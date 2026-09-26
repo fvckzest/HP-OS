@@ -1,6 +1,6 @@
 # HP-OS
 
-HP-OS is a shared cultural operations engine for LMNL-built websites. Events and ticketing are the first planned capabilities. LMNL is the first Site. This repository currently contains planning documents and research, not an implemented HP-OS application. The [first-release Wayfinder issue](https://github.com/fvckzest/HP-OS/issues/1) indexes current planning work.
+HP-OS is a shared cultural operations engine for LMNL-built websites. Events and ticketing are the first planned capabilities. LMNL is the first Site. This repository currently contains planning documents and research, not an implemented HP-OS application. The [first-release Wayfinder issue](https://github.com/fvckzest/HP-OS/issues/1) indexes current planning work; [issue #6](https://github.com/fvckzest/HP-OS/issues/6) settles the first-release jobs, while [issue #8](https://github.com/fvckzest/HP-OS/issues/8) will define their detailed journey.
 
 ## Find the current guidance
 
