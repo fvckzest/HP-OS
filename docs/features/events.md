@@ -14,7 +14,7 @@ Featured and home-page selection remain LMNL presentation controls. For HP-OS ti
 
 ## Data and states
 
-Event records belong to one Site. Fields, publication rules, sales rules, and lifecycle states are not yet settled. See [domain language](https://github.com/fvckzest/HP-OS/issues/7) and [ticket #8](https://github.com/fvckzest/HP-OS/issues/8).
+An Event belongs to one Site and has exactly one priced Ticket offering in the first release. The offering represents what is sold and its available quantity; it is distinct from both the Event and each issued Ticket. See the [domain glossary](../../CONTEXT.md) and [decision in ticket #7](https://github.com/fvckzest/HP-OS/issues/7#issuecomment-5848989424). Exact fields, publication rules, sales rules, and lifecycle states remain for [ticket #8](https://github.com/fvckzest/HP-OS/issues/8).
 
 ## API links
 
