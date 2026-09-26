@@ -18,7 +18,11 @@ The complete purchase, delivery, order-lookup, cancellation, refund-status, and 
 
 ## Data and states
 
-Buyer records, orders, tickets, admission records, and sales totals belong to one Site, even when Sites share a payment connection. Their exact fields and lifecycle states are not yet settled. See [domain language](https://github.com/fvckzest/HP-OS/issues/7) and [ticket #8](https://github.com/fvckzest/HP-OS/issues/8).
+Buyer records, Orders, Tickets, Admissions, and sales totals belong to one Site, even when Sites share a payment connection. A Buyer is reusable across that person's Orders on the same Site. Each Order retains the name and email used for that purchase, begins when checkout starts, and concerns one Event. A private Access Request is permission to begin checkout, not an Order.
+
+An Order may have no issued Tickets before payment. A paid Order can issue multiple independently usable Tickets. Each Ticket can have at most one successful Admission. Individual attendee identity is not required, so the Buyer need not be the person who uses every Ticket.
+
+See the [domain glossary](../../CONTEXT.md) and [decision in ticket #7](https://github.com/fvckzest/HP-OS/issues/7#issuecomment-5848989424). Exact fields, state transitions, payment outcomes, and recovery rules remain for [ticket #8](https://github.com/fvckzest/HP-OS/issues/8).
 
 ## API links
 
