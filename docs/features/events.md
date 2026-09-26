@@ -2,24 +2,38 @@
 
 ## Purpose and ownership
 
-HP-OS owns each Site's operational event records. LMNL is the first Site and provides the staff CRUD interface and public presentation. A Site's events are not shared with another Site. See [ownership](../ownership.md) and the [first-release plan](https://github.com/fvckzest/HP-OS/issues/1).
+HP-OS owns each Site's operational Event records. LMNL is the first Site and owns staff CRUD and public presentation. Events are not shared between Sites. See [ownership](../ownership.md). The first-release jobs were selected in [ticket #6](https://github.com/fvckzest/HP-OS/issues/6); the journey rules below were settled in [ticket #8](https://github.com/fvckzest/HP-OS/issues/8).
 
-## Settled behavior
+## Setup and publication
 
-The first release begins with new events after LMNL's current live event. It supports paid public and private events; free ticket issuance is deferred. Both event types appear in LMNL's public event list. A private event offers an Access Request, and staff approval is required before the guest can enter paid checkout.
+- The first release covers new paid public and private Events after LMNL's current live event. Both appear in the Site's public event list. A private Event offers an Access Request instead of public checkout. Free ticket issuance is deferred.
+- Staff may save incomplete drafts. Publication requires a title, description, start and end dates and times with time zone, venue, and public or private visibility. The end must follow the start and may be days later for a multi-day Event.
+- Publication and sales are separate. A published Event can be visible before checkout opens. Price, capacity, and a scheduled sales opening and closing time are required before sales can open. The sales window may continue after Event start but must close no later than Event end.
+- An Event becomes past automatically at its end time. Staff may archive an ended or canceled Event; archiving removes it from the current-event list but preserves its details, direct page, Orders, Tickets, and history. A Site may still show archived Events in a past-events view. Archiving does not change payment or admission status.
 
-LMNL staff can create and edit events, archive inactive events instead of permanently deleting their history, and cancel an event after sales begin. Staff can correct or update an event after sales start; the safeguards for changes affecting buyers and the cancellation procedure belong to [ticket #8](https://github.com/fvckzest/HP-OS/issues/8).
+Separate publication and sales controls let Sites announce Events early without exposing an incomplete checkout. Preserving archived data keeps past Events and buyer records available.
 
-Featured and home-page selection remain LMNL presentation controls. For HP-OS ticketed events, manual event-page or checkout-link overrides and arbitrary custom traits are deferred. The Square test-item action is removed from normal staff event setup. These choices keep the operational event and purchase path consistent while retaining useful Site presentation controls. See the [first-release jobs decision](https://github.com/fvckzest/HP-OS/issues/6).
+## Sales and capacity
 
-## Data and states
+- Staff may stop new checkouts immediately and resume them while the Event is not canceled, its scheduled sales window is open, and capacity remains. A manual stop lets active checkouts finish.
+- Checkout reserves the requested Ticket offering quantity without exceeding available capacity. The buyer has 15 minutes to start payment. An unpaid checkout expires with its Reservation if payment has not started; a payment already processing keeps its Reservation until the provider reports the result.
+- When an unpaid Reservation releases capacity, a sold-out Event becomes available automatically if the sales window is open and staff have not stopped sales.
+- Capacity cannot be reduced below Tickets already admitted, issued Tickets still valid for Admission, and active Reservations. A fully refunded Ticket returns to sale capacity only if it was never admitted.
+- A price edit affects only checkouts started afterward. Paid Orders and active checkouts retain their original quoted price.
 
-An Event belongs to one Site and has exactly one priced Ticket offering in the first release. The offering represents what is sold and its available quantity; it is distinct from both the Event and each issued Ticket. See the [domain glossary](../../CONTEXT.md) and [decision in ticket #7](https://github.com/fvckzest/HP-OS/issues/7#issuecomment-5848989424). Exact fields, publication rules, sales rules, and lifecycle states remain for [ticket #8](https://github.com/fvckzest/HP-OS/issues/8).
+These rules prevent overselling, release abandoned capacity, and keep purchase terms stable while staff make corrections.
 
-## API links
+## Event changes and cancellation
 
-The exact API contract will live in [docs/api.md](../api.md) after [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+- After sales begin, staff may change the start or end date and time or venue. HP-OS notifies existing buyers, and Order pages show the current details.
+- Each Event has a check-in opening time, defaulting to its start time; staff may set it earlier. Admission is available through the Event's end time. Scans outside that window create no Admission.
+- Cancellation immediately stops new sales, ends unpaid checkouts and releases their Reservations, and prevents Ticket Admission. HP-OS keeps the Event and purchase history. It emails buyers immediately and shows cancellation separately from refund status on their Order pages.
+- Cancellation does not initiate a refund. Staff refund through the payment provider's dashboard; HP-OS reflects the resulting status. A charge confirmed after cancellation is recorded as paid and requiring a refund, with no usable Tickets, and alerts staff.
 
-## Decision links and evidence
+Notifying buyers of changed arrival details and cancellation keeps the public journey accurate. Keeping refund status separate avoids implying money was returned before the provider confirms it.
 
-See the [first-release plan](https://github.com/fvckzest/HP-OS/issues/1), [Site ownership decision](https://github.com/fvckzest/HP-OS/issues/3#issuecomment-5848567711), [first-release jobs decision](https://github.com/fvckzest/HP-OS/issues/6), and [dated LMNL jobs inventory](../research/lmnl-event-ticketing-jobs.md). The inventory is evidence, not a settled HP-OS rule.
+## Presentation and API boundaries
+
+Featured and home-page selection remain LMNL controls. Manual event-page and checkout-link overrides, arbitrary custom traits, and the Square test-item action are outside normal first-release Event setup. See [ticket #6](https://github.com/fvckzest/HP-OS/issues/6).
+
+An Event belongs to one Site and has one priced Ticket offering in the first release. The offering is the sale option and capacity, not an issued Ticket. See the [domain glossary](../../CONTEXT.md). The Site API must keep archived Event details retrievable for past-event presentation; exact operations and payloads belong to [ticket #10](https://github.com/fvckzest/HP-OS/issues/10) and [docs/api.md](../api.md).
