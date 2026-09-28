@@ -6,7 +6,7 @@ HP-OS is a shared cultural operations engine for LMNL-built websites. Events and
 
 | Need | Source |
 | --- | --- |
-| Customer organization, Site, and payment-connection boundaries | [Ownership](docs/ownership.md) |
+| Customer organization, Site data separation, payment connections, and Site payment execution | [Ownership](docs/ownership.md) |
 | Meanings and relationships of event and ticketing terms | [Domain language](CONTEXT.md) |
 | Event rules | [Events](docs/features/events.md) |
 | Ticketing rules | [Ticketing](docs/features/ticketing.md) |
@@ -15,6 +15,8 @@ HP-OS is a shared cultural operations engine for LMNL-built websites. Events and
 | Dated source evidence | [Research](docs/research/) |
 
 Repository documents state settled guidance. GitHub issues hold open questions and current work; resolution comments preserve the full decision discussion. Research records evidence and does not establish HP-OS behavior by itself.
+
+[Issue #9](https://github.com/fvckzest/HP-OS/issues/9) settles data separation and payment execution: provider credentials and calls remain on Site backends; HP-OS owns operational records, authoritative amounts, connection assignments, and fee terms. The detailed rules are in [Ownership](docs/ownership.md#data-separation-and-payment-execution). Provider integration and fee settlement remain unverified.
 
 ## Keep the guidance current
 

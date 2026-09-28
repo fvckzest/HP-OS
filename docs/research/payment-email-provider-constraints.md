@@ -2,6 +2,8 @@
 
 Research for [HP-OS issue #5](https://github.com/fvckzest/HP-OS/issues/5), checked 2026-09-26.
 
+Subsequent decision: [issue #9](https://github.com/fvckzest/HP-OS/issues/9) assigns payment credentials, provider calls, notification verification, and provider recovery checks to Site backends. The historical findings below describe provider requirements and sometimes assume HP-OS executes those calls; that assumption is superseded by [the settled ownership rules](../ownership.md#data-separation-and-payment-execution). The selected account and platform-fee setup still require integration validation. Email credential ownership is not settled by this payment decision.
+
 ## Scope and evidence
 
 [Issue #3](https://github.com/fvckzest/HP-OS/issues/3) settles the product boundary: a customer organization owns one or more Sites and payment connections; a connection may be assigned to several Sites; the customer sells tickets; HP-OS collects a platform fee; each Site owns its orders and tickets. This document records provider capabilities and their consequences. It does not choose a provider, credential custody model, or email account owner. No provider dashboard, live account, real transaction, or webhook was inspected. Provider eligibility and commercial terms still require account-specific confirmation.
