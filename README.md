@@ -10,13 +10,16 @@ HP-OS is a shared cultural operations engine for LMNL-built websites. Events and
 | Meanings and relationships of event and ticketing terms | [Domain language](CONTEXT.md) |
 | Event rules | [Events](docs/features/events.md) |
 | Ticketing rules | [Ticketing](docs/features/ticketing.md) |
-| Exact Site-to-HP-OS request, response, permission, and error rules | [API contract](docs/api.md) |
+| API components, endpoints, fields, and data formats at a glance | [API reference](docs/api/api-ref.md) |
+| Exact Site-to-HP-OS request, response, permission, and error rules | [API contract](docs/api/api.md) |
 | Current questions and work | [First-release Wayfinder issue](https://github.com/fvckzest/HP-OS/issues/1) and its linked tickets |
 | Dated source evidence | [Research](docs/research/) |
 
 Repository documents state settled guidance. GitHub issues hold open questions and current work; resolution comments preserve the full decision discussion. Research records evidence and does not establish HP-OS behavior by itself.
 
 [Issue #9](https://github.com/fvckzest/HP-OS/issues/9) settles data separation and payment execution: provider credentials and calls remain on Site backends; HP-OS owns operational records, authoritative amounts, connection assignments, and fee terms. The detailed rules are in [Ownership](docs/ownership.md#data-separation-and-payment-execution). Provider integration and fee settlement remain unverified.
+
+[Issue #10](https://github.com/fvckzest/HP-OS/issues/10) defines the first API contract. Its settled credential boundary is that HP-OS retains no Site or organization external service credentials; Site backends execute credential-dependent integrations, including Apple Wallet signing. See [external service credentials](docs/ownership.md#external-service-credentials) and the [API contract](docs/api/api.md).
 
 ## Keep the guidance current
 
