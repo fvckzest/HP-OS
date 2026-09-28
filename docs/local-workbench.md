@@ -1,6 +1,6 @@
 # Local testing workbench
 
-This document records local workbench decisions agreed with the product owner in [Choose the simplest beginner-friendly testing workflow](https://github.com/fvckzest/HP-OS/issues/58), under [Plan the HP-OS local API workbench](https://github.com/fvckzest/HP-OS/issues/56). The workbench is planned, not implemented.
+This document records local workbench decisions agreed with the product owner in [Choose the simplest beginner-friendly testing workflow](https://github.com/fvckzest/HP-OS/issues/58) and [Decide repeatable test data and failure controls](https://github.com/fvckzest/HP-OS/issues/60), under [Plan the HP-OS local API workbench](https://github.com/fvckzest/HP-OS/issues/56). The workbench is planned, not implemented.
 
 ## Starting point
 
@@ -46,7 +46,7 @@ One shared history includes guided workflow requests, manual requests, and obser
 
 Observed LMNL calls show what happened. They receive a pass/fail result only when an expected outcome has been defined. This preserves the distinction between observing an application call and checking it against a test expectation.
 
-The user can explicitly clear the workbench history. Clearing history removes workbench history records without changing Events, Orders, Tickets, Admissions, or other operational data. Resetting local test data is a separate control to be decided in [issue #60](https://github.com/fvckzest/HP-OS/issues/60). History storage and retention details belong to [issue #61](https://github.com/fvckzest/HP-OS/issues/61).
+The user can explicitly clear the workbench history. Clearing history removes workbench history records without changing Events, Orders, Tickets, Admissions, or other operational data. Resetting local test data is the separate control described below, agreed in [issue #60](https://github.com/fvckzest/HP-OS/issues/60). History storage and retention details belong to [issue #61](https://github.com/fvckzest/HP-OS/issues/61).
 
 ## Protected values
 
@@ -68,6 +68,58 @@ For example, setting Ticket quantity to `0` can be paired with an expectation th
 
 This makes intentional rejection tests explicit and prevents the workbench from changing a test's meaning merely because its request changed.
 
+## Local test environment
+
+The test-data and failure controls below operate only in the dedicated local test environment. API tests use the normal HTTP boundary against real local PostgreSQL. Controls must preserve authentication, Site isolation, validation, idempotency, concurrency, and other business rules being tested. They must not directly force an Order, Ticket, Admission, or job into a desired outcome.
+
+These boundaries, agreed in [issue #60](https://github.com/fvckzest/HP-OS/issues/60), make local failures repeatable without replacing the behavior under test. They preserve the existing [API contract](api/api.md) and [background processing responsibilities](technology.md#background-processing).
+
+## Sample data and explicit reset
+
+Provide a small, known base dataset containing test Sites and sample Events. “Reset local test data” clears all operational data in the dedicated local test database and restores that dataset. It preserves workbench request history, with entries labeled by the dataset they belong to. Earlier entries remain historical evidence even when their operational records have been removed.
+
+Starting a scenario never resets existing data automatically. Each run creates its own labeled records through normal API operations, including the preparation needed for the test. For example, a second-Admission rejection scenario creates an Order, simulates a successful payment report, issues a Ticket, and admits it before attempting Admission again. A scenario requiring the exact original starting state, such as competing Orders for the last available Ticket, requires an explicit reset first.
+
+This separates deliberate cleanup from scenario execution and preserves data still under investigation. Resetting local data does not reset external provider or email-service records.
+
+## Background processing controls
+
+Background processing runs manually by default, with an optional automatic mode. A “Run background processing” control executes one processing cycle and shows its results. It uses the same bounded processing entry point as the scheduler. HP-OS processing and Site-owned processing remain separately identified; an HP-OS cycle cannot itself prove payment verification or email delivery by LMNL.
+
+Manual execution lets the user inspect pending work before and after a cycle. Automatic execution supports complete workflow testing once the individual steps are understood.
+
+## Controlled time
+
+Simulated scenarios start at a known, frozen application time. Controls advance that time by a duration or to the next relevant deadline. Advancing time changes what the local application considers “now”; processing continues to follow the selected manual or automatic mode. Time advancement does not itself force expiration, release capacity, or mark work complete.
+
+For example, advance just past a Reservation's 15-minute deadline, inspect the Order, run processing, and check the contract-defined result. An unresolved payment attempt must still preserve its capacity hold until the normal rules permit release. Controlled time avoids real waiting while preserving deadline and recovery rules.
+
+## Repeated and concurrent requests
+
+Provide separate controls to repeat the same request and to send a small group of requests concurrently. Repeating a request retains its idempotency key, so the test can check that no duplicate operation occurs. Concurrent requests keep their individual request details, keys, and results visible in history and exercise normal database-backed concurrency rules.
+
+For example, two competing Admission requests for one Ticket must create exactly one Admission. These controls make duplicate and competing operations deliberate, inspectable tests rather than accidental repetitions.
+
+## Interrupted operations
+
+Guided scenarios provide named interruption points that explain where execution stops and how to resume or retry through normal application operations. They cover interruptions such as a committed operation whose response is lost, interrupted worker execution, and external dispatch before its outcome is recorded. An interruption must not substitute a fabricated business-state change for the operation under test.
+
+For example, “Payment recorded, response lost” commits the payment report but drops its response. The workbench shows “Outcome unknown”; retrying the same request with the same idempotency key must not duplicate Tickets. An email sent before its outcome is recorded requires the normal verification path before another send. These points make recovery repeatable while retaining transaction, retry, and unknown-outcome safeguards.
+
+## Simulated outcomes
+
+Select a simulated outcome for the next relevant operation, with success as the default. Payment choices include successful, declined, processing, and unknown outcomes, represented through the normal Site reporting contract. Email choices include accepted, known sending failure, and unknown sending outcome. Simulate delivery reports separately because sending acceptance does not establish delivery.
+
+Guided failure scenarios select the relevant outcomes and show them before execution. Every simulated result is clearly labeled. Simulations represent Site-owned integration behavior and submit normal reports; they do not cause HP-OS to call external services or bypass report validation. This makes failure selection simple without confusing simulated evidence with an actual integration result.
+
+## Actual test integrations
+
+Simulation is the default. Actual test integrations become selectable when the local LMNL backend has the required test configuration. Payments use the provider's test environment; actual email tests use an explicitly configured test recipient. Credentials remain on the Site backend under the existing [ownership rules](ownership.md#external-service-credentials).
+
+Each run identifies which services are simulated and which are actual. Runs using actual integrations use real time, since external services do not follow the controlled application clock. For example, a provider test payment with simulated email can establish the payment test journey but cannot establish actual email delivery.
+
+Reset and interruption controls cannot erase an external service's effects. Simulation and local API results do not replace required actual payment, email, Wallet, device, hosted, or production evidence in the [release procedure](release-and-cutover.md).
+
 ## Related planning
 
-Test data and failure controls belong to [issue #60](https://github.com/fvckzest/HP-OS/issues/60); delivery and persistence belong to [issue #61](https://github.com/fvckzest/HP-OS/issues/61). These workflow decisions preserve the existing [API contract](api/api.md). They do not implement a workbench or establish actual integration, hosted, or production readiness.
+Test data and failure controls were agreed in [issue #60](https://github.com/fvckzest/HP-OS/issues/60); workbench delivery and persistence belong to [issue #61](https://github.com/fvckzest/HP-OS/issues/61). Planned scenario coverage is indexed in the [local testing coverage research](research/local-api-workflow-testing-coverage.md). These decisions preserve the existing [API contract](api/api.md). They do not implement a workbench or establish actual integration, hosted, or production readiness.
