@@ -6,7 +6,7 @@ HP-OS owns each Site's operational Event records. LMNL is the first Site and own
 
 ## Setup and publication
 
-- The first release covers new paid public and private Events after LMNL's current live event. Both appear in the Site's public event list. A private Event offers an Access Request instead of public checkout. Free ticket issuance is deferred.
+- The first release covers new paid public and private Events after all current LMNL Events are complete. Cutover occurs with no active public sales; existing Events and their records remain in the existing system. Historical import is separate future work if needed. See the [release and cutover procedure](../release-and-cutover.md), agreed in [ticket #12](https://github.com/fvckzest/HP-OS/issues/12). Public and private Events both appear in the Site's public event list. A private Event offers an Access Request instead of public checkout. Free ticket issuance is deferred.
 - Staff may save incomplete drafts. Publication requires a title, description, start and end dates and times with time zone, venue, and public or private visibility. The end must follow the start and may be days later for a multi-day Event.
 - Public or private visibility can change while an Event is a draft but becomes fixed once published. This keeps the access rules stable after visitors see the Event or begin checkout; see [ticket #10](https://github.com/fvckzest/HP-OS/issues/10) and [Event editing rules](../api/api.md#draft-and-published-event-edits).
 - Publication and sales are separate. A published Event can be visible before checkout opens. Price, capacity, and a scheduled sales opening and closing time are required before sales can open. The sales window may continue after Event start but must close no later than Event end.
