@@ -4,6 +4,10 @@ Research for [issue #59](https://github.com/fvckzest/HP-OS/issues/59), 2026-09-2
 
 **Status: proposal only.** This note records a small local workbench architecture for tracing manual and actual LMNL calls. It does not settle HP-OS product behavior, add an API contract, authorize a deployment, or implement instrumentation. The words “should” and “proposed” describe research recommendations for a later implementation decision.
 
+## Settled implementation guidance
+
+The product owner subsequently settled delivery and persistence in [Settle incremental workbench delivery and verification](https://github.com/fvckzest/HP-OS/issues/61). Follow the [local workbench handoff](../local-workbench.md#delivery-and-implementation-handoff): a local-only HP-OS page, dedicated local PostgreSQL history tables, retention until explicit history clearing, and incremental additions in existing implementation tickets. That decision supersedes this note's proposed separate JSONL store and automatic seven-day/100 MB deletion. The initial version requires no separate collector or new tracing header. Preserve the research findings on redaction, correlation limits, Site credential custody, and failure isolation; detailed instrumentation choices must satisfy the settled functional checks.
+
 ## Evidence boundary
 
 The repository is still a planning repository. Its technology document proposes one Next.js application with a TypeScript API, direct SQL, and durable PostgreSQL work; it does not prove that a Next.js runtime, collector, LMNL integration, or worker currently exists ([technology](../technology.md)). The API contract is the current source for wrapper fields, retries, domain identifiers, notification jobs, and credential custody; it explicitly says that the endpoints and integrations are not implemented or verified ([API contract](../api/api.md)). No hosted request, production database, payment provider, email provider, or visual review was inspected.
