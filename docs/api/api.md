@@ -1,0 +1,706 @@
+# Site-to-HP-OS API contract
+
+This document defines the first Site-to-HP-OS API contract agreed during [ticket #10](https://github.com/fvckzest/HP-OS/issues/10). It covers operations, authorization, request and response fields, failures, and recovery. Use the [compact API reference](api-ref.md) to look up components, routes, and fields. It specifies planned behavior; endpoints and provider integrations have not been implemented or verified.
+
+The agreed boundary is that each Site backend uses its own HP-OS API key, and HP-OS enforces that key's Site scope on every operation and related record. Shared organization or payment-connection ownership does not grant access to another Site's records. The Site authenticates and authorizes its staff. See [ownership](../ownership.md), the [decision in ticket #3](https://github.com/fvckzest/HP-OS/issues/3#issuecomment-5848567711), and [ticket #9](https://github.com/fvckzest/HP-OS/issues/9).
+
+## Protocol and versioning
+
+The first Site-to-HP-OS contract is a versioned HTTP API using JSON request and response bodies under `/v1`. Changes within version 1 preserve compatibility; an incompatible contract change requires a new API version. This gives Sites a stable integration contract, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Routes and HTTP status codes are defined below. Site backends generate binary artifacts such as signed Apple Wallet passes using HP-OS operational data.
+
+## Backend access
+
+All LMNL-to-HP-OS requests go through the LMNL backend, including public Event listings, Order and individual Ticket pages, checkout, and staff operations. Browsers call LMNL; the LMNL backend calls HP-OS using its private Site API key. The key is never sent to the browser. A separate browser-facing HP-OS API is outside the first contract. This gives public and staff journeys one consistent Site access boundary, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+HP-OS retains no Site or organization external service credentials, including payment and email credentials or Apple Wallet signing certificates and private keys. Credential-dependent integrations execute on the Site backend; HP-OS retains operational data and non-secret references. See [external service credentials](../ownership.md#external-service-credentials) and [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+## Site authorization
+
+Each Site alone defines and enforces its staff permissions, including limited door access. The Site backend must authorize a staff action before calling HP-OS. HP-OS does not evaluate individual staff roles or permissions supplied by the Site. This keeps staff access policy in the Site that authenticates staff, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+HP-OS authenticates the Site API key, enforces Site ownership, and validates the requested operation against its business rules. Site authorization does not override capacity, payment, or Admission rules, or permit changes to operator-managed connection assignments and fee terms. See [ownership](../ownership.md#settled-rules).
+
+## Safe retries
+
+Requests that create records or perform actions use a unique idempotency key supplied by the Site backend. Within the replay period defined below, retrying the same operation with the same key and request details reuses the original operation and returns its original result without repeating its effects. For example, retrying checkout creation returns the existing Order and Reservation rather than creating another pair. Reusing the key with different request details returns an error. This prevents duplicate actions when HP-OS completes a request but its response does not reach the Site, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+The Site backend automatically retries network failures and HTTP `429`, `500`, and `503` responses with increasing delays. Retries of the same action reuse its idempotency key. HP-OS includes a `Retry-After` header on `429` and `503`, expressed as the number of seconds to wait; the Site observes this delay before retrying. Other errors require correction or state review before another attempt. For example, a version conflict requires reloading the record rather than repeatedly sending the outdated edit. These retry rules were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+If a retry reaches HP-OS while the original action is still processing, HP-OS returns HTTP `409` with `request_in_progress` and a `Retry-After` delay in seconds. The Site waits and retries with the same key; once the action finishes, the retry returns its original result without executing it again. This is an explicit retryable exception to the usual correction or state-review requirement for `409`. It prevents concurrent execution of the same action, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+The Site sends a UUID in the `Idempotency-Key` header, generating a new UUID for each new action and reusing it for retries. Keys are scoped to the authenticated Site. HP-OS associates each key with the HTTP method, route, and request details. Reusing a key within that Site for a different action or different details returns HTTP `409` with `idempotency_conflict`; another Site may use the same UUID independently. This makes accidental key reuse detectable, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+HP-OS retains the replayable result for seven days after an action completes. After this period, it remembers that the key was used and rejects a matching retry with HTTP `409` and `idempotency_expired`, without executing the action again. The Site checks the current record before deciding what to do next. An unfinished action remains tracked until resolved; the replay period starts at completion. Remembering used keys prevents delayed retries from becoming duplicate actions, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+## Concurrent edits
+
+Each editable record has a version number. The Site backend submits the version loaded by the editor when requesting an edit. HP-OS applies the edit only if that version is still current and advances the version when the record changes. If another change has made the submitted version outdated, HP-OS rejects the edit so the Site can reload the record and ask staff to review their changes before submitting again. This prevents one staff member's save from silently overwriting another's changes, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Admin responses include `version`. Edits and admin lifecycle actions require `expected_version`, containing the version loaded by the authorized Site user; creation requests do not require it. A missing value returns HTTP `422` with `validation_failed`, and an outdated value returns HTTP `409` with `version_conflict`. Successful edits and lifecycle actions return the updated record and its new version. Applying the check to lifecycle actions also prevents staff from acting on details another staff member has since changed, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+## Event lifecycle operations
+
+Publishing an Event, stopping or resuming its sales, canceling it, and archiving it each use a dedicated API action. Ordinary Event edits update descriptive and configuration fields rather than directly assigning lifecycle status. HP-OS validates each action and applies the effects defined in [Events](../features/events.md), including stopping sales, ending unpaid checkouts, and notifying buyers on cancellation. Dedicated actions make these effects explicit, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Admin Event endpoints
+
+| Request | Purpose |
+| --- | --- |
+| `GET /v1/admin/events` | List Events, including drafts. |
+| `GET /v1/admin/events/{event_id}` | Retrieve admin Event details. |
+| `POST /v1/admin/events` | Create a draft. |
+| `PATCH /v1/admin/events/{event_id}` | Edit Event fields. |
+| `POST /v1/admin/events/{event_id}/actions/{action}` | Perform an Event lifecycle action. |
+
+Supported actions are `publish`, `stop_sales`, `resume_sales`, `cancel`, and `archive`. Creation returns HTTP `201 Created`; reads, edits, and completed actions return HTTP `200 OK`, using the common success wrapper. All writes require `Idempotency-Key`; edits and lifecycle actions also require `expected_version`. The Site enforces staff permissions before calling these operations. These endpoints and request requirements were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Event write fields
+
+Event creation and editing use one payload with a nested `ticket_offering` object, matching the first-release rule that each Event has one Ticket offering.
+
+| Group | Fields |
+| --- | --- |
+| Event details | `title`, `description`, `venue`, `visibility` (`public` or `private`) |
+| Event timing | `starts_at`, `ends_at`, `time_zone`, `check_in_opens_at` |
+| `ticket_offering` | `price`, `capacity`, `sales_opens_at`, `sales_closes_at` |
+
+HP-OS validates the whole change together rather than allowing separate Event and offering edits to leave settings inconsistent between requests. For example, the sales closing time cannot be later than the Event's end. These payload groups were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+`venue` is an object with `name` and optional `address`. Publication requires a nonempty venue name; its address may be `null`. Drafts may leave either unset. Partial venue edits preserve omitted fields, like `ticket_offering`, rather than replacing the entire venue object. This separates venue display name and address without adding a separate venue-management system, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Draft and published Event edits
+
+Drafts allow all configurable Event and Ticket offering fields to be edited and can be saved incomplete under the [Event setup rules](../features/events.md#setup-and-publication). Draft edits also change only supplied fields, including supplied fields within `ticket_offering`; omitted fields remain unchanged. Fully editable means every configurable field can be changed or cleared where allowed, without requiring the whole draft to be resent. This does not permit editing server-managed identifiers, versions, or lifecycle status directly, or changing operator-managed connection assignments and fee terms.
+
+For published Events, `PATCH` changes only supplied fields, including supplied fields within `ticket_offering`; omitted fields remain unchanged. For example, `{ "expected_version": 3, "ticket_offering": { "capacity": 150 } }` changes capacity while preserving price and sales times. HP-OS validates the resulting Event against its live business rules and saves the whole update together; if any part is invalid, nothing changes. Explicit `null` clears a field only where clearing is allowed. These editing rules were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+An Event's `visibility` can change freely while it is a draft but becomes fixed once published. A published Event cannot switch between public checkout and Access Request mode. This prevents changing access rules after visitors have seen the Event or begun checkout, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+The Site may create an empty draft by sending `{}`. Missing configurable fields return as `null`, and draft fields may be cleared back to `null`. Supplied values must still be valid; for example, invalid timestamps and negative capacity are rejected. Publication separately checks the required Event details. This supports gradual draft completion without accepting malformed data, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Offering provider mapping
+
+A Ticket offering may have an optional mapping to an existing payment-provider resource, scoped to a payment connection. It is associated with `ticket_offering` and included only in admin responses, not public Event responses. HP-OS remains authoritative for price and capacity. This association is distinct from the Site's active payment connection and from the checkout and payment references recorded for an individual Order's payment attempt. The mapping does not select a different provider for an Event; per-Event provider selection remains deferred under [ownership](../ownership.md#data-separation-and-payment-execution). Keeping the association optional supports checkout without a preexisting catalog resource, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+The Site backend verifies a selected provider resource through its configured payment connection before registering the mapping with HP-OS. It then submits the verified resource reference; HP-OS validates the Site and connection assignment and stores the association. Provider credentials and verification calls remain on the Site backend under [ownership](../ownership.md#data-separation-and-payment-execution). This prevents an unchecked resource ID from being treated as a usable mapping, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Automatic provider catalog creation is deferred beyond the first release. The Site either associates an existing, verified resource or creates checkout without a catalog mapping where its integration supports that flow. Deferral avoids introducing a provider catalog synchronization workflow into the first contract. See [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+If a mapped resource cannot produce the amount quoted by HP-OS, checkout stops until the configuration is corrected. The Site shows a temporary checkout-unavailable message and exposes the specific mismatch in its admin interface. If an Order and Reservation were already created, HP-OS releases capacity only after the Site verifies that no provider checkout can take payment; uncertain outcomes retain the Reservation. The accepted HP-OS total remains authoritative; the mismatch does not automatically change the provider's catalog price, which could affect other sales using the resource. This behavior was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+| Request | Purpose |
+| --- | --- |
+| `PUT /v1/admin/events/{event_id}/provider-mappings/{connection_id}` | Register or replace a verified offering mapping. |
+| `DELETE /v1/admin/events/{event_id}/provider-mappings/{connection_id}` | Remove the mapping for future Orders. |
+
+Registration supplies `resource_type`, `resource_reference`, `verified_at`, and `expected_version`. Removal also requires `expected_version`; both operations require `Idempotency-Key`. HP-OS checks that the connection is assigned to the Site. Existing Orders retain their recorded mapping and payment references; a mapping change does not rewrite purchase history or change the Site's active provider. These operations were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+## Public and admin Event responses
+
+HP-OS provides separate public and admin Event responses. Public responses contain published Event details and checkout availability. Published private Events remain discoverable and indicate the Access Request option. Drafts, administrative configuration, and operational information are excluded from public responses. Admin responses also provide drafts, configuration, and operational information for Site-authorized workflows. The Site backend chooses the appropriate operation and enforces staff permissions before requesting admin data. Separate responses prevent public presentation from depending on the Site filtering a complete admin response, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Operational endpoints use the `/v1/admin` namespace and their responses are called admin responses. The namespace does not define a staff role or permission: the Site alone determines access to each operation. Event visibility remains a separate public or private setting, and admin operations can concern either kind of Event. This terminology was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+The public Event list returns current Events by default: published, unarchived Events that have not ended, ordered by start time, earliest first. Past Events are requested separately: published Events that have ended, including archived Events, ordered by start time, most recent first. Canceled Events retain their cancellation status wherever they appear. Direct lookup keeps published Event details available after archiving. These rules give Sites predictable current and past lists, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Public Event responses explicitly include purchase mode and current sales status as separate fields supplied by HP-OS. Purchase mode is public checkout or Access Request required. Sales status is not configured, scheduled, open, paused, sold out, closed, or canceled. For example, a private Event can require an Access Request while also being sold out. Sites use these values rather than reconstructing availability from dates and capacity; checkout still validates availability when requested. This keeps public presentation aligned with HP-OS's operational rules, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+A published Event whose price, capacity, or sales window is incomplete returns `sales_status: "not_configured"`. Public details remain available, but quote requests return HTTP `409` with `sales_not_configured`. The Site can display that sales details are coming soon rather than incorrectly presenting the Event as sold out or ready for checkout. Once configuration is complete, HP-OS calculates the appropriate scheduled, open, or other status. This additional status was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Sales status uses the first matching condition in this precedence:
+
+| Priority | Status | Condition |
+| --- | --- | --- |
+| 1 | `canceled` | Event canceled. |
+| 2 | `closed` | Event ended or sales closing time reached. |
+| 3 | `not_configured` | Required sales settings incomplete. |
+| 4 | `scheduled` | Sales opening time not yet reached. |
+| 5 | `paused` | New checkouts manually stopped. |
+| 6 | `sold_out` | No capacity currently available. |
+| 7 | `open` | Otherwise available for new checkout. |
+
+Admin responses retain the underlying settings separately. This precedence gives one predictable public status when conditions overlap, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Public Event endpoints
+
+| Request | Purpose |
+| --- | --- |
+| `GET /v1/public/events` | List published Events using `period`, `limit`, and `cursor`. |
+| `GET /v1/public/events/{event_id}` | Retrieve one published Event, including archived details. |
+
+`period` accepts `current` or `past` and defaults to `current`, using the listing rules above. `limit` defaults to 50 and cannot exceed 100. `cursor` requests the next page. Draft Events return HTTP `404 Not Found` with `not_found` through public lookup and never appear in public lists. Both endpoints require the Site API key and are called through the Site backend; public describes their response contents. These operations were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Public Event object
+
+Public Event lists and detail lookup use the same Event object:
+
+| Group | Fields |
+| --- | --- |
+| Identity and content | `event_id`, `title`, `description`, `venue` |
+| Timing | `starts_at`, `ends_at`, `time_zone`, `check_in_opens_at` |
+| State | `visibility`, `purchase_mode`, `sales_status`, `is_canceled`, `is_archived` |
+| `ticket_offering` | `price`, `max_quantity_per_order` |
+
+`purchase_mode` is `public_checkout` or `access_request`. The per-Order quantity limit is eight for public Events and one for private Events; actual availability is rechecked at checkout. `price` is the base Ticket price, or `null` if unset; buyers obtain a quote for the full total. Admin configuration, capacity, and provider mappings are excluded. This shared object was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Admin Event object
+
+Admin Event responses extend the public Event object with operational fields:
+
+| Group | Additional fields |
+| --- | --- |
+| Record | `version`, `publication_status`, `created_at`, `updated_at` |
+| Sales control | `sales_paused` |
+| `ticket_offering` | `offering_id`, `capacity`, `reserved_quantity`, `available_quantity`, `sales_opens_at`, `sales_closes_at`, `provider_mappings` |
+
+`publication_status` is `draft` or `published`; cancellation and archiving remain separate. Incomplete draft values are `null`. Capacity figures describe current operational state, while checkout still validates availability atomically. Detailed sales totals and Order lists remain in their dedicated endpoints. Provider mappings contain only non-secret references. These admin fields were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Event list filters and ordering
+
+Admin Event lists accept the following filters alongside `limit` and `cursor`:
+
+| Parameter | Values |
+| --- | --- |
+| `publication_status` | Optional `draft` or `published`. |
+| `visibility` | Optional `public` or `private`. |
+| `is_archived` | `true` or `false`, defaulting to `false`. |
+| `is_canceled` | Optional `true` or `false`. |
+
+Admin results sort by `created_at` descending, then `event_id` ascending to break ties. Public results retain their agreed start-time ordering and use `event_id` ascending for ties. Archived admin records remain available when explicitly requested. These filters and deterministic ordering were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10). Archived public details remain retrievable for direct pages and past-event presentation under the [Event rules](../features/events.md#setup-and-publication).
+
+## Access token generation
+
+HP-OS generates separate opaque tokens using 32 cryptographically random bytes, encoded as URL-safe strings, for Order pages, Ticket pages, approval links, recovery links, and admission QR codes. Tokens contain no personal information or record IDs and resolve only within the authenticated Site and their permitted purpose. For example, an admission token cannot open an Order page. Expiry and replacement rules remain purpose-specific. This generation rule was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Normal Order and Ticket-page links have no automatic expiry and remain available after Event end to show cancellation, refunds, and Admission history. Authorized delivery-email correction replaces those page-access tokens. Recovery links expire after 30 minutes, and approval links stop permitting checkout when sales close or approval is undone. Admission QR tokens remain stable, with entry controlled by current Ticket rules. These lifetimes were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+## Public Order access
+
+`GET /v1/public/orders/{order_token}` retrieves a buyer's Order using a valid, hard-to-guess access token. It returns current Event details; payment, Ticket issuance, and Event cancellation status; and all issued Tickets with their individual Ticket-page tokens. It supports payment-confirmation and paid-but-awaiting-Tickets states without presenting unissued Tickets. An Order token grants access to the whole purchase, while an individual Ticket token grants access to one Ticket. Replacing Order links invalidates the old token under the [buyer-correction rules](../features/ticketing.md#delivery-order-access-and-buyer-correction). The Site backend supplies its Site API key, and HP-OS enforces the same Site boundary. This operation was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Invalid, expired, replaced, or wrong-Site Order and Ticket access tokens all return HTTP `404` with `not_found`, without revealing whether a token once worked or belongs to another Site. The Site shows a link-unavailable message and offers Order recovery. A valid token for a canceled or refunded purchase still returns HTTP `200` with its current status so the buyer can see what happened. This behavior was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Buyer-facing Order object
+
+The buyer-facing Order object contains these field groups:
+
+| Group | Fields |
+| --- | --- |
+| Identity | `order_id`, `order_reference`, `quantity`, `created_at`, `updated_at` |
+| Buyer | `buyer_name`, current `delivery_email` |
+| Purchase | Accepted `pricing` breakdown, `checkout_expires_at` |
+| Current state | `event`, the four status fields below, `tickets` |
+
+`event` uses the public Event object. `pricing` preserves accepted `unit_price`, `subtotal`, `buyer_fees`, `tax_total`, and `total`. `tickets` contains the complete issued set with individual page tokens and QR data, or an empty array while issuance is pending. Original checkout email, provider references, fee records, and investigation details remain in admin responses. These fields were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Admin Order object
+
+The admin Order object extends the buyer-facing object with operational fields:
+
+| Group | Additional fields |
+| --- | --- |
+| Record | `version`, `buyer_id`, `quote_id` |
+| Original identity | `checkout_identity` containing purchase-time `name` and `email` |
+| Private access | `access_request_id`, `approved_attendee`, or `null` for public purchases |
+| Operations | `reservation`, `payment_attempts`, `refunds`, `fee_records`, `notification_jobs`, `issues` |
+
+This supports payment investigation, issuance and delivery recovery, and confirmed fee inspection. Delivery-email correction updates the current address and Buyer association while preserving `checkout_identity`. Provider details contain non-secret references only. Admin Ticket lookup retains its narrower response without buyer access tokens. These fields were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Order status fields
+
+Buyer and admin Order responses expose separate status fields:
+
+| Field | Values |
+| --- | --- |
+| `payment_status` | `unpaid`, `processing`, `paid`, `failed`, `unknown`, `conflicted` |
+| `issuance_status` | `not_started`, `pending`, `issued`, `failed`, `blocked` |
+| `delivery_status` | `not_sent`, `pending`, `sent`, `delivered`, `failed` |
+| `refund_status` | `none`, `partial`, `full` |
+
+Responses also provide current Event cancellation information. For example, an Order may be paid with issued Tickets but failed email delivery. A full refund changes refund status and Ticket validity while preserving issuance history. Sent means the email provider accepted the email; delivered requires delivery confirmation. A conflicted payment remains visible for admin investigation rather than being presented as successful. These status fields were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Lost-email Order recovery
+
+`POST /v1/public/order-recovery` accepts the buyer's email address and sends time-limited access links for the authenticated Site's matching Orders to their current delivery email. The request body uses `email`. The Site backend supplies its Site API key and `Idempotency-Key`. The API always returns the same HTTP `202 Accepted` acknowledgment whether matching Orders exist or not, with no Orders or access tokens in the response. This supports purchase recovery without exposing purchase history merely from an entered email address, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Recovery links expire 30 minutes after issuance and permit repeated use within that window so page refreshes continue to work. After expiration, the buyer may request another recovery email. Recovery does not invalidate existing Order or Ticket links; replacing those links remains part of the verified delivery-email correction process. This temporary access window was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+## Public Ticket access
+
+`GET /v1/public/tickets/{ticket_token}` retrieves one Ticket using a hard-to-guess access token rather than a Ticket ID alone. The response contains that Ticket's Event details, QR presentation data, and current validity and Admission status; it does not expose other Tickets in the Order. The Site backend supplies its Site API key, and HP-OS validates the token within that Site. Replacing Ticket links invalidates the old token under the [buyer-correction rules](../features/ticketing.md#delivery-order-access-and-buyer-correction). This operation supports independently shareable Ticket pages, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Each QR code contains a dedicated admission token separate from the Ticket-page access token. The page token opens the independently shareable Ticket page; the QR token identifies the Ticket for check-in and cannot open buyer pages. The Site sends the QR token through its backend to an admin admission operation after authorizing the door user. HP-OS validates the Event, Ticket validity, check-in window, and previous Admission before recording entry under the [admission rules](../features/ticketing.md#admission-and-wallet). Separate tokens distinguish presentation access from check-in identification, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Delivery-email correction replaces Order and individual Ticket-page access tokens but preserves admission QR tokens and existing Wallet passes. Previously captured QR screenshots and saved passes remain usable while the Ticket is eligible for Admission. Correction does not reset Admission history or create another entry right. Existing passes continue to reflect used status, Event cancellation, and full refunds under the normal Wallet rules; they are not voided solely because the delivery email changed. Normal resends and Order recovery also preserve admission QR tokens. This keeps previously shared QR presentations working, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Ticket responses include `qr_payload`, a string containing only the dedicated admission token, with no name, email, or page URL. The Site encodes this string directly into the QR image and sends the scanned value unchanged as `qr_token` to the Admission endpoint. This keeps QR presentation independent of page-link replacements, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Public Ticket object
+
+The individual Ticket page and buyer Order response use the same public Ticket object:
+
+| Group | Fields |
+| --- | --- |
+| Identity | `ticket_id`, `ticket_token`, `ordinal`, `issued_at` |
+| Presentation | Current `event`, `qr_payload`, `attendee_name` |
+| Admission | `admission_status`, `admitted_at`, `can_admit`, `admission_blockers` |
+
+`ordinal` is the Ticket's stable number within its Order, starting at one; Order responses list Tickets by ordinal. Private Tickets show the approved attendee's name; public Tickets use `attendee_name: null`. The object excludes attendee email, purchaser details, provider references, and other Tickets. These fields were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Ticket admission fields
+
+Ticket responses include `admission_status` (`unused` or `admitted`), `admitted_at` (the Admission timestamp or `null`), `can_admit` (current entry eligibility), and `admission_blockers` (the current reasons entry is unavailable). Blockers use the agreed codes: `already_admitted`, `event_canceled`, `ticket_refunded`, `check_in_not_open`, and `check_in_closed`. An eligible Ticket has an empty blocker list. These fields support presentation and lookup; the Admission endpoint still checks current state atomically when entry is requested. These fields were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Apple Wallet generation
+
+The Site backend generates and signs Apple Wallet passes and holds the signing certificate and private key; HP-OS holds neither. HP-OS supplies unsigned operational data for the Ticket and current Event, including the admission QR and the agreed used and voided states under [Wallet guidance](../features/ticketing.md#admission-and-wallet). The Site delivers the signed `.pkpass` file to the buyer. Live HP-OS check-in remains authoritative. This ownership boundary was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+| Request | Purpose |
+| --- | --- |
+| `GET /v1/public/tickets/{ticket_token}/apple-wallet-data` | Supply unsigned data for the buyer's initial Wallet download. |
+| `GET /v1/admin/tickets/{ticket_id}/apple-wallet-data` | Supply current unsigned data for Site Wallet update jobs. |
+
+Both operations return JSON containing Ticket identity, current Event details, admission QR data, used and voided states, and a data version for detecting changes. The Site constructs and signs passes, manages device registrations, and sends Apple update notifications. HP-OS retains no signing credentials or Apple device-registration credentials. These endpoints and responsibilities were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Wallet templates and artwork are managed entirely by the Site, including default artwork, logos, images, layout, and presentation text. HP-OS supplies operational Event and Ticket content. The Site combines that data with its template and may regenerate, sign, and distribute a pass when operational data or its own artwork changes. This keeps presentation with the Site and operational state in HP-OS, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+## Admission operations
+
+`POST /v1/admin/events/{event_id}/admissions` handles both QR scans and manual check-in. Its request supplies exactly one of `qr_token` for a scanned Ticket or `ticket_id` for a Ticket selected through Site-authorized manual lookup. Both modes require `Idempotency-Key` and apply the same [Admission rules](../features/ticketing.md#admission-and-wallet). HP-OS checks current eligibility and records entry atomically so simultaneous attempts produce exactly one successful Admission. This operation does not require `expected_version`; eligibility is checked against current state when it executes. A retry of the same successful request returns its original result within the replay period rather than recording another Admission. This endpoint was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Admission outcomes
+
+| HTTP status | Result or error code |
+| --- | --- |
+| `201` | Admission created; return its ID, Ticket ID, Event ID, and admission timestamp. |
+| `409` | `already_admitted` |
+| `409` | `check_in_not_open` or `check_in_closed` |
+| `409` | `event_canceled` or `ticket_refunded` |
+| `409` | `ticket_event_mismatch`, for a Ticket from another Event on the same Site. |
+| `404` | `not_found`, for an invalid admission token, nonexistent Ticket, or Ticket outside the authenticated Site. |
+
+Rejected attempts create no Admission. Within the replay period, retrying the original successful request with the same key returns its original `201` result; a new scan with a new key returns `already_admitted`. These outcomes were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Manual Ticket lookup
+
+`POST /v1/admin/events/{event_id}/ticket-lookup` accepts either `order_reference` or `email`, plus pagination parameters. It returns matching Orders for that Event with buyer identification, Order status, and individual Ticket IDs and admission eligibility. It does not return buyer access tokens. After a verified delivery-email correction, lookup uses the corrected delivery email. Lookup never creates an Admission: the Site lets the authorized door user select an unused Ticket and explicitly confirm entry through the Admission endpoint. This operation supports the [manual check-in journey](../features/ticketing.md#admission-and-wallet), as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+## Admin Orders, Tickets, and totals
+
+| Request | Purpose |
+| --- | --- |
+| `GET /v1/admin/events/{event_id}/orders` | List the Event's Orders and payment and issuance statuses. |
+| `GET /v1/admin/orders/{order_id}` | Retrieve one Order's operational details. |
+| `GET /v1/admin/events/{event_id}/tickets` | List Tickets with their associated buyer and Admission status. |
+| `GET /v1/admin/events/{event_id}/totals` | Retrieve sales amounts and Ticket counts. |
+
+Totals include gross paid sales, refunds, net sales, and separate counts for issued, currently valid, and admitted Tickets under the [ticketing totals rules](../features/ticketing.md#refunds-and-event-totals). Order and Ticket lists use the agreed pagination rules. Public checkout does not require individual attendee details; private Tickets retain the intended attendee association from their approved Access Requests under the [domain glossary](../../CONTEXT.md#relationships). These endpoints were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Admin Ticket object
+
+Admin Ticket lists use a narrower operational object:
+
+| Group | Fields |
+| --- | --- |
+| Identity | `ticket_id`, `event_id`, `order_id`, `order_reference`, `ordinal` |
+| History | `version`, `issued_at`, `created_at`, `updated_at` |
+| People | `buyer_id`, `buyer_name`, `delivery_email`, `approved_attendee` |
+| Admission | `admission_status`, `admitted_at`, `can_admit`, `admission_blockers` |
+
+`approved_attendee` contains the private attendee's name and email, or `null` for public Tickets. This object omits page-access tokens and QR contents. Manual lookup may use it directly; authorized entry uses `ticket_id` through the Admission endpoint. Wallet-generation data remains available through its dedicated endpoint. These fields were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Event totals response
+
+The totals response uses the common success wrapper. Its `data` contains `event_id`, `sales`, `tickets`, and `as_of`. `sales` is an array grouping money totals by currency; each entry contains `gross_paid_sales`, `refunded_amount`, and `net_sales`, represented as money objects. `tickets` contains `issued`, `valid`, and `admitted` counts. These counts can overlap because they describe different aspects of Ticket history. HP-OS calculates all totals from one consistent snapshot identified by the timestamp `as_of`. This response structure was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+The response also includes provider processing fees, such as Square transaction fees, and LMNL platform fees in each currency's sales totals. These are separate from each other. The existing definition of `net_sales` remains gross paid sales less refunds. This additional reporting scope was requested in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Fee totals reflect actual provider-confirmed amounts. The Site backend retrieves and reports the actual fees from provider records; HP-OS distinguishes confirmed fees from incomplete reporting and explicitly marks missing fee information as pending. Unknown fees must not appear as zero or as confirmed estimates. The platform fee specified at checkout is an expected amount, separate from confirmation of what LMNL actually received. This confirmation boundary was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Each fee category reports `charged`, `returned`, and `net` separately. `charged` is the confirmed amount taken; `returned` is the confirmed amount refunded or credited; `net` is charged less returned. A buyer refund does not itself imply that a processing or platform fee was returned: the Site must separately confirm fee returns with the provider. These fields preserve fee history and show the amount retained, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Each currency's sales entry contains `processing_fees` and `platform_fees`. Each category contains `reporting_status`, either `pending` or `complete`, and the three fee amount fields. When complete, `charged`, `returned`, and `net` contain money objects. While that category's reporting is incomplete, those aggregate fields are `null`; the Site displays pending rather than a misleading total. Confirmed individual fee records remain available in admin Order details while the Event aggregate is pending. This representation was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Fee reporting
+
+`POST /v1/admin/orders/{order_id}/fee-reports` accepts verified fee reports from the Site backend. Each report identifies the recorded payment attempt and connection, a stable provider source reference, the fee category (processing or platform), whether it is a charge or return, and its amount and currency. It requires `Idempotency-Key`. HP-OS also deduplicates the source reference so the same fee cannot be counted twice under different request keys. Fee reporting is independent of Ticket issuance: a confirmed payment can issue Tickets while its fee information remains pending. These requirements were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+For the current snapshot, a fee category becomes complete only after the Site explicitly confirms its fees for every paid Order and confirmed refund included in that snapshot. No fee, or no fee returned, must be explicitly confirmed as zero; a missing report remains pending. The Event category is complete when all relevant Orders are complete. A new payment or refund makes the affected fee reporting pending again until verified. Complete describes the current snapshot and does not prevent later provider adjustments from updating it. These completeness criteria were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+## Notification jobs
+
+HP-OS maintains a durable notification queue for approval emails, Ticket emails, Event-change notifications, and Wallet updates. HP-OS records required work; the Site backend retrieves it, executes credential-dependent provider calls, and reports the outcome using its Site API key. HP-OS retains pending, failed, and completed job states for recovery and admin visibility. This preserves reliable delivery without retaining Site or organization credentials in HP-OS, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+References in this contract to sending, resending, or retrying email mean queuing and tracking the required notification work in HP-OS, with actual sending and provider verification performed by the Site backend. Wallet signing and update execution also remain on the Site backend.
+
+HP-OS saves required notification jobs in the same transaction as the operational change that triggers them. Approval and its email job are saved together, as are Ticket issuance and its initial email job. If HP-OS cannot save the required job, the operation does not report success. Later Site sending failures remain recoverable without undoing the approval or issuance. This prevents successful changes from silently losing required notifications, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Job claims
+
+`POST /v1/admin/notification-jobs/claims` atomically assigns available jobs to the Site backend with a five-minute lease and returns their IDs, payloads, claim identifier, and lease expiry. Another worker cannot claim these jobs while the lease is active. The Site can renew its lease for longer work and reports outcomes against its claim. If a provider outcome is uncertain, the Site must verify it before resending; a lease coordinates workers but does not itself prevent duplicate external emails. This claiming model was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Lease renewal and outcome reports
+
+| Request | Purpose |
+| --- | --- |
+| `POST /v1/admin/notification-jobs/claims/{claim_id}/renew` | Extend an active lease to five minutes from renewal. |
+| `POST /v1/admin/notification-jobs/{job_id}/outcome-reports` | Report `completed`, `failed`, or `unknown`, with the claim ID and available provider references. |
+
+Claims, renewals, and outcome reports require `Idempotency-Key`. New reports require an active matching claim; an expired or mismatched claim returns HTTP `409` with `claim_conflict`. Within the replay period, a retry of an already accepted report reuses its original result under the safe-retry rules. For email jobs, completed means sending was confirmed, not necessarily inbox delivery; delivery confirmation is reported separately. An unknown outcome must be verified before another send attempt. These operations were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Email delivery reports
+
+`POST /v1/admin/notification-jobs/{job_id}/delivery-reports` accepts `outcome` (`delivered` or `failed`), `provider_message_reference`, `provider_event_reference`, and `observed_at`. The Site verifies provider notifications before reporting them. HP-OS matches the message to the job, deduplicates events, and retains delivery history. Reports require `Idempotency-Key` but no active claim because delivery notifications can arrive after the sending lease ends. A confirmed send remains in history even if delivery later fails. This operation was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+## Admin Order recovery
+
+Order recovery uses `POST /v1/admin/orders/{order_id}/actions/{action}` with these supported actions:
+
+| Action | Purpose |
+| --- | --- |
+| `retry_ticket_issuance` | Safely retry issuance for a confirmed paid Order awaiting Tickets. |
+| `resend_ticket_email` | Send the existing Tickets to the current delivery email. |
+| `correct_delivery_email` | Replace buyer access links and resend to a corrected `email`. |
+
+All actions require `Idempotency-Key` and `expected_version`. The Site must verify the purchase before permitting delivery-email correction. Issuance retries cannot create duplicate Tickets, and resends cannot issue new ones. Correcting delivery email preserves original checkout details and the approved attendee association on private Tickets and applies the [link-replacement rules](../features/ticketing.md#delivery-order-access-and-buyer-correction). These recovery actions were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+## List pagination
+
+Event, Order, Ticket, and Access Request lists use cursor pagination. Each request returns 50 records by default and permits a requested page size of at most 100. A response includes a continuation cursor when more results are available; the Site sends that cursor to retrieve the next page. This keeps responses manageable as Site history grows, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+List parameters use `limit` and `cursor`; public Event lists additionally use `period`, as specified above. Cursors are opaque, bound to the authenticated Site and original filters, ordering, and page size, and valid for one hour. Changing those parameters requires starting a new list. An invalid, expired, or mismatched cursor returns HTTP `422` with `invalid_cursor`; the Site restarts from the first page.
+
+Pagination reads current data rather than a frozen snapshot. Records changed during browsing may move between pages; refreshing restarts the list. Event totals use a separately consistent snapshot.
+
+### Admin list filters and ordering
+
+| List | Optional filters |
+| --- | --- |
+| Orders | `payment_status`, `issuance_status`, `delivery_status`, `refund_status`, `email`, `order_reference` |
+| Tickets | `admission_status`, `can_admit`, `email` |
+| Access Requests | `status` (`pending`, `approved`, `rejected`), `email` |
+
+Filters combine using AND; email and reference filters use exact matches. Order and Ticket email filters use the current delivery email, while Access Request email filters use the intended attendee's email. All three lists default to `created_at` descending, with their record ID ascending for ties. Without filters, they return all records for the requested Event. Manual Ticket lookup uses the same Order ordering. These rules were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+## Success response format
+
+Successful JSON responses use a common wrapper with `data` and `request_id`. Single-record responses put an object in `data` and omit `pagination`. Lists put an array in `data` and include `pagination` with `next_cursor`; this value is `null` when there are no more pages. This gives Sites one predictable response structure, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+```json
+{
+  "data": [],
+  "pagination": { "next_cursor": null },
+  "request_id": "..."
+}
+```
+
+## Error response format
+
+Every API error uses a common structured JSON format containing a stable error code, a readable explanation, and a request identifier for tracing the failure. Invalid input also includes field-specific details. Sites handle errors by their stable codes rather than parsing explanation text; for example, a sold-out response uses `sold_out`. This keeps error handling consistent across operations, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Missing or invalid Site API keys return HTTP `401 Unauthorized`. A request for a record outside the authenticated Site returns the same HTTP `404 Not Found` response and `not_found` code as a request for a nonexistent record, without disclosing whether another Site owns it. This preserves the Site data boundary, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Errors contain `error` and `request_id`. The `error` object contains `code`, `message`, and `details`. Each field-specific detail contains `field`, `code`, and `message`; `details` is an empty array when no field-specific errors apply. Sites use codes to handle errors and messages to explain them. This structure was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+```json
+{
+  "error": {
+    "code": "validation_failed",
+    "message": "The request contains invalid fields.",
+    "details": [
+      {
+        "field": "starts_at",
+        "code": "offset_required",
+        "message": "Include a UTC offset."
+      }
+    ]
+  },
+  "request_id": "..."
+}
+```
+
+### HTTP error statuses
+
+| Status | Meaning |
+| --- | --- |
+| `400` | Malformed request, such as unreadable JSON. |
+| `401` | Missing or invalid Site API key. |
+| `404` | Record unavailable to the authenticated Site or endpoint. |
+| `409` | Conflict with current state, including an outdated version, sold-out checkout, or changed price. |
+| `422` | Readable request containing invalid field values. |
+| `429` | Too many requests. |
+| `500` | Unexpected HP-OS failure. |
+| `503` | Service temporarily unavailable. |
+
+The stable error code identifies the specific problem within each status; for example, `version_conflict` and `sold_out` use `409`. These mappings were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10). See [common response and error defaults](#common-response-and-error-defaults) and the operation-specific codes above and below.
+
+## Quote before checkout
+
+The Site obtains an authoritative price quote from HP-OS before creating an Order. The quote includes the full buyer-facing price breakdown and does not reserve capacity. When the buyer proceeds, the Site submits that quote to create the Order and Reservation. HP-OS checks current price and availability again. If the price has changed, it does not create the Order or Reservation; the Site shows the updated total and obtains buyer confirmation before submitting again. Once checkout starts, the Order retains its accepted quote under the [ticketing rules](../features/ticketing.md#public-checkout-and-payment). This lets buyers review the full total without holding capacity merely by requesting a price, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Checkout-start endpoints
+
+| Request | Input |
+| --- | --- |
+| `POST /v1/public/events/{event_id}/quotes` | Requested `quantity`. |
+| `POST /v1/public/orders` | `quote_id`, buyer `name` and `email`, plus `access_request_token` for private Events. |
+
+Both operations require `Idempotency-Key`. The quote response includes its ID, price breakdown, total, currency, and expiry. Order creation revalidates the quote, access permission, and capacity and creates the Order and Reservation together. It returns the Order ID, reference, buyer access token, and checkout deadline. The Order begins unpaid. These operations were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Quotes expire 10 minutes after creation. Using an expired quote to create an Order returns HTTP `409` with `quote_expired`. The Site requests a fresh quote and obtains buyer confirmation again if the total changed. Quotes reserve no capacity. Once the Order is created, its accepted price is preserved and the separate 15-minute checkout window begins; expiry of the original quote does not end that active checkout. This lifetime was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Quote responses contain `quote_id`, `event_id`, `quantity`, `unit_price`, `subtotal`, `buyer_fees`, `tax_total`, `total`, and `expires_at` inside the common `data` wrapper. Money fields use the agreed amount-and-currency objects. `buyer_fees` is a list of labeled fee amounts, or an empty list when none apply. The total equals subtotal plus buyer fees plus tax. Buyer-facing fees are separate from provider processing fees and LMNL platform-fee deductions reported after payment, so those deductions are not counted twice. These fields were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+## Access Request operations
+
+| Request | Purpose |
+| --- | --- |
+| `POST /v1/public/events/{event_id}/access-requests` | Submit a request with `name` and `email`. |
+| `GET /v1/admin/events/{event_id}/access-requests` | List requests using pagination. |
+| `POST /v1/admin/access-requests/{request_id}/actions/{action}` | Approve, reject, or undo a decision. |
+
+Supported actions are `approve`, `reject`, and `undo_decision`. All writes require `Idempotency-Key`; admin decision actions also require `expected_version`. Approval sends a checkout link without reserving capacity. Undoing approval before payment invalidates its link and ends its unpaid checkout under the [Access Request rules](../features/ticketing.md#private-access-requests). These operations were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Access Request `name` and `email` identify the intended attendee being considered for admission, even if someone else will pay. Admin users approve that named attendee. Checkout separately collects the purchaser's name and email, and the private Ticket retains its association with the approved attendee. Public checkout continues without individual attendee details. This supports vetting intended attendees while keeping payer identity separate, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Multiple independent Access Requests for one Event may have identical attendee names and emails. Each request requires its own approval and permits one paid Ticket; this does not enable a multi-ticket private Order. A new intentional submission uses a new idempotency key and creates a separate request, while a retry with the same key reuses its original submission under the safe-retry rules. There is no uniqueness restriction on attendee name or email per Event. This keeps repeated requests simple without conflating intentional submissions with network retries, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Changing attendee details on an approved, unpaid request is an exceptional correction: approval must first be undone, then the corrected request approved again. Undoing approval invalidates the old checkout link, and renewed approval sends a new one. Normal checkout carries the approved attendee details forward without requesting them again; changing the purchaser's checkout details does not change that attendee association. This preserves the identity that was vetted without adding a routine correction step, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+Each approved request allows only one active unpaid Order at a time. A second checkout attempt returns HTTP `409` with `access_checkout_in_progress` while the first is active or has an unresolved payment. Payment retries use the existing Order. Once an unpaid checkout safely expires or ends, the approval may start another Order while sales remain open. After a successful purchase, further attempts return HTTP `409` with `access_already_used`. This enforces one purchase per approval without preventing multiple independent approved requests with identical names and emails, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Admin Access Request object
+
+`GET /v1/admin/access-requests/{request_id}` retrieves one Access Request. Lists, direct lookup, edits, and decision actions use the same admin object containing `request_id`, `event_id`, `name`, `email`, `status`, `version`, `created_at`, `updated_at`, `decision_at`, and `paid_order_id`. Name and email identify the intended attendee. `decision_at` is `null` while pending; `paid_order_id` is `null` until a successful purchase. Decision history is preserved separately, and approval tokens remain outside normal admin list responses. This object and lookup endpoint were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Approval-link lookup
+
+`GET /v1/public/access-requests/{access_request_token}` resolves an approval link and returns its Event, approved attendee details, one-Ticket limit, and whether the approval has already produced a paid Order. The Site uses it to present private checkout without collecting attendee details again. HP-OS still checks sales availability when checkout is requested and prevents a second successful purchase using the approval. Invalidated links return HTTP `404` with `not_found`. Like other public endpoints, it is called through the Site backend with the Site API key. This operation was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Exceptional attendee correction
+
+`PATCH /v1/admin/access-requests/{request_id}` accepts `name`, `email`, and `expected_version` and requires `Idempotency-Key`. Correction is allowed only while the request is pending, with no paid Order or unresolved payment. An approved or rejected request must first have its decision undone. Other states return HTTP `409` with `invalid_state`. This keeps corrections under Site-defined admin permissions and prevents attendee identity changes during unresolved payment or after Ticket issuance, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+## Payment configuration reads
+
+| Request | Purpose |
+| --- | --- |
+| `GET /v1/admin/payment-configuration` | Retrieve the Site's active connection for new Orders. |
+| `GET /v1/admin/payment-connections/{connection_id}` | Retrieve a connection assigned to the Site or retained for its historical Orders. |
+
+Responses contain connection ID, provider, environment, and required non-secret account or location references, never credentials. Historical Orders continue using their recorded connection after the active connection changes. These endpoints are read-only; HP-OS operators still manage assignments and fee terms under [ownership](../ownership.md#data-separation-and-payment-execution). These operations were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+## Payment attempt setup
+
+HP-OS creates the payment-attempt record before the Site backend calls the payment provider.
+
+| Request | Purpose |
+| --- | --- |
+| `POST /v1/admin/orders/{order_id}/payment-attempts` | Create a payment attempt and return its ID, connection, and authoritative payment amounts. |
+| `POST /v1/admin/payment-attempts/{attempt_id}/checkout-reference` | Register the provider checkout reference before opening checkout to the buyer. |
+
+Both operations require `Idempotency-Key`. The Site associates provider checkout with the HP-OS attempt ID and registers the available checkout reference before opening it to the buyer under [ownership](../ownership.md#data-separation-and-payment-execution). This gives HP-OS a recorded attempt against which to validate subsequent payment reports, including when several Sites share a provider connection. These operations were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+An Order permits only one payment-capable or unresolved attempt at a time. Creating another while an existing provider checkout could still take payment returns HTTP `409` with `payment_attempt_in_progress`. The Site may retry through the existing provider checkout. A replacement attempt requires confirmation that the previous checkout can no longer take payment and that the Order's checkout window remains open. Paid Orders cannot start another attempt. This prevents independent provider checkouts from charging the same Order, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Payment outcome reports
+
+`POST /v1/admin/payment-attempts/{attempt_id}/payment-reports` accepts Site-verified provider outcomes: `processing`, `paid`, `failed`, `canceled`, and `unknown`. Reports include the connection, provider references, provider observation time, and amount and currency where applicable. They require `Idempotency-Key`; HP-OS also prevents duplicate fulfillment using the recorded attempt and payment identity. HP-OS validates reports against the recorded attempt under [ownership](../ownership.md#data-separation-and-payment-execution).
+
+Only a valid, confirmed `paid` report can trigger Ticket issuance, subject to the [cancellation and fulfillment rules](../features/ticketing.md#public-checkout-and-payment). An `unknown` outcome preserves the unresolved state and Reservation, while conflicting reports are retained for investigation. Returning from provider checkout never counts as payment confirmation. This operation and its outcomes were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Refund outcome reports
+
+`POST /v1/admin/orders/{order_id}/refund-reports` records refund outcomes already verified by the Site backend; it does not initiate a provider refund. Reports identify the original payment attempt and connection, provider payment and refund references, amount, currency, and one of `processing`, `completed`, `failed`, or `unknown`. HP-OS deduplicates provider refund references, including reports for Orders on previous payment connections.
+
+Only completed refunds change sales totals. When completed refunds cover the full Order amount, its Tickets become unusable under the [refund rules](../features/ticketing.md#refunds-and-event-totals); partial refunds do not automatically revoke Tickets. This reporting operation was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+### Checkout setup failure
+
+`POST /v1/admin/payment-attempts/{attempt_id}/setup-failure` requires `Idempotency-Key` and a reason such as `provider_unavailable` or `quote_mismatch`. Before reporting a setup failure that releases capacity, the Site must confirm that no provider checkout remains capable of taking payment. HP-OS then ends the unpaid checkout and releases its Reservation. If payment could be underway or its result is uncertain, the Site reports `unknown` instead and the Reservation remains held. This prevents capacity release while the buyer might still complete payment, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+## Money values
+
+All money values use integer amounts in the currency's smallest unit together with a currency code. This applies to prices, fees, taxes, payments, refunds, and sales totals. For example, USD $25.00 is represented as `{ "amount": 2500, "currency": "USD" }`. The Site formats these values for display. Integer amounts avoid decimal-rounding errors, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+## Dates and times
+
+API timestamps include an explicit UTC offset. Each Event also stores a named time zone, such as `America/Los_Angeles`, for local-time presentation. For example, an Event may use `{ "starts_at": "2026-10-10T19:00:00-07:00", "time_zone": "America/Los_Angeles" }`. HP-OS rejects timestamps without an offset. Explicit offsets identify exact moments independently of server settings, while the named time zone supports correct local display across daylight-saving changes, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+## Detailed schemas and operational rules
+
+The following technical defaults complete the decisions approved during [ticket #10](https://github.com/fvckzest/HP-OS/issues/10). They define planned behavior, not implemented endpoints or verified provider integrations. This section supplies the exact details referenced by the earlier sections.
+
+### Request conventions and validation
+
+- All endpoints require HTTPS and `Authorization: Bearer <site_api_key>`. Requests with JSON bodies use `Content-Type: application/json`; responses use JSON. HP-OS derives Site scope from authentication, not a submitted `site_id`.
+- HP-OS operators issue and revoke Site keys. Only key-verification hashes are retained in HP-OS; the plaintext key is given to the Site at issuance. Revoked keys return `401`, and rotation does not change Site-scoped idempotency history. This authentication mechanism is separate from the prohibition on retaining external service credentials.
+- Identifiers are opaque strings. Clients do not infer ordering, ownership, or permissions from their contents. Versions are positive integers. Money and quantity values must be integers within the JSON safe-integer range; floating-point amounts are rejected.
+- Money uses uppercase currency codes. A price must be positive because free ticketing is deferred. Capacity is a nonnegative integer. Public quantity is 1–8; private quantity is exactly 1.
+- Timestamps are RFC 3339 strings with `Z` or a numeric UTC offset. Responses normalize timestamps to UTC. Event `time_zone` is an IANA time-zone name; submitted Event offsets must agree with that zone at the specified instant.
+- Names and titles are trimmed, nonempty strings of at most 200 characters. Descriptions are plain multiline text of at most 20,000 characters, not HTML. Venue addresses are text of at most 1,000 characters. Email is a valid address of at most 254 characters; comparisons trim whitespace and ignore case. Purchase-time spelling is retained in the original identity snapshot. Display formatting belongs to the Site.
+- Unknown request fields, invalid enums, invalid timestamps, and out-of-range values return `422 validation_failed` with field details. Unreadable JSON returns `400 invalid_request`. JSON request bodies are limited to 64 KiB; oversized bodies return `413 request_too_large`. Unsupported media types return `415 unsupported_media_type`.
+- Admin writes include `actor: { "type": "user" | "system", "reference": "..." }`, a non-secret Site-local identifier for audit attribution. HP-OS records this Site assertion but does not authenticate that person or enforce their role. Public submissions do not require an actor. Actor is audit metadata, not a credential.
+- Empty bodies on actions are `{}`; admin human actions still include their required actor and version. `DELETE` mapping requests carry a JSON body with `expected_version` and actor.
+- All writes require `Idempotency-Key`, including reports, corrections, renewals, and mapping removal. Quote creation is a write. Manual lookup is read-only despite using POST and does not require an idempotency key or actor.
+
+### Retry and concurrency details
+
+Idempotency compares the method, canonical route, and semantic JSON body, ignoring object-key order but distinguishing omission from explicit `null`. Matching replays preserve the original HTTP status and domain result; tracing may use the current request ID. Replays do not regenerate tokens or return a newer record version. A response is historical and may contain a link that has since been replaced.
+
+Missing or malformed keys return `422 validation_failed`. Authentication and structural validation happen before a key is registered. Definitive domain results are replayable; an unresolved transport or server failure must be recovered before deciding whether the original action committed. Used-key fingerprints remain for the Site's lifetime after replayable results expire. A matching expired key returns `idempotency_expired`; conflicting reuse still returns `idempotency_conflict`.
+
+Sites retry transient calls up to five times with increasing delays of 1, 2, 4, 8, and 16 seconds, adding jitter and respecting a longer `Retry-After`. Interactive exhaustion displays a temporary error without creating a replacement action key. Verified payment, refund, fee, and delivery reports remain in a durable Site outbox until HP-OS accepts them; background retries continue with a maximum interval of 15 minutes and expose persistent failures to Site administrators. A `409 request_in_progress` is retryable after its supplied delay. Other `409` responses require review or a new intentional action.
+
+HP-OS checks replay history before applying a fresh version check, so a committed action can be replayed after its record version changes. Fresh human edits and lifecycle actions compare `expected_version` atomically. Event versions track stored configuration changes, not time passing or derived inventory counters; capacity edits still validate current Reservations and issued/admitted Tickets atomically. Payment, delivery, and Admission facts advance the versions of affected operational records. Automated reports use source identities and state validation, not a human `expected_version`.
+
+### Event field and action rules
+
+Draft fields may be omitted or `null`, including venue and offering configuration. Supplied nested objects merge by field. Publication requires nonempty title, description, venue name, visibility, valid start/end timestamps, and time zone; end must follow start. Required publication fields cannot be cleared afterward. Price, capacity, and both sales timestamps must be present before sales can open. Sales closing must follow opening and be no later than Event end. Published sales configuration cannot be cleared once configured; price and capacity edits affect new Orders only and retain the established capacity floor.
+
+`check_in_opens_at: null` means use the current Event start, including after a start-time edit. An explicit check-in opening cannot be later than Event end. Public and admin responses return the effective opening time; admin responses also include `check_in_uses_event_start` so the Site can distinguish the default from an explicit value. Strings are plain text; public responses never include draft records.
+
+Event actions require `expected_version` and actor. Publish requires a draft meeting publication rules. Stop sales requires a published, noncanceled Event that has not ended. Resume requires complete configuration, an open scheduled window, and available capacity. Cancel requires a published, noncanceled Event. Archive requires an ended or canceled, unarchived Event. Unsupported actions return `404 not_found`; invalid state returns `409 invalid_state`. New requests to repeat an already completed action do not silently repeat effects; clients use the original idempotency key to replay it.
+
+`provider_mappings` is an array of `{ connection_id, resource_type, resource_reference, verified_at }`. Supported resource types are `square_item_variation` and `stripe_price`, matching the connection provider. Verification covers account, environment, resource existence, and ability to create checkout with the accepted quote. It does not prove live fee settlement. PUT and DELETE return the updated admin Event with `200`. Orders snapshot the mapping for their selected connection, or `null`; a connection switch does not reuse a mapping from a different connection. Catalogless checkout is permitted only if the chosen Site integration supports it without a catalog creation workflow.
+
+### List and lookup details
+
+`limit` is an integer from 1 through 100, default 50. Invalid page size, filters, or filter values return `422 validation_failed`. Subsequent requests repeat the original filter and page-size values with `cursor`; an omitted original value uses its documented default. Cursors are opaque URL-safe strings bound to the Site, endpoint, filters, ordering, and page size. Cross-Site or endpoint cursor reuse returns `422 invalid_cursor` without exposing another Site's data.
+
+Manual lookup accepts exactly one of `order_reference` or `email`, with `limit` and `cursor` in its JSON body. It returns `200` with paginated Order summaries containing `order_id`, `order_reference`, `buyer_name`, `delivery_email`, the four Order statuses, and `tickets` using the admin Ticket object. No match returns an empty array. It exposes neither Order-page nor Ticket-page tokens. Lookup never creates an Admission, and the admission endpoint always rechecks eligibility.
+
+Public Event current/past boundaries use HP-OS time: current requires `ends_at > now`; past uses `ends_at <= now`. Admin lists do not silently hide canceled or ended records. Optional status filters use a single enum value; combined filters are AND. Exact email matching uses the normalization above, without implying uniqueness of Access Requests.
+
+### Quote and Order creation details
+
+Quote input is `{ "quantity": 1 }`. Quote creation returns `201` with the established quote object. Each `buyer_fees` entry is `{ "code": "...", "label": "...", "amount": 0, "currency": "USD" }`; code and label describe a buyer-facing charge, and amount is nonnegative. All quote components share a currency. Taxes and fees come from authoritative HP-OS pricing configuration; inability to determine the full total returns `503 payment_configuration_unavailable`. The provider must not add an unquoted fee, tax, or discount.
+
+Quotes bind Event, quantity, pricing configuration, and expiry to the authenticated Site. Private Events may expose a one-Ticket price quote before approval; obtaining a quote never grants checkout permission. Quotes cannot be created for drafts or canceled, closed, paused, unconfigured, or sold-out sales. Insufficient remaining quantity returns `409 insufficient_capacity`; zero remaining quantity uses `sold_out`. Other status errors are `event_canceled`, `sales_closed`, `sales_paused`, `sales_not_open`, and `sales_not_configured`, all `409`.
+
+Order creation input is `{ "quote_id": "...", "buyer": { "name": "...", "email": "..." }, "access_request_token": "..." }`; the token is required only for private Events and is rejected for public Events. It does not change approved attendee details. Creation locks quote validation, current availability, private approval use, and Reservation acquisition together. A used quote cannot create another Order under a different key: return `409 quote_already_used`. A changed quote returns `409 quote_changed` without reserving anything; the Site obtains a new quote and reconfirms its total.
+
+Order creation returns `201` with the buyer Order object plus `order_token`, and initial states `unpaid`, `not_started`, `not_sent`, and `none`. The initial deadline is 15 minutes after creation. The token supports the confirmation page before payment, but `tickets` is empty until the entire set is issued. Creating a private Order atomically attaches it to its approval. Canceling an Event blocks new Orders, terminates unpaid checkout permission, and never automatically refunds a charge.
+
+Buyer Order responses also include `checkout_status`: `active`, `awaiting_payment_result`, `expired`, or `ended`. Active means new payment starts remain permitted; awaiting a result means no replacement attempt is permitted. Expired and ended describe checkout, not whether a later provider report has revealed money movement. Original checkout identity remains immutable; admin responses contain its snapshot and the current delivery email separately.
+
+### Access Request payloads
+
+Submission input is `{ "name": "...", "email": "..." }` for the intended attendee and returns `201` with `{ "received": true }`. Every new idempotency key creates an independent request; identical names/emails are allowed. Creation requires a published, private, noncanceled Event that has not ended and whose sales closing time has not passed. Requests are permitted before sales opens, before sales configuration is complete, and while sold out or paused, because they do not hold capacity. Public Events return `409 access_not_required`; ended/canceled/closed Events use the applicable sales error.
+
+Admin lookup, edits, and decision actions return `200` with the admin Access Request. New records have `status: pending`, version 1, null decision time, and null paid Order. Approve/reject require pending state. Undo requires approved or rejected state and returns it to pending while preserving decision history. Undo after payment cannot change the paid Order, Ticket, approved attendee snapshot, or one-purchase history. A refunded purchase still consumes that approval. Undo before payment disables its link and instructs the Site to close provider checkout; if money could still be processing, the affected Reservation stays held until verified. Corrections remain blocked during that uncertainty.
+
+Approval lookup returns `200` with `{ request_id, event, approved_attendee: { name, email }, max_quantity_per_order: 1, purchase_completed, checkout_in_progress }`. It never returns the purchaser's identity or paid Order access token. Approved tokens remain usable for reading this context after purchase or sales closure, but cannot start another purchase. Undone, replaced, nonexistent, or wrong-Site tokens return `404`. Approval checkout is denied with `409 access_checkout_in_progress` or `access_already_used` as appropriate; unapproved or invalid tokens return `404`.
+
+### Payment metadata and attempts
+
+Connection objects contain `connection_id`, `provider` (`square` or `stripe`), `environment` (`test` or `live`), `account_reference`, and `location_reference` (nullable for providers that do not use one). Configuration reads return `{ "active_connection": <connection-or-null> }`. Attempt and historical-connection reads always use the connection frozen on the Order. A connection belongs to the Site's explicit assignment or historical Order, never merely its organization. Missing active payment configuration blocks new Orders with `503 payment_configuration_unavailable`.
+
+Creating an attempt accepts `{}` plus the admin actor and returns `201` with `{ attempt_id, order_id, connection, total, platform_fee, provider_mapping, provider_checkout_reference, provider_payment_reference, last_outcome, provider_can_take_payment, version, created_at, updated_at }`. Total and platform fee are money objects frozen from the Order. References and last outcome start null. `provider_can_take_payment` is null until setup or verification establishes the state; null is unresolved, not false. Paid Orders return `409 order_already_paid`; expired/ended checkout returns `409 checkout_expired` or `checkout_ended`.
+
+Checkout-reference input contains `connection_id`, `provider_checkout_reference`, and `provider_can_take_payment: true`. It returns `200` with the updated attempt. The Site retains the provider checkout URL and builds its own buyer-facing URLs. References are scoped by provider connection and must correlate to the recorded Order/attempt; shared buyer email is never sufficient. A reference already attached to another Site returns `404`; contradictory reuse inside this Site returns `409 provider_reference_conflict`.
+
+Payment report input contains `connection_id`, `source_reference`, `provider_checkout_reference`, nullable `provider_payment_reference`, `outcome`, `observed_at`, nullable `payment_started_at`, and `provider_can_take_payment` (true, false, or null). Paid reports also require integer `amount` and `currency`; other outcomes include both together when known. `source_reference` is a stable identity for the verified provider event or polling observation, not a new random ID on every retry. The Site must persist it in its reporting outbox.
+
+Reports return `201` with `{ report_id, applied, attempt, order_id }`; equivalent previously recorded source reports return `200` without another effect. HP-OS checks the Site, original connection, recorded checkout/payment references, amount, and currency. Contradictory reports are retained with an issue and return `409 payment_report_conflict`, blocking automatic fulfillment. Older verified observations do not regress a newer confirmed outcome. A matched confirmed paid result is not downgraded by a stale failed/unknown report, and refunds are processed separately. Provider source identity prevents repeat issuance even beyond the seven-day request-key replay window.
+
+A failed payment can retry within the existing Order's window if the existing provider checkout can still take payment. No replacement attempt is allowed until that checkout is confirmed closed and no processing/unknown result remains. A confirmed paid report records payment durably and schedules issuance; inability to issue Tickets cannot erase payment. Ticket issuance and its email job commit together as a complete set, with a unique `(order_id, ordinal)` per Ticket. Paid canceled Orders are blocked from usable issuance and flagged for provider-dashboard refund. A paid report after an already released Reservation is retained for investigation, never used to oversell automatically.
+
+Setup-failure input contains `reason` (`provider_unavailable` or `quote_mismatch`), `provider_checkout_closed: true`, and `payment_outcome: "not_started" | "failed" | "canceled"`. It returns `200` with the updated attempt. HP-OS checks its current state before ending the unpaid checkout and releasing the Reservation. Processing/paid/uncertain attempts cannot be cleared through this operation.
+
+### Checkout expiry and provider verification
+
+At the 15-minute deadline, HP-OS disables new payment starts. Where provider checkout could still accept money, the Reservation remains held and the attempt requires verification until the Site closes provider checkout and verifies its outcome. A processing/unknown result remains held. A checkout that never created an attempt can expire and release directly. An attempt in setup with an uncertain provider call is not treated as proof that no checkout exists.
+
+`GET /v1/admin/payment-attempts` supports `requires_verification=true`, optional `event_id`, and standard pagination. It returns attempts with their Order IDs and deadlines across current and historical connections, newest first with attempt ID ties. HP-OS sets verification-required for overdue live/uncertain checkouts, unknown/conflicted payments, and checkout termination requested by cancellation or approval withdrawal. The Site processes this durable frontier even after a worker restart; it must not rely solely on provider notifications. A poll at least once per minute is the normal recovery target, without claiming provider confirmation will arrive within a minute.
+
+`POST /v1/admin/payment-attempts/{attempt_id}/closure-reports` accepts `connection_id`, `source_reference`, `provider_checkout_reference`, `observed_at`, `provider_checkout_closed: true`, and `payment_outcome: "not_started" | "failed" | "canceled"`. It requires an idempotency key and returns `200` with the updated attempt. It cannot override paid, processing, or conflicting evidence. For expired/terminated checkout, a valid closure releases capacity; within an active window, it permits a replacement attempt without extending the original deadline. Cancellation still blocks Admission immediately, even if a Reservation must temporarily wait for provider verification.
+
+`POST /v1/admin/payment-attempts/{attempt_id}/actions/resolve` is an exceptional admin action requiring actor, expected version, `reason`, `verification_reference`, and `report`, an object using the payment-report input schema with a new source reference and verified outcome. It preserves report history and cannot waive Site ownership, connection, reference, quote-amount, or currency checks. It resolves only evidence that passes these checks; otherwise the conflict stays visible and no automatic issuance occurs. Refunds remain provider-dashboard operations. This gives staff a guarded resolution path without an API that declares arbitrary payment success.
+
+### Refund reports
+
+Refund reports require `Idempotency-Key` and the admin system actor. Input contains `attempt_id`, `connection_id`, `provider_payment_reference`, `provider_refund_reference`, `source_reference`, `outcome`, `amount`, `currency`, and `observed_at`. Outcomes use the previously defined refund enums. Reports return `201` with `{ report_id, applied, refund, order_id }`; equivalent repeated source reports return `200`. Refund objects contain `refund_id`, those references, latest outcome, amount, currency, and timestamps.
+
+Only completed provider refund identities contribute money; multiple completed partial refunds accumulate toward full refund. Completed total cannot exceed the verified payment amount; contradictory amount, currency, references, or state returns `409 refund_report_conflict` and creates an issue. Delayed observations never turn a completed refund back into processing or failed. Completion makes affected fee reporting pending until fee-return confirmation arrives. Full refunds revoke future Admission without deleting issued Tickets or previous Admissions. Unadmitted refunded Tickets return capacity; admitted Tickets do not.
+
+### Fee records and completeness
+
+Fee report input contains `attempt_id`, `connection_id`, `scope_type` (`payment` or `refund`), `scope_reference` (the provider payment or refund reference), `source_reference`, `source_revision` (positive integer), `category` (`processing` or `platform`), `direction` (`charge` or `return`), integer `amount`, `currency`, and `observed_at`. Amount is a nonnegative verified fee component, not a cumulative Order fee delta. Unknown fee amounts cannot be submitted as zero. Actual fee currency is retained, including a provider settlement currency different from checkout currency; no currency conversion is implied.
+
+A fee component is identified by connection, source reference, category, and direction. Equivalent revision reports return `200` with the existing record. New components or newer verified revisions return `201`; a newer revision replaces that component's current amount for aggregation while preserving history, rather than adding the revised amount again. Older revisions are retained but do not regress the current value. Contradictory same-revision reports return `409 fee_report_conflict`. A changed component makes its category pending until reconfirmed. Response is `{ fee_record_id, applied, order_id }`; admin fee records include all input fields and their ID/history. Fees must be attributable to the recorded Order's provider payment/refund, not arbitrary account-wide fees.
+
+`POST /v1/admin/orders/{order_id}/fee-confirmations` explicitly confirms a category for a provider payment or completed refund. It requires `Idempotency-Key`, actor, `attempt_id`, `connection_id`, `scope_type`, `scope_reference`, `category`, `totals` (a nonempty array of `{ currency, charged, returned }`, with nonnegative integer minor-unit amounts and unique currencies), and `observed_at`. HP-OS checks that component records sum to these totals; mismatch returns `409 fee_report_conflict`. Explicit zero totals with no components confirm that no fee or return applied. Confirmation returns `200` with `{ order_id, scope_type, scope_reference, category, reporting_status: "complete" }`. The array declares the complete verified currency set for that scope/category and must include every currency in its component records. A zero-fee scope explicitly includes its payment currency with both amounts zero. Omitted fee currencies never imply zero.
+
+A category is complete only when every relevant paid Order and completed refund has a matching current confirmation covering its fee components, including explicit zero cases. New payments/refunds or component revisions reopen affected completeness. Confirmation describes the known provider state as of its observation, not a promise that no future credit will occur. HP-OS retains planned platform fee separately from actual provider-confirmed fees; differences raise an admin issue without changing a verified actual amount or undoing issued Tickets.
+
+### Totals definitions
+
+Totals use the field names agreed above. Money rows cover the union of payment, refund, and actual fee currencies; amounts in different currencies are never added or converted. Gross sales sum accepted confirmed payments, refunded amount sums completed refunds, and net sales is their difference. Both fee categories are independently pending/complete per the confirmation rules; pending aggregate fields are null, while confirmed components remain inspectable per Order. With no relevant money activity, the configured offering currency has confirmed zero values; an Event with no price has an empty sales array.
+
+`issued` counts every issued Ticket, including used or refunded Tickets. `valid` counts issued, non-fully-refunded Tickets whose Event is not canceled; it can overlap admitted Tickets and does not apply the time window. `admitted` counts historical successful Admissions, including Tickets later refunded or canceled. Immediate ability to enter is represented by `can_admit`, not by the valid total. Capacity committed is the union of admitted Tickets and non-fully-refunded issued Tickets, plus held Reservations, avoiding double-counting admitted Tickets. Event cancellation does not fabricate capacity by deleting history.
+
+### Admission details
+
+Admission input is `{ "qr_token": "..." }` or `{ "ticket_id": "..." }`, never both, plus actor. Success data is `{ admission_id, ticket_id, event_id, admitted_at }`. No expected version is required. Check-in uses HP-OS time, including the opening instant and exact end instant; before opening uses `check_in_not_open`, after end uses `check_in_closed`.
+
+Rejection precedence is Site-safe not-found first, wrong Event on the same Site second, then canceled, fully refunded, already admitted, early, and late. Ticket `admission_blockers` returns every applicable blocker in that same business order. A blocked request creates no Admission. Replayed successful admission retains its original Admission ID/time. Lost connectivity never creates offline entry state; an ambiguous timeout is resolved by retrying the same key before treating another scan as a new action.
+
+### Buyer recovery and admin actions
+
+Recovery input is `{ "email": "..." }` and acknowledgment data is `{ "accepted": true }` with `202`. Matching Orders use current delivery email within this Site; correction invalidates outstanding temporary recovery access to that Order as well as normal page tokens. Recovery creates new 30-minute tokens and does not reveal permanent Order tokens through a temporary response. `GET /v1/public/orders/{order_token}` accepts either a valid normal Order token or that Order's temporary recovery token; Ticket tokens remain separately scoped. Public Order reads never return `order_token`; it is supplied by Order creation and delivery work only.
+
+Recovery requests are silently coalesced to at most one recovery email per normalized Site/email per minute and five per hour, with the same `202` acknowledgment whether matches exist or suppression occurs. Site-wide limits still use `429`. LMNL enforces visitor/IP abuse controls before forwarding public operations. Normal Order/Ticket tokens have no automatic expiry; recovery does not revoke them.
+
+Order retry/resend/correction actions contain actor and `expected_version`. Issuance retry requires a verified paid, non-fully-refunded, noncanceled Order awaiting issuance; it returns `202` with the admin Order and durable retry work. Resend requires issued Tickets and queues a new email job, returning `202` with the admin Order. A resend may report cancellation/refund accurately and cannot reactivate Tickets. Correction requires `email`, `verification_reference`, and `reason`; it returns `200` with the updated admin Order and queued delivery work. Original identity and private attendee association are immutable. Old page tokens, including temporary recovery tokens, are replaced, but admission QR tokens, Ticket IDs, existing Wallet passes, and Admission history remain unchanged.
+
+Issues in admin Order responses are `{ issue_id, code, status: "open" | "resolved", message, created_at, resolved_at }`; resolution requires verified evidence or the appropriate guarded action, never editing an issue into payment success. Reservation is `{ reservation_id, quantity, status: "held" | "consumed" | "released", expires_at, awaiting_provider_verification }`. Admin payment attempts, refunds, fee records, and jobs use their defined operational objects. Decision and action history retain actor, operation, timestamp, prior/new version, and non-secret evidence references.
+
+### Apple Wallet data fields
+
+Both Wallet-data endpoints return `{ ticket_id, event, qr_payload, attendee_name, used, voided, data_version }`. Event is the public Event object; used means an Admission exists; voided means Event canceled or Order fully refunded. Data version is an opaque change token that reflects every field affecting this payload, including Event changes and Ticket/Order state, not just Ticket configuration. Email correction does not change the QR or voided state.
+
+LMNL combines this data with its templates and artwork, assigns stable pass serials to Tickets, signs passes, hosts Apple's device registration/update service, holds its device registration and push credentials, and sends Apple notifications. HP-OS jobs reference Ticket IDs and changed operational versions; LMNL retrieves current data before generating updates. Site artwork revisions may trigger Site-local Wallet updates without inventing an HP-OS Event change. Apple device requests go to LMNL; HP-OS never receives Apple credentials or device registration tokens. Certificate eligibility, expiry, signing, and actual device updates require integration proof.
+
+### Notification job schema and recovery
+
+Job kinds are `access_approved`, `tickets_ready`, `order_recovery`, `event_changed`, `event_canceled`, and `wallet_update`. A job contains `{ job_id, kind, status, event_id, order_id, access_request_id, ticket_id, is_superseded, attempt_count, available_at, created_at, updated_at, requires_verification, provider_message_reference, payload }`; unrelated record IDs are null. Status is `pending`, `failed`, or `completed`; an active lease is separate claim metadata. `access_request_id` identifies the associated Access Request; it is distinct from the outer tracing `request_id`.
+
+Claim input is `{ "limit": 50, "kinds": [...] }` plus system actor; kinds may be omitted to claim all. Limit is 1–100. Claims return `200` with `{ claim_id, lease_expires_at, jobs: [...] }`; no available jobs returns null claim/expiry and an empty array. Claiming is a mutation, not cursor pagination. Renew returns `200` with claim ID and new expiry. Outcome input is `{ claim_id, outcome, provider_message_reference, observed_at, error_code }` plus actor; nullable fields are explicitly null where unavailable. Outcome reports return `200` with the job. Equivalent replay bypasses fresh lease checks; fresh conflicting/expired claims use `claim_conflict`.
+
+Payloads carry operational references, record versions, and current recipient/access data required for that job, never provider credentials or pass-signing/device credentials. For approval, payload contains attendee name/email and approval token; Ticket email contains current delivery email, buyer name, Event and Order references, and Order token; recovery contains delivery email and matching Order references with temporary tokens/expiries; Event notifications contain recipient/Order references and changed Event details; Wallet jobs contain Ticket ID and change version only. Sites construct their own URLs and render templates. Each recipient or Ticket has a separate durable delivery unit; a broad Event change is not one all-or-nothing provider send.
+
+Jobs are saved with their triggering change. Claim-time payloads use current versions and credentials remain Site-local. Obsolete unsent approval or delivery-email jobs receive `is_superseded: true`, are excluded from claims, and retain their last dispatch status and history. They must not send an invalidated link or use an old address. Sending already completed externally cannot be undone; reports/history remain. Workers recheck current job eligibility before send. Stable job ID is the external-send idempotency identity where the provider supports it, and the Site durably tracks dispatch references.
+
+An expired lease makes unfinished work claimable again with `requires_verification: true`. Unknown outcomes do the same after the claim ends, and do not authorize a blind resend. A new worker first checks the provider/its durable dispatch log using stable job identity; it reports the confirmed existing send, sends only if verified not sent, or retains unknown and alerts staff. If verification cannot establish the outcome, the job remains unresolved and cannot be declared completed. Known transient failures retry after 1 minute, 5 minutes, 15 minutes, 1 hour, and 6 hours; exhaustion is failed and admin-visible. Permanent invalid-address/bounce failures require correction or an intentional resend. A succeeded send completes dispatch; delivery reports update separate message history and applicable Order delivery status without undoing the completed dispatch.
+
+`GET /v1/admin/notification-jobs` accepts optional `status`, `kind`, `event_id`, `order_id`, and `requires_verification`, with standard pagination and newest-first job ID ties. `GET /v1/admin/notification-jobs/{job_id}` returns one job for admin inspection/worker recheck. Delivery reports must match a recorded message reference for the job. Older provider observations cannot overwrite newer delivery state; contradictory same-event reports return `409 delivery_report_conflict`. For resend history, Order delivery status follows its newest applicable Ticket-email job, preserving all earlier attempts. Other notification kinds do not overwrite Ticket delivery status.
+
+### Common response and error defaults
+
+Reads, edits, mapping changes, decision actions, claims, renewals, closures, resolutions, fee confirmations, and notification outcome/delivery reports return `200` with their defined data. Record creation returns `201`; accepted asynchronous issuance retry, resend, and recovery return `202`. Domain-effect reports use the specific new/repeated statuses above. No operation returns an empty `204`; clients always receive the common wrapper. JSON response `request_id` traces the HTTP request and is distinct from domain IDs.
+
+All field errors use `details` entries `{ field, code, message }`, with dot paths for nested fields and `headers.` paths for header validation. Stable generic codes are `invalid_request`, `validation_failed`, `unauthorized`, `not_found`, `invalid_cursor`, `request_too_large`, `unsupported_media_type`, `rate_limited`, `internal_error`, and `service_unavailable`. Domain conflict codes are defined by operation above, plus `invalid_state`, `version_conflict`, `idempotency_conflict`, `idempotency_expired`, `request_in_progress`, and `claim_conflict`. Reasons must not expose another Site's data or credentials. Unexpected failures return `500 internal_error`, with investigation through the request ID rather than a raw stack trace.
+
+The default Site-wide budget is 1,200 requests per minute across its keys, including background workers; operators may raise this configured budget for a Site. Exceeding it returns `429 rate_limited` with `Retry-After` seconds. Temporary dependency unavailability returns `503 service_unavailable` or `payment_configuration_unavailable`, also with `Retry-After`. Neither means a new idempotency key should be generated. Admission eligibility cannot be inferred from cached responses; Ticket/Order access and staff operational reads use `Cache-Control: no-store`. Public Event content may be cached briefly by LMNL for presentation, but quotes and admission remain authoritative live checks.
+
+## Contract verification and boundaries
+
+Before implementation is accepted, verify the following against the contract. These are required behavior checks, not a claim that a running API exists.
+
+| Area | Required evidence |
+| --- | --- |
+| Site isolation | Missing/revoked keys use 401; cross-Site IDs, tokens, related records and shared-provider references reveal no data. |
+| Retries | Lost responses, concurrent same-key calls, conflicting key reuse, seven-day expiry, source deduplication, and version conflicts do not repeat effects. |
+| Event setup | Empty/incomplete draft, nested partial edits, publication, unconfigured sales, fixed visibility, capacity floor, and status precedence. |
+| Checkout | Quote change/expiry/reuse; complete accepted amounts; atomic capacity; one private Order and one payment-capable attempt; processing/unknown timeout holds. |
+| Payment recovery | Site restart discovers overdue/unknown attempts; closure before release; stale/conflicting reports; paid issuance failure retains payment; cancellation and late charges. |
+| Private access | Separate payer and attendee, identical repeated requests, independent approvals, withdrawal/reapproval, one successful use, guarded exceptional correction. |
+| Buyer access | Initial Order link, individual pages, temporary recovery with non-enumerating acknowledgment, corrected lookup and page links, preserved old QR/Wallet presentations. |
+| Admission | Scan and manual lookup, all rejection reasons, lost connectivity, and two concurrent devices produce exactly one Admission. |
+| Fees/refunds | Actual rather than estimated fees; complete/null pending aggregates; source revisions and zero confirmations; partial/full refunds; historical connections; currency separation. |
+| Jobs and Wallet | Atomic outbox, claims/renewal/fencing, expired/unknown dispatch verification, old delivery events, stale payload suppression, Site-held credentials and pass updates. |
+
+Provider selection, account eligibility, actual tax/fee configuration, provider ability to enforce checkout closure, platform-fee settlement, email verification, deployment workers, and Apple signing/device updates require separate implementation and end-to-end evidence. They are not settled by a payload design. First prove the full single-Ticket journey, then public multi-ticket checkout, under the [release proof](../features/ticketing.md#release-proof). Free Tickets, private multi-ticket Orders, automatic catalog creation, browser-to-HP-OS access, arbitrary custom fields, bulk holder email, CSV export, Site-initiated refunds, and separate reconciliation reporting remain deferred.

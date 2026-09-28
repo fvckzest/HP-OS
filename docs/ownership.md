@@ -8,12 +8,16 @@ This file holds boundaries shared by events, ticketing, and later features. The 
 
 - A customer organization owns one or more Sites. Each Site belongs to exactly one organization. Moving a Site between organizations is outside the first release.
 - Each Site owns its events, buyer records, orders, tickets, admission records, and sales totals. Buyer and order records are not shared across Sites. Combined organization reporting is deferred.
-- Each Site backend has its own HP-OS API key. The Site's CRUD interface authenticates and authorizes staff. HP-OS authorizes the server-to-server call and enforces the key's Site boundary. HP-OS has no staff login or organization administrator role in the first release. A person overseeing multiple Sites uses the relevant Site interfaces.
+- Each Site backend has its own HP-OS API key. Each Site alone defines and enforces staff permissions, including limited door access, and authorizes staff actions before calling HP-OS. HP-OS authenticates the server-to-server call, enforces the key's Site boundary and operational business rules, and does not evaluate individual staff roles. This keeps staff access policy with the Site that authenticates staff; see [ticket #10](https://github.com/fvckzest/HP-OS/issues/10) and [Site authorization](api/api.md#site-authorization). HP-OS has no staff login or organization administrator role in the first release. A person overseeing multiple Sites uses the relevant Site interfaces.
 - The organization owns payment connections. It may explicitly assign one connection to several Sites or use separate connections. Sharing a connection does not change which Site owns an order or ticket.
 - The customer is the seller for ticket sales. HP-OS receives a platform fee through the payment provider. One fee agreement belongs to the organization and applies across its Sites.
 - HP-OS operators manually set up organizations, Sites, connection assignments, API keys, and fee terms in the first release. Customers use Site CRUD interfaces for daily operations.
 
 These boundaries keep operational records Site-specific while allowing an organization to share a payment connection and fee agreement across its Sites. See the [decision discussion](https://github.com/fvckzest/HP-OS/issues/3#issuecomment-5848567711) for context.
+
+## External service credentials
+
+HP-OS retains no external service credentials supplied by a Site or customer organization, including payment-provider credentials, email-provider credentials, or Apple Wallet signing certificates and private keys. Site backends hold these credentials and execute credential-dependent integrations. HP-OS retains operational records and non-secret integration references. This keeps external service secret custody outside HP-OS, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10). HP-OS authentication of its own Site API keys remains the agreed server-to-server access boundary.
 
 ## Data separation and payment execution
 
@@ -33,4 +37,4 @@ These rules preserve Site ownership while keeping payment credentials and provid
 
 ## Pending details
 
-Provider selection, account eligibility, and the concrete platform-fee setup still require validation against the [provider research](research/payment-email-provider-constraints.md). The rules above assign responsibilities; they do not prove provider integration or fee settlement. Exact API-key behavior, payment-report operations, fields, and errors belong in the [API contract](api.md) after [ticket #10](https://github.com/fvckzest/HP-OS/issues/10) is resolved.
+Provider selection, account eligibility, and the concrete platform-fee setup still require validation against the [provider research](research/payment-email-provider-constraints.md). The rules above assign responsibilities; they do not prove provider integration or fee settlement. Exact API-key behavior, payment-report operations, fields, and errors are defined in the [API contract](api/api.md), as agreed during [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).

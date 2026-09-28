@@ -2,7 +2,7 @@
 
 Research for [HP-OS issue #5](https://github.com/fvckzest/HP-OS/issues/5), checked 2026-09-26.
 
-Subsequent decision: [issue #9](https://github.com/fvckzest/HP-OS/issues/9) assigns payment credentials, provider calls, notification verification, and provider recovery checks to Site backends. The historical findings below describe provider requirements and sometimes assume HP-OS executes those calls; that assumption is superseded by [the settled ownership rules](../ownership.md#data-separation-and-payment-execution). The selected account and platform-fee setup still require integration validation. Email credential ownership is not settled by this payment decision.
+Subsequent decisions: [issue #9](https://github.com/fvckzest/HP-OS/issues/9) assigns payment credentials, provider calls, notification verification, and provider recovery checks to Site backends. [Issue #10](https://github.com/fvckzest/HP-OS/issues/10) further settles that HP-OS retains no Site or organization external service credentials, including email credentials and Apple Wallet signing credentials. The historical findings below describe provider requirements and sometimes assume HP-OS executes credential-dependent calls; that assumption is superseded by [the settled ownership rules](../ownership.md#external-service-credentials). The selected account and platform-fee setup still require integration validation; email account ownership and the delivery execution contract still require definition.
 
 ## Scope and evidence
 
