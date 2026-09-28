@@ -17,6 +17,7 @@ HP-OS is a shared cultural operations engine for LMNL-built websites. Events and
 | Current questions and work | [First-release Wayfinder issue](https://github.com/fvckzest/HP-OS/issues/1) and its linked tickets |
 | Dated source evidence | [Research](docs/research/) |
 | Local workbench tracing feasibility and integration boundaries (research, pending decisions) | [Local call tracing](docs/research/local-call-tracing.md) |
+| Planned local workbench API and workflow coverage | [Local testing coverage research](docs/research/local-api-workflow-testing-coverage.md) |
 
 Repository documents state settled guidance. GitHub issues hold open questions and current work; resolution comments preserve the full decision discussion. Research records evidence and does not establish HP-OS behavior by itself.
 
