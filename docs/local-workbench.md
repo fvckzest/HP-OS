@@ -1,6 +1,6 @@
 # Local testing workbench
 
-This document records local workbench decisions agreed with the product owner in [Choose the simplest beginner-friendly testing workflow](https://github.com/fvckzest/HP-OS/issues/58) and [Decide repeatable test data and failure controls](https://github.com/fvckzest/HP-OS/issues/60), under [Plan the HP-OS local API workbench](https://github.com/fvckzest/HP-OS/issues/56). The workbench is planned, not implemented.
+This document records local workbench decisions agreed with the product owner in [Choose the simplest beginner-friendly testing workflow](https://github.com/fvckzest/HP-OS/issues/58) [Decide repeatable test data and failure controls](https://github.com/fvckzest/HP-OS/issues/60), and [Settle incremental workbench delivery and verification](https://github.com/fvckzest/HP-OS/issues/61), under [Plan the HP-OS local API workbench](https://github.com/fvckzest/HP-OS/issues/56). The workbench is planned, not implemented.
 
 ## Starting point
 
@@ -46,7 +46,7 @@ One shared history includes guided workflow requests, manual requests, and obser
 
 Observed LMNL calls show what happened. They receive a pass/fail result only when an expected outcome has been defined. This preserves the distinction between observing an application call and checking it against a test expectation.
 
-The user can explicitly clear the workbench history. Clearing history removes workbench history records without changing Events, Orders, Tickets, Admissions, or other operational data. Resetting local test data is the separate control described below, agreed in [issue #60](https://github.com/fvckzest/HP-OS/issues/60). History storage and retention details belong to [issue #61](https://github.com/fvckzest/HP-OS/issues/61).
+The user can explicitly clear the workbench history. Clearing history removes workbench history records without changing Events, Orders, Tickets, Admissions, or other operational data. Resetting local test data is the separate control described below, agreed in [issue #60](https://github.com/fvckzest/HP-OS/issues/60). History storage and retention follow the [persistent evidence and export rules](#persistent-evidence-and-export) below.
 
 ## Protected values
 
@@ -120,6 +120,71 @@ Each run identifies which services are simulated and which are actual. Runs usin
 
 Reset and interruption controls cannot erase an external service's effects. Simulation and local API results do not replace required actual payment, email, Wallet, device, hosted, or production evidence in the [release procedure](release-and-cutover.md).
 
+
+## Delivery and implementation handoff
+
+The product owner confirmed this plan in [Settle incremental workbench delivery and verification](https://github.com/fvckzest/HP-OS/issues/61). Amend the existing first-release implementation tickets rather than creating separate workbench implementation tickets. Workbench requirements travel with the capability they inspect, preserving the implementation sequence and native dependencies.
+
+### Location, startup, and access
+
+Deliver a local-only `/workbench` page inside the planned HP-OS Next.js application. Provide one documented command that starts the required local services and prints the URL, plus clear service/configuration status and actionable startup errors. The initial command must work without an implemented local LMNL integration; show LMNL as unavailable until its corresponding capability arrives. Document first-time prerequisites separately.
+
+Explicitly enable the workbench through this local command; bind its viewer and local HTTP targets to loopback and verify the dedicated local test database before enabling controls. Refuse hosted/production targets and redirects to them. Local handlers require a local access check and valid Host/Origin; Site keys stay in the server environment. These handlers are development controls, not new business endpoints or a production staff-login system. Manual and guided requests execute the existing API over HTTP with normal authentication and business rules. Workbench tables cannot become operational authority.
+
+### First useful slice
+
+[Run HP-OS locally with persistent PostgreSQL](https://github.com/fvckzest/HP-OS/issues/23) delivers the page, startup command, service status, editable manual request runner, sanitized shared history, storage across restart, explicit history clearing, and masked JSON export. It also establishes the catalogue and capture mechanism for later additions. Where a business endpoint does not yet exist, expose its unavailable status rather than inventing a testing endpoint or reporting a passed business check. Site authentication/configuration and durable processing become testable with their existing foundation tickets.
+
+### Shared catalogue and capability status
+
+Keep a shared, version-controlled catalogue of request templates and guided workflow steps. Each entry identifies its explanation, plain fields and request details, expected outcomes, operational observations and their sources, values shared between steps, preparation, and required capabilities/configuration. Add entries with the relevant endpoint or workflow implementation; keep the catalogue aligned with the API contract and [coverage index](research/local-api-workflow-testing-coverage.md).
+
+Separate capability availability from execution results. Show **Unavailable** with the missing implementation, **Blocked** with the missing configuration/service or other prerequisite, and **Not run**, **Passed**, **Failed**, or **Interrupted** for execution state. Missing responses show **Outcome unknown**; absent capture is a separate evidence gap. Neither an absent capability nor an expected rejection is automatically a failed check. Disable execution that lacks its prerequisites and explain how it becomes available.
+
+### Additions by implementation stage
+
+| Stage | Workbench additions delivered with existing tickets |
+| --- | --- |
+| Foundation | Site access/configuration and isolation requests; durable-job reads, claims and reports; separate HP-OS/Site processing observations; repeat, concurrent, and interruption controls as the operations arrive. |
+| Public single-Ticket | Event preparation and publication, sales controls, quotes and Orders, Site-owned checkout and payment reports, issuance, initial email, buyer access and Admission. Build a guided complete purchase and repeat-Admission rejection scenario; distinguish simulated API behavior from the connected LMNL/provider-test journey. |
+| Recovery, refunds, and totals | Controlled deadlines, unresolved/conflicting payment and capacity holds, issuance/email recovery, Order recovery and email correction, Event changes/cancellation, provider-reported refunds, fees/totals, historical payment connections, and unattended worker recovery. Add named interruptions and safe recovery paths to the operation that needs them. |
+| Private Events and Wallet | Access Request preparation/decisions, one paid purchase per approval, purchaser/attendee separation, unsigned Wallet data and durable updates. Expose actual signing/device checks only when the Site integration and device prerequisites are ready. |
+| Public multi-Ticket | Extend the already verified one-Ticket workflow to quantities 1–8, complete atomic issuance, independent Ticket access/Admission, capacity races, and appropriate rejection checks. |
+| Release verification | Export revision/environment-specific local evidence for the release checklist. Hosted test and controlled real purchase/refund evidence still come from their approved environments and actual integrations; the local workbench neither operates on those databases nor grants approval to open sales. |
+
+Every applicable ticket includes request/catalogue entries, relevant before/after observations, success and expected-rejection scenarios, applicable retry/concurrency/interruption checks, and functional acceptance checks. Complete journeys grow only as their prerequisites arrive; do not rearrange implementation dependencies or expand the business contract.
+
+### Persistent evidence and export
+
+Store sanitized call history and workflow results in dedicated workbench tables in local PostgreSQL, separate from operational tables and durable business jobs. Retain them across application restart and operational test-data reset, until the user explicitly clears workbench history. Do not automatically age out entries. Operational reset must exclude these tables and preserve dataset labels; old references remain historical observations even after the associated operational records are removed.
+
+Record the source, run/step and attempt identifiers, dataset, repository revision, environment, per-service integration mode, request/response evidence, expectation used at execution, actual result, and observation provenance. Use the HP-OS response-envelope request identifier separately from Access Request domain identifiers. Exports are masked JSON snapshots of this evidence and its completeness markers. They contain no usable credentials, access tokens, QR payloads, or secret-bearing URLs. Protect before persistence/export, including nested bodies, paths, headers, and diagnostic errors.
+
+Use bounded capture that visibly marks truncation or excluded fields and does not consume the application's usable response. History is diagnostic evidence; it must not participate in the business transaction or change its commit/rollback outcome. The initial implementation does not require a separate tracing service, collector, or new cross-service tracing header. Capture manual/guided requests and HP-OS HTTP handling first; add actual local LMNL client and worker observations with the relevant Site capabilities. Correlate by returned HTTP request IDs and explicit run/job/domain links, show missing sides, and exclude workbench history polling from automatic capture. Labels must distinguish actual LMNL code from direct simulated requests.
+
+This PostgreSQL history choice supersedes the research proposal for a separate JSONL trace store and automatic seven-day/100 MB deletion in [local call tracing](research/local-call-tracing.md). The research remains evidence, not an alternative implementation instruction.
+
+### Capture failures and interrupted runs
+
+If recording fails, finish the API operation normally and show **History capture incomplete**. Never retry a business operation because recording failed. If storage cannot save the failure marker, expose degraded capture through the running workbench/process diagnostics; after an abrupt stop, retain an explicit capture gap rather than claiming every attempt was recorded. A check cannot pass when its required response or state evidence is missing.
+
+Preserve recorded results after restart and mark unfinished workflows **Interrupted**. Do not automatically resume or resend. Explicit recovery inspects current API state, respects same-request idempotency and external verification rules, and obtains protected values again from an authorized source or asks for them when needed. History snapshots alone cannot reconstruct a secret-bearing request. If the original request/key cannot be recovered safely, block that retry rather than create a replacement operation.
+
+### Functional acceptance checks
+
+Use observable outcomes through the two approved [testing boundaries](https://github.com/fvckzest/HP-OS/issues/22), not private functions or SQL structure as business proof:
+
+- One command starts the initial local slice and prints its URL. Missing services/configuration produce useful status; hosted/production controls are inaccessible and hosted targets/database configuration are refused.
+- Manual requests and available guided steps exercise normal HTTP authentication, validation, Site isolation and business rules against real test PostgreSQL. Capture actual local LMNL calls when the Site capability exists and label their source correctly.
+- Field/request synchronization preserves deliberate customized invalid requests. Shared values and retry keys remain inspectable; expectations are snapshotted per execution. Unexpected results pause continuous execution, while correct expected rejections pass.
+- Responses and relevant public/admin state observations expose expected/actual results and evidence provenance. Missing responses/observations and capture failures cannot produce a false pass.
+- History/results survive application restart and operational reset, retain dataset/revision/environment labels, and export as masked JSON. Clearing history leaves business records unchanged; operational reset preserves history.
+- Interrupted workflows do not resume automatically. Recovery checks current API state and respects original idempotency/verification rules. Lost responses and storage failures do not duplicate Orders, Tickets, Admissions, or dispatches.
+- Exercise nested/path/header secret redaction, malformed bodies, truncation, unavailable storage and interrupted capture. Business outcomes remain unchanged, and evidence gaps are visible.
+- Each added capability brings its catalogue entries and relevant success/rejection/recovery checks. Unimplemented or unconfigured steps explain their availability; configured actual integrations remain distinct from simulations.
+
+Controlled time, reset, background processing, repeat/concurrent requests and named interruptions follow the settled controls above. Business acceptance checks use real local PostgreSQL and the scheduler's bounded processing entry point. Complete LMNL journeys still require the relevant actual services and devices. No visual review is included, and publishing this handoff is not runtime verification or release approval.
+
 ## Related planning
 
-Test data and failure controls were agreed in [issue #60](https://github.com/fvckzest/HP-OS/issues/60); workbench delivery and persistence belong to [issue #61](https://github.com/fvckzest/HP-OS/issues/61). Planned scenario coverage is indexed in the [local testing coverage research](research/local-api-workflow-testing-coverage.md). These decisions preserve the existing [API contract](api/api.md). They do not implement a workbench or establish actual integration, hosted, or production readiness.
+Test data and failure controls were agreed in [issue #60](https://github.com/fvckzest/HP-OS/issues/60); workbench delivery and persistence were agreed in [issue #61](https://github.com/fvckzest/HP-OS/issues/61). Planned scenario coverage is indexed in the [local testing coverage research](research/local-api-workflow-testing-coverage.md). These decisions preserve the existing [API contract](api/api.md). They do not implement a workbench or establish actual integration, hosted, or production readiness.
