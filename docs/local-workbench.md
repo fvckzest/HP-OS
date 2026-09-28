@@ -1,6 +1,6 @@
 # Local testing workbench
 
-This document records local workbench decisions agreed with the product owner in [Choose the simplest beginner-friendly testing workflow](https://github.com/fvckzest/HP-OS/issues/58) [Decide repeatable test data and failure controls](https://github.com/fvckzest/HP-OS/issues/60), and [Settle incremental workbench delivery and verification](https://github.com/fvckzest/HP-OS/issues/61), under [Plan the HP-OS local API workbench](https://github.com/fvckzest/HP-OS/issues/56). The workbench is planned, not implemented.
+This document records local workbench decisions agreed with the product owner in [Choose the simplest beginner-friendly testing workflow](https://github.com/fvckzest/HP-OS/issues/58), [Decide repeatable test data and failure controls](https://github.com/fvckzest/HP-OS/issues/60), and [Settle incremental workbench delivery and verification](https://github.com/fvckzest/HP-OS/issues/61), under [Plan the HP-OS local API workbench](https://github.com/fvckzest/HP-OS/issues/56). The workbench is planned, not implemented.
 
 ## Starting point
 
