@@ -46,6 +46,6 @@ The following order was agreed during [issue #11](https://github.com/fvckzest/HP
 3. **Recovery:** verify interrupted checkout, duplicate or conflicting reports, failed issuance, email retry, buyer recovery, refunds, and totals. Essential retry and transaction safeguards belong in their triggering operations from the outset, rather than being postponed to this stage.
 4. **Private Events and Wallet:** implement Access Request approval and protected single-ticket checkout, plus Site-owned Wallet generation and updates.
 5. **Public multi-ticket purchase:** extend the verified single-ticket flow to independently presentable Tickets without duplicate issuance or Admission.
-6. **Release verification:** prove the complete journeys and failure handling with actual integrations, then verify the hosted environment before LMNL cutover. Follow the existing [release proof](features/ticketing.md#release-proof).
+6. **Release verification:** prove the complete journeys and failure handling with actual integrations, then verify the hosted environment before LMNL cutover. Follow the [ticketing release proof](features/ticketing.md#release-proof) and [LMNL release checklist and cutover procedure](release-and-cutover.md). All required local and hosted checks precede a controlled real purchase and refund; explicit user approval is required before opening public sales.
 
 The full single-ticket flow must be proven before public multi-ticket purchasing. Completing these stages locally does not authorize production cutover or prove provider fee settlement.
