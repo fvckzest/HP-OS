@@ -1,14 +1,17 @@
 import { randomBytes, randomUUID, createHash } from "node:crypto";
-import { Pool } from "pg";
+import { Pool, type PoolClient } from "pg";
+
+type OperatorOptions = Record<string, string>;
+interface SiteKey { id: string; key: string; hash: string }
 
 const LOCAL_DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:54322/postgres";
 const databaseUrl = process.env.HPOS_DATABASE_URL ?? LOCAL_DATABASE_URL;
 
-function fail(message) {
+function fail(message: string): never {
   throw new Error(message);
 }
 
-function isLocalDatabase(value) {
+function isLocalDatabase(value: string): boolean {
   try {
     const url = new URL(value);
     return url.protocol === "postgresql:" && url.hostname === "127.0.0.1" && url.port === "54322" && url.username === "postgres" && url.pathname === "/postgres";
@@ -21,8 +24,8 @@ if (!isLocalDatabase(databaseUrl) && process.env.HPOS_OPERATOR_ALLOW_REMOTE !== 
   fail("Remote operator access is disabled. Set HPOS_OPERATOR_ALLOW_REMOTE=true only in an approved operator environment.");
 }
 
-function readOptions(args) {
-  const options = {};
+function readOptions(args: string[]): OperatorOptions {
+  const options: OperatorOptions = {};
   for (let index = 0; index < args.length; index += 1) {
     const name = args[index];
     if (!name.startsWith("--") || !args[index + 1] || args[index + 1].startsWith("--")) fail(`Expected a value after ${name}.`);
@@ -32,31 +35,32 @@ function readOptions(args) {
   return options;
 }
 
-function required(options, name) {
+function required(options: OperatorOptions, name: string): string {
   const value = options[name]?.trim();
   if (!value) fail(`Provide --${name}.`);
   return value;
 }
 
-function uuid(value, flag) {
+function uuid(value: string, flag: string): string {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) fail(`--${flag} must be a UUID.`);
   return value;
 }
 
-function boundedName(value, flag) {
+function boundedName(value: string, flag: string): string {
   const trimmed = value.trim();
   if (trimmed.length < 1 || trimmed.length > 200) fail(`--${flag} must contain 1 to 200 characters.`);
   return trimmed;
 }
 
-function credentialReference(value, flag) {
+function referenceAlias(value: string, flag: string): string {
   const trimmed = value.trim();
-  if (trimmed.length < 1 || trimmed.length > 500) fail(`--${flag} must contain 1 to 500 characters.`);
-  if (/^(bearer\s|sk[_-]|rk[_-]|sq0[a-z]|access[_-]?token|secret)/i.test(trimmed)) fail(`--${flag} must be a non-secret provider reference, never a credential.`);
+  if (!/^ref:[A-Za-z0-9][A-Za-z0-9._:-]{0,245}$/.test(trimmed)) {
+    fail(`--${flag} must be a non-secret reference alias starting with ref: and using only letters, numbers, period, underscore, colon, or hyphen.`);
+  }
   return trimmed;
 }
 
-async function transaction(pool, action) {
+async function transaction<T>(pool: Pool, action: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
   try {
     await client.query("begin");
@@ -71,7 +75,7 @@ async function transaction(pool, action) {
   }
 }
 
-function newSiteKey() {
+function newSiteKey(): SiteKey {
   const id = randomUUID();
   const secret = randomBytes(32).toString("base64url");
   const key = `hpos_site_${id}_${secret}`;
@@ -83,7 +87,7 @@ const help = `HP-OS operator setup (database changes are direct operator actions
 
   pnpm operator organization create --name "LMNL"
   pnpm operator site create --organization <organization-id> --name "LMNL main"
-  pnpm operator payment-connection create --organization <organization-id> --provider square --environment test --account-reference <non-secret-reference> [--location-reference <non-secret-reference>]
+  pnpm operator payment-connection create --organization <organization-id> --provider square --environment test --account-reference ref:venue-square [--location-reference ref:main-hall]
   pnpm operator site assign-connection --site <site-id> --connection <connection-id>
   pnpm operator site request-limit --site <site-id> --per-minute 1200
   pnpm operator organization fee-terms-pending --organization <organization-id>
@@ -106,22 +110,22 @@ const pool = new Pool({ connectionString: databaseUrl, max: 1, connectionTimeout
 try {
   if (group === "organization" && action === "create") {
     const name = boundedName(required(options, "name"), "name");
-    const result = await pool.query(`insert into hpos.organizations (name) values ($1) returning id`, [name]);
+    const result = await pool.query<{ id: string }>(`insert into hpos.organizations (name) values ($1) returning id`, [name]);
     console.log(JSON.stringify({ organization_id: result.rows[0].id, fee_terms_status: "pending_validation" }));
   } else if (group === "site" && action === "create") {
     const organizationId = uuid(required(options, "organization"), "organization");
     const name = boundedName(required(options, "name"), "name");
-    const result = await pool.query(`insert into hpos.sites (organization_id, name) values ($1, $2) returning id`, [organizationId, name]);
+    const result = await pool.query<{ id: string }>(`insert into hpos.sites (organization_id, name) values ($1, $2) returning id`, [organizationId, name]);
     console.log(JSON.stringify({ site_id: result.rows[0].id, organization_id: organizationId, request_limit_per_minute: 1200 }));
   } else if (group === "payment-connection" && action === "create") {
     const organizationId = uuid(required(options, "organization"), "organization");
     const provider = required(options, "provider");
     const environment = required(options, "environment");
-    if (!new Set(["square", "stripe"]).has(provider)) fail("--provider must be square or stripe.");
-    if (!new Set(["test", "live"]).has(environment)) fail("--environment must be test or live.");
-    const accountReference = credentialReference(required(options, "account-reference"), "account-reference");
-    const locationReference = options["location-reference"] ? credentialReference(options["location-reference"], "location-reference") : null;
-    const result = await pool.query(
+    if (!new Set<string>(["square", "stripe"]).has(provider)) fail("--provider must be square or stripe.");
+    if (!new Set<string>(["test", "live"]).has(environment)) fail("--environment must be test or live.");
+    const accountReference = referenceAlias(required(options, "account-reference"), "account-reference");
+    const locationReference = options["location-reference"] ? referenceAlias(options["location-reference"], "location-reference") : null;
+    const result = await pool.query<{ id: string }>(
       `insert into hpos.payment_connections (organization_id, provider, environment, account_reference, location_reference)
        values ($1, $2, $3, $4, $5) returning id`,
       [organizationId, provider, environment, accountReference, locationReference],
@@ -131,7 +135,7 @@ try {
     const siteId = uuid(required(options, "site"), "site");
     const connectionId = uuid(required(options, "connection"), "connection");
     await transaction(pool, async (client) => {
-      const ownership = await client.query(
+      const ownership = await client.query<{ site_organization_id: string; connection_organization_id: string }>(
         `select site.organization_id as site_organization_id, connection.organization_id as connection_organization_id
          from hpos.sites site cross join hpos.payment_connections connection
          where site.id = $1 and connection.id = $2`,
@@ -140,7 +144,7 @@ try {
       const row = ownership.rows[0];
       if (!row) fail("The Site or payment connection does not exist.");
       if (row.site_organization_id !== row.connection_organization_id) fail("A payment connection can only be assigned to a Site in the same organization.");
-      const current = await client.query(
+      const current = await client.query<{ connection_id: string }>(
         `select connection_id from hpos.site_payment_connection_assignments where site_id = $1 and unassigned_at is null`,
         [siteId],
       );
@@ -171,7 +175,7 @@ try {
       const revokeAll = options.all === "true";
       const keyId = options["key-id"] ? uuid(options["key-id"], "key-id") : null;
       if (!revokeAll && !keyId) fail("Provide --key-id <uuid> or --all true.");
-      const result = await pool.query(
+      const result = await pool.query<{ id: string }>(
         `update hpos.site_api_keys set revoked_at = clock_timestamp()
          where site_id = $1 and revoked_at is null and ($2::boolean or id = $3::uuid)
          returning id`,
@@ -182,7 +186,7 @@ try {
     } else {
       const newKey = newSiteKey();
       await transaction(pool, async (client) => {
-        const site = await client.query(`select id from hpos.sites where id = $1 for update`, [siteId]);
+        const site = await client.query<{ id: string }>(`select id from hpos.sites where id = $1 for update`, [siteId]);
         if (site.rowCount !== 1) fail("The Site does not exist.");
         if (action === "rotate") await client.query(`update hpos.site_api_keys set revoked_at = clock_timestamp() where site_id = $1 and revoked_at is null`, [siteId]);
         await client.query(`insert into hpos.site_api_keys (id, site_id, key_hash) values ($1, $2, $3)`, [newKey.id, siteId, newKey.hash]);

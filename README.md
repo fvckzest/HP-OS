@@ -4,14 +4,14 @@ HP-OS is a shared cultural operations engine for LMNL-built websites. Events and
 
 ## Run locally
 
-First install Node.js 22 or later, pnpm 11, and a running Docker-compatible container service. The Supabase local stack uses Docker and must stay on the local machine.
+First install Node.js 22.6 or later, pnpm 11, and a running Docker-compatible container service. The Supabase local stack uses Docker and must stay on the local machine.
 
 ```sh
 pnpm install
 pnpm local
 ```
 
-The `pnpm local` command starts local PostgreSQL, applies pending version-controlled migrations, verifies the dedicated local test database, binds the Next.js app to `127.0.0.1`, and prints the workbench URL. Open `http://127.0.0.1:3000/workbench`. The workbench can run temporary API checks for key rotation/revocation, Site isolation, shared connections, and request limits. For persistent operator setup, run `pnpm operator help`; the operator command defaults to the local database. Site API keys are shown once by the key command and must be stored in the Site backend environment, such as `HPOS_SITE_API_KEY` in a local `.env.local`. Never put them in browser code. Stop the app with Ctrl-C. The local database volume persists; `pnpm local:stop` stops its services without resetting data. Supabase runtime files stay in the ignored `.local-supabase-home/` directory, and CLI telemetry is disabled for these local commands.
+The `pnpm local` command starts local PostgreSQL, applies pending version-controlled migrations, verifies the dedicated local test database, binds the Next.js app to `127.0.0.1`, and prints the workbench URL. Open `http://127.0.0.1:3000/workbench`. The workbench can run temporary API checks for key rotation/revocation, Site isolation, shared connections, and request limits. For persistent operator setup, run `pnpm operator help`; the operator command defaults to the local database. Payment account and location references use operator-defined `ref:` aliases that map to configuration held by the Site backend; HP-OS rejects other values so provider credentials cannot be stored in these fields. Site API keys are shown once by the key command and must be stored in the Site backend environment, such as `HPOS_SITE_API_KEY` in a local `.env.local`. Never put them in browser code. Stop the app with Ctrl-C. The local database volume persists; `pnpm local:stop` stops its services without resetting data. Supabase runtime files stay in the ignored `.local-supabase-home/` directory, and CLI telemetry is disabled for these local commands.
 
 In a second terminal, `pnpm test` starts temporary app processes and verifies the real local PostgreSQL boundary, confirms the generated Supabase Data API is disabled, exercises Site-key authentication and configuration reads through HTTP, checks rotation/revocation, isolation and request limits, checks request redaction and local access guards, forces a diagnostic-history write failure, and verifies history across an app restart. It leaves sanitized verification evidence in workbench history. `pnpm typecheck` checks TypeScript; `pnpm build` creates the production build, where local workbench routes remain disabled.
 

@@ -135,6 +135,11 @@ async function verifyCaptureFailureIsolation() {
 }
 
 async function verifySiteAccessConfiguration() {
+  const statusResponse = await fetch(`${origin}/api/workbench/status`, { headers: { Origin: origin } });
+  const status = await statusResponse.json();
+  const template = status.catalogue?.find((entry) => entry.id === "site-payment-configuration")?.requestTemplate;
+  assert(template?.method === "GET" && template?.path === "/v1/admin/payment-configuration", "The Site API request template is missing from the workbench catalogue.");
+
   const response = await fetch(`${origin}/api/workbench/site-access-check`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Origin: origin },
@@ -144,14 +149,25 @@ async function verifySiteAccessConfiguration() {
   assert(result.result === "passed", "Site key lifecycle, configuration isolation, shared connections, or request-limit verification failed.");
   assert(Array.isArray(result.steps) && result.steps.length >= 12, "The Site access workflow did not return its expected evidence steps.");
   assert(result.steps.every((step) => step.result === "passed" && step.capture === "stored"), "A Site access API check failed or its evidence was not recorded.");
+  assert(result.evidence?.executionMode === "actual_local_http_postgresql" && result.evidence?.fixtureMode === "synthetic", "The Site workflow did not label actual execution and synthetic data separately.");
+  assert(result.steps.every((step) => step.request?.headers?.authorization?.includes("redacted") && step.observations?.every((observation) => observation.source)), "The Site workflow omitted request secrecy or observation provenance evidence.");
   assert(result.steps.some((step) => step.id === "site-rate-limit" && step.statusCode === 429), "The Site-wide request limit was not exercised through HTTP.");
+  const pool = new pg.Pool({ connectionString: databaseUrl, max: 1, connectionTimeoutMillis: 2_000 });
+  try {
+    const remainingFixtures = await pool.query(
+      `select count(*)::integer as count from hpos.organizations where name like 'Workbench access check %' or name like 'Workbench isolation check %'`,
+    );
+    assert(remainingFixtures.rows[0].count === 0, "The Site access workflow left synthetic Organizations in PostgreSQL.");
+  } finally {
+    await pool.end();
+  }
 }
 
 function runOperator(args, expectedToSucceed = true) {
-  const result = spawnSync(process.execPath, ["scripts/operator.mjs", ...args], { cwd: root, env, encoding: "utf8" });
+  const result = spawnSync(process.execPath, ["--experimental-strip-types", "scripts/operator.ts", ...args], { cwd: root, env, encoding: "utf8" });
   const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
   if (expectedToSucceed && result.status !== 0) throw new Error(`The local operator command failed: ${output}`);
-  if (!expectedToSucceed && result.status === 0) throw new Error("An invalid operator assignment was accepted.");
+  if (!expectedToSucceed && result.status === 0) throw new Error("An invalid operator command was accepted.");
   if (!expectedToSucceed) return output;
   try { return JSON.parse(result.stdout); }
   catch { throw new Error("The operator command did not return its documented JSON result."); }
@@ -165,16 +181,36 @@ async function verifyOperatorProvisioning() {
     organizationIds.push(organization.organization_id);
     assert(organization.fee_terms_status === "pending_validation", "Organization setup invented or omitted the fee-term validation state.");
     runOperator(["organization", "fee-terms-pending", "--organization", organization.organization_id]);
+    const credentialRejected = runOperator(["payment-connection", "create", "--organization", organization.organization_id, "--provider", "square", "--environment", "test", "--account-reference", "sk_live_not_a_reference"], false);
+    assert(credentialRejected.includes("non-secret reference alias"), "The operator accepted a provider credential instead of a reference alias.");
 
     const otherOrganization = runOperator(["organization", "create", "--name", `Other organization ${randomUUID()}`]);
     organizationIds.push(otherOrganization.organization_id);
     const site = runOperator(["site", "create", "--organization", organization.organization_id, "--name", "Operator verification Site"]);
-    const connection = runOperator(["payment-connection", "create", "--organization", organization.organization_id, "--provider", "square", "--environment", "test", "--account-reference", `test-account-${randomUUID()}`, "--location-reference", `test-location-${randomUUID()}`]);
-    const otherConnection = runOperator(["payment-connection", "create", "--organization", otherOrganization.organization_id, "--provider", "stripe", "--environment", "test", "--account-reference", `test-account-${randomUUID()}`]);
+    const connection = runOperator(["payment-connection", "create", "--organization", organization.organization_id, "--provider", "square", "--environment", "test", "--account-reference", `ref:test-account-${randomUUID()}`, "--location-reference", `ref:test-location-${randomUUID()}`]);
+    const otherConnection = runOperator(["payment-connection", "create", "--organization", otherOrganization.organization_id, "--provider", "stripe", "--environment", "test", "--account-reference", `ref:test-account-${randomUUID()}`]);
     assert(connection.account_eligibility_status === "pending_validation", "Payment account eligibility was claimed without validation.");
+    let databaseRejectedCredential = false;
+    try {
+      await pool.query(
+        `insert into hpos.payment_connections (organization_id, provider, environment, account_reference) values ($1, 'square', 'test', $2)`,
+        [organization.organization_id, `sk_live_${randomUUID()}`],
+      );
+    } catch (error) {
+      databaseRejectedCredential = error && typeof error === "object" && "code" in error && error.code === "23514";
+    }
+    assert(databaseRejectedCredential, "The PostgreSQL constraint accepted a credential-shaped account reference.");
     runOperator(["site", "assign-connection", "--site", site.site_id, "--connection", connection.connection_id]);
     const invalidAssignment = runOperator(["site", "assign-connection", "--site", site.site_id, "--connection", otherConnection.connection_id], false);
     assert(invalidAssignment.includes("same organization"), "The operator did not explain why a cross-organization connection assignment was rejected.");
+    let connectionHistoryProtected = false;
+    try { await pool.query(`delete from hpos.payment_connections where id = $1`, [connection.connection_id]); }
+    catch (error) { connectionHistoryProtected = error && typeof error === "object" && "code" in error && error.code === "23503"; }
+    assert(connectionHistoryProtected, "PostgreSQL allowed deletion of a connection referenced by assignment history.");
+    let siteHistoryProtected = false;
+    try { await pool.query(`delete from hpos.sites where id = $1`, [site.site_id]); }
+    catch (error) { siteHistoryProtected = error && typeof error === "object" && "code" in error && error.code === "23503"; }
+    assert(siteHistoryProtected, "PostgreSQL allowed deletion of a Site referenced by assignment history.");
 
     const original = runOperator(["site-key", "issue", "--site", site.site_id]);
     assert(typeof original.site_api_key === "string" && original.site_api_key.length > 70, "The operator did not issue a high-entropy Site API key.");
@@ -192,7 +228,10 @@ async function verifyOperatorProvisioning() {
     const revokedKey = await fetch(`${origin}/v1/admin/payment-configuration`, { headers: { Authorization: `Bearer ${rotated.site_api_key}` } });
     assert(revokedKey.status === 401, "A revoked Site key remained usable through HTTP.");
   } finally {
-    if (organizationIds.length) await pool.query(`delete from hpos.organizations where id = any($1::uuid[])`, [organizationIds]).catch(() => undefined);
+    if (organizationIds.length) {
+      await pool.query(`delete from hpos.site_payment_connection_assignments where organization_id = any($1::uuid[])`, [organizationIds]).catch(() => undefined);
+      await pool.query(`delete from hpos.organizations where id = any($1::uuid[])`, [organizationIds]).catch(() => undefined);
+    }
     await pool.end();
   }
 }

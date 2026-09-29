@@ -19,6 +19,10 @@ interface CheckStep {
   expected: string;
   statusCode: number | null;
   actual: string;
+  request: { method: "GET"; path: string; headers: { accept: string; authorization: string } };
+  observations: Array<{ label: string; source: string; value: string }>;
+  executionMode: "actual_local_http_postgresql";
+  fixtureMode: "synthetic";
   result: "passed" | "failed";
   capture: "stored" | "incomplete";
 }
@@ -81,17 +85,17 @@ async function createFixtures(): Promise<Fixtures> {
     const sharedConnection = await client.query<{ id: string }>(
       `insert into hpos.payment_connections (organization_id, provider, environment, account_reference, location_reference)
        values ($1, 'square', 'test', $2, $3) returning id`,
-      [organizationOne, `test-account-${randomUUID()}`, `test-location-${randomUUID()}`],
+      [organizationOne, `ref:test-account-${randomUUID()}`, `ref:test-location-${randomUUID()}`],
     );
     const separateConnection = await client.query<{ id: string }>(
       `insert into hpos.payment_connections (organization_id, provider, environment, account_reference, location_reference)
        values ($1, 'stripe', 'test', $2, null) returning id`,
-      [organizationOne, `same-org-account-${randomUUID()}`],
+      [organizationOne, `ref:same-org-account-${randomUUID()}`],
     );
     const otherOrganizationConnection = await client.query<{ id: string }>(
       `insert into hpos.payment_connections (organization_id, provider, environment, account_reference, location_reference)
        values ($1, 'stripe', 'test', $2, null) returning id`,
-      [organizationTwo, `test-account-${randomUUID()}`],
+      [organizationTwo, `ref:test-account-${randomUUID()}`],
     );
     fixture.connectionIds = {
       shared: sharedConnection.rows[0].id,
@@ -147,6 +151,24 @@ async function revokeSiteKey(siteId: string, keyId: string): Promise<void> {
     `update hpos.site_api_keys set revoked_at = clock_timestamp() where site_id = $1 and id = $2 and revoked_at is null`,
     [siteId, keyId],
   );
+}
+
+async function removeFixtures(organizationIds: string[]): Promise<void> {
+  const client = await getBusinessPool().connect();
+  try {
+    await client.query("begin");
+    await client.query(
+      `delete from hpos.site_payment_connection_assignments where organization_id = any($1::uuid[])`,
+      [organizationIds],
+    );
+    await client.query(`delete from hpos.organizations where id = any($1::uuid[])`, [organizationIds]);
+    await client.query("commit");
+  } catch (error) {
+    await client.query("rollback").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function recordStep(input: {
@@ -218,32 +240,56 @@ async function recordStep(input: {
     expected: input.expected,
     statusCode: response?.status ?? null,
     actual: capture === "incomplete" ? `${actual}; history capture incomplete` : actual,
+    request: {
+      method: "GET",
+      path: route,
+      headers: { accept: "application/json", authorization: "[generated Site key held on server; redacted]" },
+    },
+    observations: [
+      {
+        label: "HTTP response",
+        source: "Local HP-OS HTTP response",
+        value: response ? `HTTP ${response.status}` : "No response; outcome unknown",
+      },
+      {
+        label: "API evidence capture",
+        source: "Sanitized local workbench history",
+        value: capture === "stored" ? "Recorded" : "Incomplete",
+      },
+    ],
+    executionMode: "actual_local_http_postgresql",
+    fixtureMode: "synthetic",
     result: capture === "incomplete" ? "failed" : result,
     capture,
   };
 }
 
+function responseData(body: unknown): Record<string, unknown> | null {
+  if (!body || typeof body !== "object" || !("data" in body)) return null;
+  const data = (body as { data?: unknown }).data;
+  return data !== null && typeof data === "object" ? data as Record<string, unknown> : null;
+}
+
+function responseHasExpectedConnection(body: unknown, connection: unknown): boolean {
+  const data = responseData(body);
+  if (!data || !body || typeof body !== "object" || typeof (body as { request_id?: unknown }).request_id !== "string") return false;
+  const actual = ("active_connection" in data ? data.active_connection : data) as Record<string, unknown> | null;
+  if (!actual || typeof actual !== "object") return false;
+  return actual.connection_id === connection
+    && Object.keys(actual).sort().join(",") === "account_reference,connection_id,environment,location_reference,provider";
+}
+
 function activeConnectionIs(body: unknown, connectionId: string): boolean {
-  if (!body || typeof body !== "object" || !("data" in body)) return false;
-  const data = (body as { data?: { active_connection?: { connection_id?: string } | null } }).data;
-  const active = data?.active_connection;
-  return typeof (body as { request_id?: unknown }).request_id === "string"
-    && active?.connection_id === connectionId
-    && Object.keys(active ?? {}).sort().join(",") === "account_reference,connection_id,environment,location_reference,provider";
+  return responseHasExpectedConnection(body, connectionId);
 }
 
 function connectionIs(body: unknown, connectionId: string): boolean {
-  if (!body || typeof body !== "object" || !("data" in body)) return false;
-  const data = (body as { data?: Record<string, unknown> }).data;
-  return typeof (body as { request_id?: unknown }).request_id === "string"
-    && data?.connection_id === connectionId
-    && Object.keys(data ?? {}).sort().join(",") === "account_reference,connection_id,environment,location_reference,provider";
+  return responseHasExpectedConnection(body, connectionId);
 }
 
 function noActiveConnection(body: unknown): boolean {
-  if (!body || typeof body !== "object" || !("data" in body)) return false;
-  return typeof (body as { request_id?: unknown }).request_id === "string"
-    && (body as { data?: { active_connection?: unknown } }).data?.active_connection === null;
+  const data = responseData(body);
+  return Boolean(body && typeof body === "object" && typeof (body as { request_id?: unknown }).request_id === "string" && data?.active_connection === null);
 }
 
 function errorCodeIs(body: unknown, code: string): boolean {
@@ -254,7 +300,12 @@ function errorCodeIs(body: unknown, code: string): boolean {
     && Array.isArray(error.details);
 }
 
-export async function runSiteAccessConfigurationCheck(): Promise<{ result: "passed" | "failed"; steps: CheckStep[]; message: string }> {
+export async function runSiteAccessConfigurationCheck(): Promise<{
+  result: "passed" | "failed";
+  steps: CheckStep[];
+  message: string;
+  evidence: { executionMode: "actual_local_http_postgresql"; fixtureMode: "synthetic" };
+}> {
   const fixtures = await createFixtures();
   const steps: CheckStep[] = [];
   const firstPath = "/v1/admin/payment-configuration";
@@ -305,13 +356,14 @@ export async function runSiteAccessConfigurationCheck(): Promise<{ result: "pass
     }
     await add({ id: "site-rate-limit", title: "Apply the Site-wide limit across active keys", expected: "HTTP 429 with rate_limited and a positive Retry-After value", path: firstPath, key: secondRateKey.value, expectedStatus: 429, accept: (body, headers) => errorCodeIs(body, "rate_limited") && Number(headers?.get("retry-after")) > 0 });
   } finally {
-    await getBusinessPool().query(`delete from hpos.organizations where id = any($1::uuid[])`, [fixtures.organizationIds]).catch(() => undefined);
+    await removeFixtures(fixtures.organizationIds);
   }
 
   const passed = steps.every((step) => step.result === "passed" && step.capture === "stored");
   return {
     result: passed ? "passed" : "failed",
     steps,
+    evidence: { executionMode: "actual_local_http_postgresql", fixtureMode: "synthetic" },
     message: passed
       ? "Site key lifecycle, Site-scoped payment reads, shared-connection assignments, and Site-wide request limits passed through the HTTP API."
       : "One or more Site configuration checks failed. Inspect each recorded HTTP result and local database status before retrying.",
