@@ -15,6 +15,7 @@ HP-OS is a shared cultural operations engine for LMNL-built websites. Events and
 | Agreed first-release language, hosting, and database approach | [Technology](docs/technology.md) |
 | Required LMNL release evidence and cutover procedure | [Release and cutover](docs/release-and-cutover.md) |
 | Settled local workbench workflow, test controls, delivery plan, and functional verification | [Local testing workbench](docs/local-workbench.md) |
+| Consolidated local workbench specification and implementation handoff | [HP-OS local API workbench implementation specification](https://github.com/fvckzest/HP-OS/issues/66) |
 | Current questions and work | [First-release Wayfinder issue](https://github.com/fvckzest/HP-OS/issues/1) and its linked tickets |
 | Dated source evidence | [Research](docs/research/) |
 | Local workbench tracing feasibility and integration boundaries (research; settled plan takes precedence) | [Local call tracing](docs/research/local-call-tracing.md) |
