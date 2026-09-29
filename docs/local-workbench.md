@@ -121,6 +121,10 @@ Each run identifies which services are simulated and which are actual. Runs usin
 Reset and interruption controls cannot erase an external service's effects. Simulation and local API results do not replace required actual payment, email, Wallet, device, hosted, or production evidence in the [release procedure](release-and-cutover.md).
 
 
+## Consolidated specification
+
+The completed workbench map is synthesized in [HP-OS local API workbench implementation specification](https://github.com/fvckzest/HP-OS/issues/66). It records user stories, implementation and testing decisions, and scope. Execution remains in the already amended first-release implementation tickets, starting with [Run HP-OS locally with persistent PostgreSQL](https://github.com/fvckzest/HP-OS/issues/23). This document retains the settled workbench rules; publication of the specification does not implement or verify them.
+
 ## Delivery and implementation handoff
 
 The product owner confirmed this plan in [Settle incremental workbench delivery and verification](https://github.com/fvckzest/HP-OS/issues/61). Amend the existing first-release implementation tickets rather than creating separate workbench implementation tickets. Workbench requirements travel with the capability they inspect, preserving the implementation sequence and native dependencies.
