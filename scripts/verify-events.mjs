@@ -114,6 +114,40 @@ async function verifyDraftCreationAndReplay(site) {
   return first.data.data;
 }
 
+async function verifyPreconfiguredDraftCannotClearSales(site) {
+  const created = await api(site, "/v1/admin/events", {
+    method: "POST",
+    idempotencyKey: randomUUID(),
+    body: {
+      actor: { type: "user", reference: "test:issue-26" },
+      title: "Configured Draft",
+      description: "A draft with a complete sales configuration.",
+      venue: { name: "LMNL Space" },
+      starts_at: "2033-04-21T19:00:00-07:00",
+      ends_at: "2033-04-21T22:00:00-07:00",
+      time_zone: "America/Los_Angeles",
+      visibility: "public",
+      ticket_offering: {
+        price: { amount: 2500, currency: "USD" },
+        capacity: 20,
+        sales_opens_at: "2033-04-01T09:00:00-07:00",
+        sales_closes_at: "2033-04-21T21:00:00-07:00",
+      },
+    },
+  });
+  assert(created.status === 201, "A fully configured draft could not be created.");
+  const cleared = await api(site, "/v1/admin/events/" + created.data.data.event_id, {
+    method: "PATCH",
+    idempotencyKey: randomUUID(),
+    body: {
+      actor: { type: "user", reference: "test:issue-26" },
+      expected_version: 1,
+      ticket_offering: { sales_closes_at: null },
+    },
+  });
+  assert(cleared.status === 409 && cleared.data.error.code === "sales_configuration_locked", "A complete sales configuration was cleared after draft creation.");
+}
+
 async function createPublishedEvent(site, { title, startsAt, endsAt }) {
   const created = await api(site, "/v1/admin/events", {
     method: "POST",
@@ -151,6 +185,12 @@ async function verifyEventLifecycleAndDiscovery(site) {
   const draft = await verifyDraftCreationAndReplay(site);
   const hiddenDraft = await api(site, "/v1/public/events/" + draft.event_id);
   assert(hiddenDraft.status === 404, "An incomplete draft was visible to public detail lookup.");
+  const archiveDraft = await api(site, "/v1/admin/events/" + draft.event_id + "/actions/archive", {
+    method: "POST",
+    idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-26" }, expected_version: 1 },
+  });
+  assert(archiveDraft.status === 409 && archiveDraft.data.error.code === "invalid_state", "An unpublished draft was archived.");
 
   const invalidPublishKey = randomUUID();
   const invalidPublishBody = { actor: { type: "user", reference: "test:issue-26" }, expected_version: 1 };
@@ -193,7 +233,12 @@ async function verifyEventLifecycleAndDiscovery(site) {
       ends_at: "2032-01-01T22:00:00-08:00",
       time_zone: "America/Los_Angeles",
       visibility: "public",
-      ticket_offering: { price: { amount: 2500, currency: "USD" }, capacity: 20 },
+      ticket_offering: {
+        price: { amount: 2500, currency: "USD" },
+        capacity: 20,
+        sales_opens_at: "2031-12-01T09:00:00-08:00",
+        sales_closes_at: "2032-01-01T21:00:00-08:00",
+      },
     },
   });
   assert(saved.status === 200 && saved.data.data.version === 2, "Saving complete Event details failed: " + JSON.stringify(saved.data));
@@ -208,6 +253,21 @@ async function verifyEventLifecycleAndDiscovery(site) {
   });
   assert(partial.status === 200 && partial.data.data.ticket_offering.capacity === 25, "A nested partial offering edit failed.");
   assert(partial.data.data.ticket_offering.price.amount === 2500, "A nested partial edit cleared an omitted price.");
+
+  const clearKey = randomUUID();
+  const clearBody = {
+    actor: { type: "user", reference: "test:issue-26" },
+    expected_version: 3,
+    ticket_offering: { capacity: null },
+  };
+  const clearConfiguredCapacity = await api(site, "/v1/admin/events/" + draft.event_id, {
+    method: "PATCH", idempotencyKey: clearKey, body: clearBody,
+  });
+  const replayClearConfiguredCapacity = await api(site, "/v1/admin/events/" + draft.event_id, {
+    method: "PATCH", idempotencyKey: clearKey, body: clearBody,
+  });
+  assert(clearConfiguredCapacity.status === 409 && replayClearConfiguredCapacity.status === 409, "Clearing complete sales settings did not return a replayable conflict.");
+  assert(clearConfiguredCapacity.data.error.code === "sales_configuration_locked", "Clearing complete sales settings returned the wrong error.");
 
   const published = await api(site, "/v1/admin/events/" + draft.event_id + "/actions/publish", {
     method: "POST",
@@ -243,17 +303,12 @@ async function verifyEventLifecycleAndDiscovery(site) {
   });
   const pastList = await api(site, "/v1/public/events?period=past");
   assert(pastList.status === 200 && pastList.data.data.some((event) => event.event_id === past.event_id), "The past Event list did not include an ended published Event.");
-  const canceled = await api(site, "/v1/admin/events/" + draft.event_id + "/actions/cancel", {
+  const archived = await api(site, "/v1/admin/events/" + past.event_id + "/actions/archive", {
     method: "POST", idempotencyKey: randomUUID(),
-    body: { actor: { type: "user", reference: "test:issue-26" }, expected_version: 4 },
+    body: { actor: { type: "user", reference: "test:issue-26" }, expected_version: 3 },
   });
-  assert(canceled.status === 200 && canceled.data.data.is_canceled, "Canceling a published Event failed.");
-  const archived = await api(site, "/v1/admin/events/" + draft.event_id + "/actions/archive", {
-    method: "POST", idempotencyKey: randomUUID(),
-    body: { actor: { type: "user", reference: "test:issue-26" }, expected_version: 5 },
-  });
-  assert(archived.status === 200 && archived.data.data.is_archived, "Archiving a canceled Event failed.");
-  const archivedDetail = await api(site, "/v1/public/events/" + draft.event_id);
+  assert(archived.status === 200 && archived.data.data.is_archived, "Archiving an ended Event failed.");
+  const archivedDetail = await api(site, "/v1/public/events/" + past.event_id);
   assert(archivedDetail.status === 200 && archivedDetail.data.data.is_archived, "Published archived Event detail was not retained.");
 
   const other = createSiteFixture();
@@ -278,13 +333,14 @@ async function main() {
   try {
     await waitForReady(app);
     const site = createSiteFixture();
+    await verifyPreconfiguredDraftCannotClearSales(site);
     await verifyEventLifecycleAndDiscovery(site);
   } finally {
     await cleanup();
     await stopApp(app);
     await pool.end();
   }
-  console.log("Local Event API verification passed: drafts, retries, partial edits, publish rules, current and past discovery, pagination, archive detail, and Site isolation.");
+  console.log("Local Event API verification passed: drafts, retries, partial edits, sales configuration locks, publish rules, current and past discovery, pagination, eligible archiving, and Site isolation.");
 }
 
 main().catch((error) => {

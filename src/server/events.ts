@@ -56,6 +56,7 @@ interface EventRow extends QueryResultRow {
   sales_opens_offset_minutes: number | null;
   sales_closes_at: Date | null;
   sales_closes_offset_minutes: number | null;
+  sales_ever_configured?: boolean;
   created_cursor_time?: string;
   starts_cursor_time?: string;
 }
@@ -408,6 +409,10 @@ async function createDraft(client: PoolClient, site: AuthenticatedSite, input: E
   const eventId = randomUUID();
   const offeringId = randomUUID();
   const offering = input.ticket_offering ?? {};
+  const salesEverConfigured = offering.price?.amount !== undefined
+    && offering.capacity !== undefined && offering.capacity !== null
+    && offering.sales_opens_at !== undefined && offering.sales_opens_at !== null
+    && offering.sales_closes_at !== undefined && offering.sales_closes_at !== null;
   await client.query(
     `insert into hpos.events (
        id, site_id, ticket_offering_id, title, description, venue_name,
@@ -434,12 +439,13 @@ async function createDraft(client: PoolClient, site: AuthenticatedSite, input: E
        id, event_id, site_id, price_amount, currency, capacity,
        sales_opens_at, sales_opens_offset_minutes, sales_closes_at,
        sales_closes_offset_minutes, sales_ever_configured
-     ) values ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8, $9::timestamptz, $10, false)`,
+     ) values ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8, $9::timestamptz, $10, $11)`,
     [
       offeringId, eventId, site.siteId, offering.price?.amount ?? null,
       offering.price?.currency ?? null, offering.capacity ?? null,
       offering.sales_opens_at?.iso ?? null, offering.sales_opens_at?.offsetMinutes ?? null,
       offering.sales_closes_at?.iso ?? null, offering.sales_closes_at?.offsetMinutes ?? null,
+      salesEverConfigured,
     ],
   );
   const event = await readAdminEvent(client, site.siteId, eventId);
@@ -617,7 +623,7 @@ async function writeEventPatch(client: PoolClient, site: AuthenticatedSite, even
     e.updated_at, e.created_actor_type, e.created_actor_reference,
     e.updated_actor_type, e.updated_actor_reference, o.price_amount, o.currency,
     o.capacity, o.reserved_quantity, o.sales_opens_at, o.sales_opens_offset_minutes,
-    o.sales_closes_at, o.sales_closes_offset_minutes
+    o.sales_closes_at, o.sales_closes_offset_minutes, o.sales_ever_configured
     from hpos.events e join hpos.ticket_offerings o on o.id=e.ticket_offering_id
       and o.event_id=e.id and o.site_id=e.site_id where e.site_id=$1 and e.id=$2
       for update of e, o`, [site.siteId, eventId]);
@@ -625,6 +631,16 @@ async function writeEventPatch(client: PoolClient, site: AuthenticatedSite, even
   if (!current) operationError(404, "not_found", "The Event is not available to this Site.");
   if (current.version !== expected) operationError(409, "version_conflict", "The Event changed after you loaded it. Reload it before editing.");
   if (current.publication_status === "published" && Object.hasOwn(input, "visibility") && input.visibility !== current.visibility) operationError(409, "visibility_locked", "Event visibility cannot change after publication.");
+  const offer = input.ticket_offering;
+  if (current.sales_ever_configured && offer) {
+    const clearing = [
+      Object.hasOwn(offer, "price") && offer.price === null ? "ticket_offering.price" : null,
+      Object.hasOwn(offer, "capacity") && offer.capacity === null ? "ticket_offering.capacity" : null,
+      Object.hasOwn(offer, "sales_opens_at") && offer.sales_opens_at === null ? "ticket_offering.sales_opens_at" : null,
+      Object.hasOwn(offer, "sales_closes_at") && offer.sales_closes_at === null ? "ticket_offering.sales_closes_at" : null,
+    ].filter((field): field is string => field !== null);
+    if (clearing.length) operationError(409, "sales_configuration_locked", "A complete sales configuration cannot be cleared after it has been saved.", clearing.map((field) => ({ field, code: "cannot_clear", message: "Set a replacement value instead of clearing this field." })));
+  }
   const eventSets: string[] = [];
   const eventArgs: unknown[] = [site.siteId, eventId];
   const addEvent = (column: string, value: unknown) => { eventArgs.push(value); eventSets.push(`${column}=$${eventArgs.length}`); };
@@ -644,7 +660,6 @@ async function writeEventPatch(client: PoolClient, site: AuthenticatedSite, even
   if (Object.hasOwn(input, "time_zone")) addEvent("time_zone", input.time_zone);
   if (Object.hasOwn(input, "visibility")) addEvent("visibility", input.visibility);
   if (eventSets.length) await client.query(`update hpos.events set ${eventSets.join(", ")} where site_id=$1 and id=$2`, eventArgs);
-  const offer = input.ticket_offering;
   if (offer) {
     const sets: string[] = [];
     const args: unknown[] = [current.ticket_offering_id, site.siteId];
@@ -672,7 +687,7 @@ async function writeEventPatch(client: PoolClient, site: AuthenticatedSite, even
   if (merged.publication_status === "published") validatePublish(merged);
   const result = await client.query(`update hpos.events set version=version+1, updated_at=clock_timestamp(), updated_actor_type=$3, updated_actor_reference=$4 where site_id=$1 and id=$2`, [site.siteId, eventId, input.actor.type, input.actor.reference]);
   void result;
-  await client.query(`update hpos.ticket_offerings set sales_ever_configured=(price_amount is not null and capacity is not null and sales_opens_at is not null and sales_closes_at is not null) where event_id=$1`, [eventId]);
+  await client.query(`update hpos.ticket_offerings set sales_ever_configured=(sales_ever_configured or (price_amount is not null and capacity is not null and sales_opens_at is not null and sales_closes_at is not null)) where event_id=$1`, [eventId]);
   const event = await readAdminEvent(client, site.siteId, eventId);
   if (!event) throw new Error("Updated Event could not be read.");
   return { status: 200, data: event };
@@ -704,18 +719,8 @@ async function writeEventAction(client: PoolClient, site: AuthenticatedSite, eve
   if (action === "publish") {
     if (current.publication_status !== "draft") operationError(409, "invalid_state", "Only a draft Event can be published.");
     validatePublish(current); column = "publication_status"; value = "published";
-  } else if (action === "stop_sales") {
-    if (current.publication_status !== "published" || current.is_canceled || !current.ends_at || current.ends_at.getTime() <= now) operationError(409, "invalid_state", "Sales can stop only for an active published Event.");
-    column = "sales_paused"; value = true;
-  } else if (action === "resume_sales") {
-    if (current.publication_status !== "published" || current.is_canceled || !current.sales_opens_at || !current.sales_closes_at || current.sales_opens_at.getTime() > now || current.sales_closes_at.getTime() <= now || current.capacity === null || !current.price_amount) operationError(409, "invalid_state", "Sales need complete settings and an open window on an active Event.");
-    if (Number(current.reserved_quantity) >= Number(current.capacity)) operationError(409, "sold_out", "No Ticket capacity is available.");
-    column = "sales_paused"; value = false;
-  } else if (action === "cancel") {
-    if (current.publication_status !== "published" || current.is_canceled) operationError(409, "invalid_state", "Only an active published Event can be canceled.");
-    column = "is_canceled"; value = true;
   } else if (action === "archive") {
-    if (current.is_archived || (!current.is_canceled && (!current.ends_at || current.ends_at.getTime() > now))) operationError(409, "invalid_state", "Only an ended or canceled Event can be archived.");
+    if (current.publication_status !== "published" || current.is_archived || (!current.is_canceled && (!current.ends_at || current.ends_at.getTime() > now))) operationError(409, "invalid_state", "Only an ended or canceled published Event can be archived.");
     column = "is_archived"; value = true;
   } else operationError(404, "not_found", "The Event action is unavailable.");
   await client.query(`update hpos.events set ${column}=$3, version=version+1, updated_at=clock_timestamp(), updated_actor_type=$4, updated_actor_reference=$5 where site_id=$1 and id=$2`, [site.siteId, eventId, value, actor.type, actor.reference]);
