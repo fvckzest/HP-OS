@@ -11,7 +11,7 @@ shadow_port = 54320
 enabled = false
 
 [studio]
-enabled = false
+enabled = true
 
 [auth]
 enabled = false
