@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "HP-OS",
-  description: "HP-OS local foundation and testing workbench",
+  description: "HP-OS operational engine for LMNL-built sites",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

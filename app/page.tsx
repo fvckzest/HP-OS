@@ -1,5 +1,3 @@
-import Link from "next/link";
-
 export default function HomePage() {
   return (
     <main className="page-shell stack">
@@ -8,18 +6,17 @@ export default function HomePage() {
         <h1>HP-OS</h1>
         <p>
           The first implementation slice provides Site-key authentication and Site-scoped payment
-          configuration, with a private local PostgreSQL foundation and testing workbench. Event
-          and ticketing operations are not implemented yet.
+          configuration, with a private local PostgreSQL foundation. Event and ticketing operations
+          are not implemented yet.
         </p>
       </header>
       <section className="panel stack" aria-labelledby="capability-heading">
         <h2 id="capability-heading">Current capability</h2>
         <ul>
           <li>Version-controlled SQL migrations and direct PostgreSQL access.</li>
-          <li>A loopback-only local workbench with sanitized, persistent diagnostic history.</li>
+          <li>Operator-managed Organizations, Sites, Site keys, and payment-connection assignments.</li>
           <li>Event and ticketing API operations and local LMNL integration remain unavailable.</li>
         </ul>
-        <p><Link href="/workbench">Open the local testing workbench</Link></p>
       </section>
       <p className="muted">Local testing results do not establish hosted, provider, device, or production readiness.</p>
     </main>

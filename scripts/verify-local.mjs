@@ -1,6 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { request as httpRequest } from "node:http";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -11,8 +10,7 @@ const supabaseHome = path.join(root, ".local-supabase-home");
 const port = Number(process.env.HPOS_VERIFY_PORT ?? 3210);
 const origin = `http://127.0.0.1:${port}`;
 const databaseUrl = process.env.HPOS_DATABASE_URL ?? "postgresql://postgres:postgres@127.0.0.1:54322/postgres";
-const revision = spawnSync("git", ["rev-parse", "--short", "HEAD"], { cwd: root, encoding: "utf8" }).stdout?.trim() || "unknown";
-const env = { ...process.env, NODE_ENV: "development", HPOS_LOCAL_WORKBENCH: "1", HPOS_DATABASE_URL: databaseUrl, HPOS_WORKBENCH_PORT: String(port), HPOS_WORKBENCH_ORIGIN: origin, HPOS_API_BASE_URL: origin, HPOS_REVISION: revision, SUPABASE_HOME: supabaseHome, SUPABASE_TELEMETRY_DISABLED: "1" };
+const env = { ...process.env, NODE_ENV: "development", HPOS_DATABASE_URL: databaseUrl, SUPABASE_HOME: supabaseHome, SUPABASE_TELEMETRY_DISABLED: "1" };
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -39,24 +37,19 @@ function startApp() {
   return { child, get recentOutput() { return recentOutput; } };
 }
 
-async function waitForReady(server) {
+async function waitForReady(server, pool) {
   const deadline = Date.now() + 90_000;
   while (Date.now() < deadline) {
     if (server.child.exitCode !== null) throw new Error(`The verification app stopped early.\n${server.recentOutput}`);
     try {
-      const response = await fetch(`${origin}/api/workbench/status`, { headers: { Origin: origin }, signal: AbortSignal.timeout(2_000) });
-      if (response.status === 200) {
-        const status = await response.json();
-        assert(
-          status.database?.ready === true,
-          "The local PostgreSQL database is not ready. Run `pnpm local` first, then run `pnpm verify:local`.",
-        );
-        return status;
-      }
+      const database = await pool.query("select to_regclass('hpos.site_api_keys') is not null as schema_ready");
+      if (!database.rows[0]?.schema_ready) throw new Error("The HP-OS operational schema is not ready.");
+      const response = await fetch(`${origin}/v1/admin/payment-configuration`, { signal: AbortSignal.timeout(2_000) });
+      if (response.status === 401) return;
     } catch {}
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  throw new Error(`The verification app did not become ready within 90 seconds.\n${server.recentOutput}`);
+  throw new Error(`The application or local PostgreSQL database did not become ready within 90 seconds. Run \`pnpm local\` first.\n${server.recentOutput}`);
 }
 
 function stopApp(server) {
@@ -67,18 +60,6 @@ function stopApp(server) {
     setTimeout(() => {
       if (server.child.exitCode === null) server.child.kill("SIGKILL");
     }, 5_000).unref();
-  });
-}
-
-function fetchWithHostHeader(url, host) {
-  return new Promise((resolve, reject) => {
-    const request = httpRequest(url, { headers: { Host: host } }, (response) => {
-      response.resume();
-      resolve(response.statusCode ?? 0);
-    });
-    request.once("error", reject);
-    request.setTimeout(2_000, () => request.destroy(new Error("Host-check request timed out.")));
-    request.end();
   });
 }
 
@@ -96,70 +77,124 @@ async function assertDatabaseApiIsNotExposed() {
   }
 }
 
-async function verifyCaptureFailureIsolation() {
-  const pool = new pg.Pool({ connectionString: databaseUrl, max: 1, connectionTimeoutMillis: 2_000 });
-  try {
-    // Remove a stale, narrowly scoped trigger if a previous verification was interrupted.
-    await pool.query("drop trigger if exists local_workbench_capture_failure_probe on workbench.call_history");
-    await pool.query("drop function if exists workbench.reject_capture_failure_probe()");
-    await pool.query(`
-      create function workbench.reject_capture_failure_probe() returns trigger
-      language plpgsql as $capture$
-      begin
-        raise exception 'intentional local workbench capture failure probe';
-      end;
-      $capture$
-    `);
-    await pool.query(`
-      create trigger local_workbench_capture_failure_probe
-      before insert on workbench.call_history
-      for each row
-      when (new.request_snapshot #>> '{body,code}' = 'hpos_capture_failure_probe')
-      execute function workbench.reject_capture_failure_probe()
-    `);
+function makeVerificationKey() {
+  const id = randomUUID();
+  const secret = randomBytes(32).toString("base64url");
+  const value = `hpos_site_${id}_${secret}`;
+  return { id, value, hash: createHash("sha256").update(value, "utf8").digest("hex") };
+}
 
-    const response = await fetch(`${origin}/api/workbench/requests`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Origin: origin },
-      body: JSON.stringify({ method: "POST", path: "/v1/__workbench_capture_failure_probe", headers: { Accept: "application/json" }, body: JSON.stringify({ code: "hpos_capture_failure_probe" }), expectedStatus: 405 }),
-    });
-    assert(response.status === 200, "A diagnostic history write failure changed the local workbench response status.");
-    const execution = await response.json();
-    assert(execution.statusCode === 405 && execution.result === "passed", "The local HTTP operation did not preserve its observed result when history storage failed.");
-    assert(execution.capture === "incomplete" && execution.id === null, "The workbench did not report the history capture failure.");
+async function createSiteAccessFixtures(pool) {
+  const client = await pool.connect();
+  const organizationIds = [];
+  try {
+    await client.query("begin");
+    const firstOrganization = (await client.query(
+      `insert into hpos.organizations (name) values ($1) returning id`,
+      [`Verification ${randomUUID()}`],
+    )).rows[0].id;
+    const secondOrganization = (await client.query(
+      `insert into hpos.organizations (name) values ($1) returning id`,
+      [`Other verification ${randomUUID()}`],
+    )).rows[0].id;
+    organizationIds.push(firstOrganization, secondOrganization);
+
+    const createSite = async (organizationId, name, requestLimit = 1200) => (await client.query(
+      `insert into hpos.sites (organization_id, name, request_limit_per_minute) values ($1, $2, $3) returning id`,
+      [organizationId, name, requestLimit],
+    )).rows[0].id;
+    const createConnection = async (organizationId, provider, suffix) => (await client.query(
+      `insert into hpos.payment_connections (organization_id, provider, environment, account_reference, location_reference)
+       values ($1, $2, 'test', $3, null) returning id`,
+      [organizationId, provider, `ref:${suffix}-${randomUUID()}`],
+    )).rows[0].id;
+    const createKey = async (siteId) => {
+      const key = makeVerificationKey();
+      await client.query(`insert into hpos.site_api_keys (id, site_id, key_hash) values ($1, $2, $3)`, [key.id, siteId, key.hash]);
+      return key;
+    };
+
+    const sites = {
+      first: await createSite(firstOrganization, "Verification Site One"),
+      second: await createSite(firstOrganization, "Verification Site Two"),
+      separate: await createSite(firstOrganization, "Verification Site Separate"),
+      unassigned: await createSite(firstOrganization, "Verification Site Unassigned"),
+      otherOrganization: await createSite(secondOrganization, "Verification Other Organization"),
+      limited: await createSite(firstOrganization, "Verification Site Limited", 1),
+    };
+    const connections = {
+      shared: await createConnection(firstOrganization, "square", "verification-shared"),
+      separate: await createConnection(firstOrganization, "stripe", "verification-separate"),
+      otherOrganization: await createConnection(secondOrganization, "stripe", "verification-other"),
+    };
+    await client.query(
+      `insert into hpos.site_payment_connection_assignments (site_id, organization_id, connection_id)
+       values ($1, $3, $5), ($2, $3, $5), ($4, $3, $6), ($7, $8, $9)`,
+      [sites.first, sites.second, firstOrganization, sites.separate, connections.shared, connections.separate, sites.otherOrganization, secondOrganization, connections.otherOrganization],
+    );
+    const keys = {
+      first: await createKey(sites.first),
+      firstSecond: await createKey(sites.first),
+      second: await createKey(sites.second),
+      separate: await createKey(sites.separate),
+      unassigned: await createKey(sites.unassigned),
+      otherOrganization: await createKey(sites.otherOrganization),
+      limitedFirst: await createKey(sites.limited),
+      limitedSecond: await createKey(sites.limited),
+    };
+    await client.query("commit");
+    return { organizationIds, sites, connections, keys };
+  } catch (error) {
+    await client.query("rollback").catch(() => undefined);
+    throw error;
   } finally {
-    await pool.query("drop trigger if exists local_workbench_capture_failure_probe on workbench.call_history").catch(() => undefined);
-    await pool.query("drop function if exists workbench.reject_capture_failure_probe()").catch(() => undefined);
-    await pool.end();
+    client.release();
   }
 }
 
-async function verifySiteAccessConfiguration() {
-  const statusResponse = await fetch(`${origin}/api/workbench/status`, { headers: { Origin: origin } });
-  const status = await statusResponse.json();
-  const template = status.catalogue?.find((entry) => entry.id === "site-payment-configuration")?.requestTemplate;
-  assert(template?.method === "GET" && template?.path === "/v1/admin/payment-configuration", "The Site API request template is missing from the workbench catalogue.");
+async function cleanupSiteAccessFixtures(pool, organizationIds) {
+  await pool.query(`delete from hpos.site_payment_connection_assignments where organization_id = any($1::uuid[])`, [organizationIds]);
+  await pool.query(`delete from hpos.organizations where id = any($1::uuid[])`, [organizationIds]);
+}
 
-  const response = await fetch(`${origin}/api/workbench/site-access-check`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Origin: origin },
-  });
-  assert(response.status === 200, "The Site access guided workflow did not complete over the local workbench boundary.");
-  const result = await response.json();
-  assert(result.result === "passed", "Site key lifecycle, configuration isolation, shared connections, or request-limit verification failed.");
-  assert(Array.isArray(result.steps) && result.steps.length >= 12, "The Site access workflow did not return its expected evidence steps.");
-  assert(result.steps.every((step) => step.result === "passed" && step.capture === "stored"), "A Site access API check failed or its evidence was not recorded.");
-  assert(result.evidence?.executionMode === "actual_local_http_postgresql" && result.evidence?.fixtureMode === "synthetic", "The Site workflow did not label actual execution and synthetic data separately.");
-  assert(result.steps.every((step) => step.request?.headers?.authorization?.includes("redacted") && step.observations?.every((observation) => observation.source)), "The Site workflow omitted request secrecy or observation provenance evidence.");
-  assert(result.steps.some((step) => step.id === "site-rate-limit" && step.statusCode === 429), "The Site-wide request limit was not exercised through HTTP.");
-  const pool = new pg.Pool({ connectionString: databaseUrl, max: 1, connectionTimeoutMillis: 2_000 });
+async function readSiteConfiguration(key, path = "/v1/admin/payment-configuration") {
+  const response = await fetch(`${origin}${path}`, { headers: { Authorization: `Bearer ${key.value}` } });
+  return { response, body: await response.json() };
+}
+
+async function verifySiteAccessIsolationAndLimits(pool) {
+  const fixtures = await createSiteAccessFixtures(pool);
   try {
-    const remainingFixtures = await pool.query(
-      `select count(*)::integer as count from hpos.organizations where name like 'Workbench access check %' or name like 'Workbench isolation check %'`,
-    );
-    assert(remainingFixtures.rows[0].count === 0, "The Site access workflow left synthetic Organizations in PostgreSQL.");
+    const missingKey = await fetch(`${origin}/v1/admin/payment-configuration`);
+    const missingBody = await missingKey.json();
+    assert(missingKey.status === 401 && missingBody.error?.code === "unauthorized", "A missing Site key did not return a structured unauthorized response.");
+
+    for (const [label, key, expectedConnection] of [
+      ["first Site", fixtures.keys.first, fixtures.connections.shared],
+      ["second Site sharing a connection", fixtures.keys.second, fixtures.connections.shared],
+      ["Site with its own connection", fixtures.keys.separate, fixtures.connections.separate],
+      ["Site in another Organization", fixtures.keys.otherOrganization, fixtures.connections.otherOrganization],
+    ]) {
+      const { response, body } = await readSiteConfiguration(key);
+      assert(response.status === 200 && body.data?.active_connection?.connection_id === expectedConnection, `The ${label} did not read its assigned payment configuration.`);
+      assert(response.headers.get("cache-control") === "no-store", `The ${label} payment configuration response was cacheable.`);
+    }
+
+    const unassigned = await readSiteConfiguration(fixtures.keys.unassigned);
+    assert(unassigned.response.status === 200 && unassigned.body.data?.active_connection === null, "A Site without an active connection did not receive a null configuration.");
+
+    const crossSite = await readSiteConfiguration(fixtures.keys.first, `/v1/admin/payment-connections/${fixtures.connections.separate}`);
+    assert(crossSite.response.status === 404 && crossSite.body.error?.code === "not_found", "A Site could read another Site's connection in the same Organization.");
+    const crossOrganization = await readSiteConfiguration(fixtures.keys.otherOrganization, `/v1/admin/payment-connections/${fixtures.connections.separate}`);
+    assert(crossOrganization.response.status === 404 && crossOrganization.body.error?.code === "not_found", "A Site could read a connection from another Organization.");
+
+    const firstLimited = await readSiteConfiguration(fixtures.keys.limitedFirst);
+    const secondLimited = await readSiteConfiguration(fixtures.keys.limitedSecond);
+    assert(firstLimited.response.status === 200, "The first Site key exceeded a fresh Site-wide request budget.");
+    assert(secondLimited.response.status === 429 && secondLimited.body.error?.code === "rate_limited", "The request budget was not shared across two keys for the same Site.");
+    assert(Number(secondLimited.response.headers.get("retry-after")) > 0, "The Site rate-limit response omitted Retry-After.");
   } finally {
-    await pool.end();
+    await cleanupSiteAccessFixtures(pool, fixtures.organizationIds).catch(() => undefined);
   }
 }
 
@@ -173,9 +208,8 @@ function runOperator(args, expectedToSucceed = true) {
   catch { throw new Error("The operator command did not return its documented JSON result."); }
 }
 
-async function verifyOperatorProvisioning() {
+async function verifyOperatorProvisioning(pool) {
   const organizationIds = [];
-  const pool = new pg.Pool({ connectionString: databaseUrl, max: 1, connectionTimeoutMillis: 2_000 });
   try {
     const organization = runOperator(["organization", "create", "--name", `Verification ${randomUUID()}`]);
     organizationIds.push(organization.organization_id);
@@ -232,24 +266,16 @@ async function verifyOperatorProvisioning() {
       await pool.query(`delete from hpos.site_payment_connection_assignments where organization_id = any($1::uuid[])`, [organizationIds]).catch(() => undefined);
       await pool.query(`delete from hpos.organizations where id = any($1::uuid[])`, [organizationIds]).catch(() => undefined);
     }
-    await pool.end();
   }
 }
 
-function assertStartupRefusesRemoteTargets() {
-  const badDatabase = spawnSync(process.execPath, ["scripts/start-local.mjs"], {
+function assertStartupRefusesRemoteDatabase() {
+  const result = spawnSync(process.execPath, ["scripts/start-local.mjs"], {
     cwd: root,
     encoding: "utf8",
     env: { ...env, HPOS_DATABASE_URL: "postgresql://user:password@database.example:5432/postgres" },
   });
-  assert(badDatabase.status !== 0 && `${badDatabase.stdout}${badDatabase.stderr}`.includes("dedicated loopback test database"), "Local startup did not refuse a remote database target.");
-
-  const badApi = spawnSync(process.execPath, ["scripts/start-local.mjs"], {
-    cwd: root,
-    encoding: "utf8",
-    env: { ...env, HPOS_API_BASE_URL: "https://api.example.com" },
-  });
-  assert(badApi.status !== 0 && `${badApi.stdout}${badApi.stderr}`.includes("remote and alternate targets are refused"), "Local startup did not refuse a remote API target.");
+  assert(result.status !== 0 && `${result.stdout}${result.stderr}`.includes("dedicated loopback test database"), "Local startup did not refuse a remote database target.");
 }
 
 async function main() {
@@ -257,59 +283,20 @@ async function main() {
   assert(databaseUrl === "postgresql://postgres:postgres@127.0.0.1:54322/postgres", "The local proof requires the dedicated default local test database URL.");
   await assertPortIsFree();
   await assertDatabaseApiIsNotExposed();
-  assertStartupRefusesRemoteTargets();
+  assertStartupRefusesRemoteDatabase();
 
-  const first = startApp();
-  let probeId = "";
+  const pool = new pg.Pool({ connectionString: databaseUrl, max: 1, connectionTimeoutMillis: 2_000 });
+  const server = startApp();
   try {
-    const status = await waitForReady(first);
-    assert(status.generatedDatabaseApi?.state === "disabled", "Status did not confirm that the generated database API is disabled.");
-    assert(status.hposBusinessApi?.state === "available", "Status did not report the implemented Site configuration API capability.");
-    await verifyOperatorProvisioning();
-    await verifySiteAccessConfiguration();
-    const response = await fetch(`${origin}/api/workbench/requests`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Origin: origin },
-      body: JSON.stringify({ method: "POST", path: "/v1/__workbench_persistence_probe", headers: { Accept: "application/json", "Idempotency-Key": "workbench-secret-idempotency-key" }, body: JSON.stringify({ access_token: "workbench-secret-token", buyer: { email: "private@example.invalid", name: "Private Person" }, safe: { error: { code: "not_found" } } }), expectedStatus: 405 }),
-    });
-    assert(response.status === 200, "The workbench HTTP request runner did not return an execution result.");
-    const execution = await response.json();
-    assert(execution.statusCode === 405 && execution.result === "passed" && execution.capture === "incomplete", "The local probe did not produce its expected 405 response with an explicit omitted-body marker.");
-    probeId = execution.id;
-    assert(typeof probeId === "string" && probeId.length > 0, "The request result was not saved to PostgreSQL.");
-    const savedResponse = await fetch(`${origin}/api/workbench/history`, { headers: { Origin: origin } });
-    const savedHistory = await savedResponse.json();
-    const probe = savedHistory.records.find((record) => record.id === probeId);
-    assert(Boolean(probe), "The saved request could not be read through the workbench API.");
-    const capturedJson = JSON.stringify(probe);
-    for (const secret of ["workbench-secret-idempotency-key", "workbench-secret-token", "private@example.invalid", "Private Person"]) {
-      assert(!capturedJson.includes(secret), `History exposed a protected value: ${secret}.`);
-    }
-    assert(JSON.stringify(probe.request_snapshot).includes("[REDACTED]"), "History did not mark protected request fields as redacted.");
-    await verifyCaptureFailureIsolation();
+    await waitForReady(server, pool);
+    await verifyOperatorProvisioning(pool);
+    await verifySiteAccessIsolationAndLimits(pool);
   } finally {
-    await stopApp(first);
+    await stopApp(server);
+    await pool.end();
   }
 
-  const second = startApp();
-  try {
-    await waitForReady(second);
-    const response = await fetch(`${origin}/api/workbench/history`, { headers: { Origin: origin } });
-    assert(response.status === 200, "History could not be read after application restart.");
-    const history = await response.json();
-    assert(history.records.some((record) => record.id === probeId), "The saved request was not present after application restart.");
-
-    const wrongOrigin = await fetch(`${origin}/api/workbench/history`, { method: "DELETE", headers: { Origin: "http://evil.example" } });
-    assert(wrongOrigin.status === 403, "A cross-origin history mutation was not refused.");
-
-    const wrongHostStatus = await fetchWithHostHeader(`${origin}/api/workbench/status`, "evil.example:3210");
-    assert(wrongHostStatus === 403, "A non-local Host header was not refused.");
-  } finally {
-    await stopApp(second);
-  }
-
-  console.log("Local API verification passed: real test PostgreSQL, Site-key lifecycle, connection isolation, shared assignments, Site-wide request limits, generated Data API disabled, and history persisted across an app restart.");
-  console.log("Synthetic Site and payment-configuration records were removed after the guided checks.");
+  console.log("Local Site API verification passed: operational PostgreSQL schema, generated Data API disabled, credential-shaped references refused, Site and connection isolation, shared Site request limits, key authentication, rotation and revocation verified through HTTP.");
 }
 
 main().catch((error) => {

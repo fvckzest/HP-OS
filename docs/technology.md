@@ -1,6 +1,6 @@
 # First-release technology
 
-This document records the technology and implementation-order decisions agreed during [issue #11](https://github.com/fvckzest/HP-OS/issues/11). [Issue #23](https://github.com/fvckzest/HP-OS/issues/23) provides a local Next.js application, direct PostgreSQL access, version-controlled migrations, and a local testing workbench. [Issue #24](https://github.com/fvckzest/HP-OS/issues/24) adds the first `/v1` slice for Site-key authentication and payment-configuration reads. Events, ticketing, and hosted readiness remain unimplemented or unverified.
+This document records the technology and implementation-order decisions agreed during [issue #11](https://github.com/fvckzest/HP-OS/issues/11). [Issue #23](https://github.com/fvckzest/HP-OS/issues/23) provides a local Next.js application, direct PostgreSQL access, and version-controlled migrations. [Issue #24](https://github.com/fvckzest/HP-OS/issues/24) adds the first `/v1` slice for Site-key authentication and payment-configuration reads. Events, ticketing, and hosted readiness remain unimplemented or unverified.
 
 ## Language and deployment
 
@@ -30,7 +30,7 @@ This approach keeps first-release scheduling on Vercel and durable recovery stat
 
 ## Local development and hosted cutover
 
-Issue #23 implements the local foundation with Supabase CLI-managed PostgreSQL and SQL migrations. `pnpm local` starts the local database and Next.js development server, applies pending migrations, verifies the `local-test` database marker, and binds the app to `127.0.0.1`. The migration places workbench diagnostics in a private PostgreSQL schema, and the generated Supabase Data API is disabled. Local-only workbench routes also require the explicit local enable flag, the expected loopback Host, and a same-origin check for mutations. These controls prepare local development only; they do not prove hosted database connectivity or authorize a production cutover.
+Issue #23 implements the local foundation with Supabase CLI-managed PostgreSQL and SQL migrations. `pnpm local` starts the local database and Next.js development server, applies pending migrations, verifies the HP-OS operational schema, and binds the app to `127.0.0.1`. The generated Supabase Data API is disabled. These controls prepare local development only; they do not prove hosted database connectivity or authorize a production cutover.
 
 - Use the Supabase CLI with Docker to run the local Supabase environment during development and testing. A hosted HP-OS Supabase project is deferred until readiness for LMNL cutover because the current plan has no available project capacity.
 - Run the database-dependent Next.js application and HP-OS and Site processing locally against test data. Exercise scheduled processing through a local scheduler or test runner using the same processing code; Vercel Cron is the hosted scheduling target, not evidence of local execution.

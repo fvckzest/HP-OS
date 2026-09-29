@@ -5,7 +5,7 @@ import path from "node:path";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const supabaseHome = path.join(root, ".local-supabase-home");
 const localDatabaseUrl = "postgresql://postgres:postgres@127.0.0.1:54322/postgres";
-const port = Number(process.env.HPOS_WORKBENCH_PORT ?? 3000);
+const port = 3000;
 
 function fail(message) {
   console.error(`HP-OS local startup stopped: ${message}`);
@@ -21,13 +21,10 @@ function validLocalDatabaseUrl(value) {
   }
 }
 
-if (process.env.NODE_ENV === "production") fail("The workbench is disabled in production mode.");
-if (!Number.isInteger(port) || port < 3000 || port > 3999) fail("HPOS_WORKBENCH_PORT must be an unused port from 3000 to 3999.");
+if (process.env.NODE_ENV === "production") fail("The local development server cannot run in production mode.");
 const origin = `http://127.0.0.1:${port}`;
 const databaseUrl = process.env.HPOS_DATABASE_URL ?? localDatabaseUrl;
 if (!validLocalDatabaseUrl(databaseUrl)) fail("HPOS_DATABASE_URL must point to the dedicated loopback test database at 127.0.0.1:54322/postgres.");
-if (process.env.HPOS_WORKBENCH_ORIGIN && process.env.HPOS_WORKBENCH_ORIGIN !== origin) fail(`HPOS_WORKBENCH_ORIGIN must match ${origin}.`);
-if (process.env.HPOS_API_BASE_URL && process.env.HPOS_API_BASE_URL !== origin) fail(`HPOS_API_BASE_URL must match ${origin}; remote and alternate targets are refused.`);
 
 const docker = spawnSync("docker", ["info", "--format", "{{.ServerVersion}}"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
 if (docker.status !== 0) fail("Start Docker Desktop or another Docker-compatible runtime, then run `pnpm local` again.");
@@ -43,15 +40,10 @@ function run(command, args, env) {
   });
 }
 
-const revision = spawnSync("git", ["rev-parse", "--short", "HEAD"], { cwd: root, encoding: "utf8" }).stdout?.trim() || "unknown";
 const localEnv = {
   ...process.env,
   NODE_ENV: "development",
-  HPOS_LOCAL_WORKBENCH: "1",
   HPOS_DATABASE_URL: databaseUrl,
-  HPOS_WORKBENCH_ORIGIN: origin,
-  HPOS_API_BASE_URL: origin,
-  HPOS_REVISION: revision,
   SUPABASE_HOME: supabaseHome,
   SUPABASE_TELEMETRY_DISABLED: "1",
 };
@@ -64,7 +56,7 @@ try {
   fail(error instanceof Error ? error.message : "The local database could not be prepared.");
 }
 
-console.log(`HP-OS local workbench: ${origin}/workbench`);
+console.log(`HP-OS local application: ${origin}`);
 console.log("The PostgreSQL volume is persistent. Stop this app with Ctrl-C; `pnpm exec supabase stop` stops services without resetting the database.");
 try {
   await run("pnpm", ["exec", "next", "dev", "--hostname", "127.0.0.1", "--port", String(port)], localEnv);

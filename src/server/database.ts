@@ -1,5 +1,6 @@
 import { Pool } from "pg";
-import { DEFAULT_DATABASE_URL } from "@/src/workbench/environment";
+
+const DEFAULT_DATABASE_URL = "postgresql://postgres:postgres@127.0.0.1:54322/postgres";
 
 const globalPool = globalThis as typeof globalThis & { hposDatabasePool?: Pool };
 
