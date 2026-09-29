@@ -7,8 +7,9 @@ export default function HomePage() {
         <p className="eyebrow">Operational engine for LMNL-built sites</p>
         <h1>HP-OS</h1>
         <p>
-          The first implementation slice provides a private local PostgreSQL foundation and a
-          testing workbench. Ticketing and Event business operations are not implemented yet.
+          The first implementation slice provides Site-key authentication and Site-scoped payment
+          configuration, with a private local PostgreSQL foundation and testing workbench. Event
+          and ticketing operations are not implemented yet.
         </p>
       </header>
       <section className="panel stack" aria-labelledby="capability-heading">
@@ -16,7 +17,7 @@ export default function HomePage() {
         <ul>
           <li>Version-controlled SQL migrations and direct PostgreSQL access.</li>
           <li>A loopback-only local workbench with sanitized, persistent diagnostic history.</li>
-          <li>Business API operations and local LMNL integration remain unavailable.</li>
+          <li>Event and ticketing API operations and local LMNL integration remain unavailable.</li>
         </ul>
         <p><Link href="/workbench">Open the local testing workbench</Link></p>
       </section>

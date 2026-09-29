@@ -1,8 +1,14 @@
 "use client";
 
+<<<<<<< HEAD
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import { foundationWorkflow } from "@/src/workbench/catalog";
 import { customEndpoint, explorerDomains, explorerEndpoints, type ExplorerEndpoint, type ExplorerField } from "@/src/workbench/explorer";
+=======
+import Link from "next/link";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { foundationWorkflow, siteAccessWorkflow } from "@/src/workbench/catalog";
+>>>>>>> 1d4ea0d9d27bcceb3f95e80d32223a521db91e59
 import type { HistoryRecord, RequestExecution } from "@/src/workbench/types";
 
 interface WorkbenchStatus {
@@ -15,9 +21,28 @@ interface WorkbenchStatus {
   environment: string;
   dataset: string;
   revision: string;
+  catalogue: Array<{ id: string; title: string; kind: string; availability: string; explanation: string; prerequisite?: string; expectedEvidence: string[]; requestTemplate?: { method: string; path: string; headers: Record<string, string>; body: string; expectedStatus: number } }>;
 }
 
 interface HistoryResponse { records: HistoryRecord[]; total: number }
+interface SiteAccessCheckResult {
+  result: "passed" | "failed";
+  message: string;
+  evidence: { executionMode: string; fixtureMode: string };
+  steps: Array<{
+    id: string;
+    title: string;
+    expected: string;
+    statusCode: number | null;
+    actual: string;
+    request: { method: string; path: string; headers: Record<string, string> };
+    observations: Array<{ label: string; source: string; value: string }>;
+    executionMode: string;
+    fixtureMode: string;
+    result: "passed" | "failed";
+    capture: "stored" | "incomplete";
+  }>;
+}
 
 interface SessionValue {
   key: string;
@@ -239,11 +264,14 @@ export default function WorkbenchClient() {
   const [message, setMessage] = useState("");
   const [requestError, setRequestError] = useState("");
   const [execution, setExecution] = useState<RequestExecution | null>(null);
+  const [siteAccessResult, setSiteAccessResult] = useState<SiteAccessCheckResult | null>(null);
+  const [siteAccessRunning, setSiteAccessRunning] = useState(false);
   const [method, setMethod] = useState("GET");
   const [path, setPath] = useState("");
   const [headers, setHeaders] = useState(defaultHeaders);
   const [body, setBody] = useState("");
   const [expectedStatus, setExpectedStatus] = useState("");
+<<<<<<< HEAD
   const [pathDetailsDraft, setPathDetailsDraft] = useState("");
   const [headersDetailsDraft, setHeadersDetailsDraft] = useState(defaultHeaders);
   const [bodyDetailsDraft, setBodyDetailsDraft] = useState("");
@@ -267,6 +295,15 @@ export default function WorkbenchClient() {
   const activeFieldId = hoveredFieldId ?? clickedFieldId;
   const activeField = selectedEndpoint.fields.find((field) => field.id === activeFieldId) ?? null;
   const relevantValues = selectedEndpoint.fields.flatMap((field) => matchingValues(field, sessionValues).map((value) => ({ field, value })));
+=======
+  const siteAccessCapability = status?.catalogue.find((entry) => entry.id === "site-payment-configuration");
+  const siteAccessReady = Boolean(status?.database.ready
+    && status.hposBusinessApi.state === "available"
+    && siteAccessCapability?.availability === "available");
+  const siteAccessBlockReason = status && !siteAccessReady
+    ? !status.database.ready ? status.database.message : siteAccessCapability?.prerequisite ?? status.hposBusinessApi.reason
+    : "";
+>>>>>>> 1d4ea0d9d27bcceb3f95e80d32223a521db91e59
 
   const refreshStatus = useCallback(async () => {
     const response = await fetch("/api/workbench/status", { cache: "no-store" });
@@ -402,6 +439,23 @@ export default function WorkbenchClient() {
     }
   }
 
+  async function runSiteAccessCheck() {
+    setSiteAccessRunning(true);
+    setSiteAccessResult(null);
+    setMessage("Running Site access and configuration checks through the HTTP API…");
+    try {
+      const response = await fetch("/api/workbench/site-access-check", { method: "POST" });
+      const result = await readJson<SiteAccessCheckResult>(response);
+      setSiteAccessResult(result);
+      setMessage(result.message);
+      await Promise.all([refreshHistory(), refreshStatus()]);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "The Site access check could not complete.");
+    } finally {
+      setSiteAccessRunning(false);
+    }
+  }
+
   async function runRequest(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setRequestError("");
@@ -429,6 +483,17 @@ export default function WorkbenchClient() {
     } catch (error) {
       setRequestError(error instanceof Error ? error.message : "The request could not be completed.");
     }
+  }
+
+  function loadRequestTemplate(template: NonNullable<WorkbenchStatus["catalogue"][number]["requestTemplate"]>) {
+    setMethod(template.method);
+    setPath(template.path);
+    setHeaders(JSON.stringify(template.headers, null, 2));
+    setBody(template.body);
+    setExpectedStatus(String(template.expectedStatus));
+    document.getElementById("request-heading")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    document.getElementById("request-method")?.focus({ preventScroll: true });
+    setMessage("Request template loaded. Review or edit it before sending; the configured Site key is added on the server.");
   }
 
   async function clearHistory() {
@@ -523,7 +588,87 @@ export default function WorkbenchClient() {
         </aside>
       </section>
 
+<<<<<<< HEAD
       <section className="workbench-section workflows-section" aria-labelledby="workflow-heading"><div className="section-heading"><div><h2 id="workflow-heading">Guided Workflows</h2><p className="section-description">Short local checks stay below the Explorer so the request console remains in place.</p></div></div><div className="workflow-card"><div className="workflow-step-copy"><strong>{foundationWorkflow.title}</strong><p>{foundationWorkflow.explanation} {foundationWorkflow.steps[0].expected}</p></div><button className="button-primary" type="button" onClick={() => void runFoundationCheck()}>Run check</button></div></section>
+=======
+      <section className="workbench-section" aria-labelledby="site-access-heading">
+        <div className="section-heading">
+          <h2 id="site-access-heading">{siteAccessWorkflow.title}</h2>
+        </div>
+        <p className="section-description">{siteAccessWorkflow.explanation}</p>
+        <div className="workflow-card">
+          {siteAccessWorkflow.steps.map((step) => <div key={step.id} className="workflow-step">
+            <div className="workflow-step-copy">
+              <strong>{step.title}</strong>
+              <p>{step.expected}</p>
+            </div>
+          </div>)}
+          <div className="workflow-step">
+            <div className="workflow-step-copy">
+              <strong>Run API checks</strong>
+              <p>Each request uses generated test keys held only in server memory. No credential is shown in the browser or saved in history.</p>
+              {siteAccessBlockReason && <p className="field-help">Blocked: {siteAccessBlockReason}</p>}
+            </div>
+            <button className="button-primary" type="button" onClick={() => void runSiteAccessCheck()} disabled={!siteAccessReady || siteAccessRunning}>
+              {siteAccessRunning ? "Running checks…" : "Run Site access checks"}
+            </button>
+          </div>
+        </div>
+        {siteAccessResult && <div className="result-panel stack" aria-live="polite">
+          <h3>Site access check: {siteAccessResult.result}</h3>
+          <p>Evidence: {siteAccessResult.evidence.executionMode.replaceAll("_", " ")} using {siteAccessResult.evidence.fixtureMode} records.</p>
+          <div className="history-list">{siteAccessResult.steps.map((step) => <article key={step.id} className="history-record">
+            <div className="history-record-heading"><strong>{step.title}</strong><span>{step.result}</span><span>{step.statusCode === null ? "Outcome unknown" : `HTTP ${step.statusCode}`}</span><span>Capture: {step.capture}</span></div>
+            <p><strong>Expected:</strong> {step.expected}</p>
+            <p><strong>Observed:</strong> {step.actual}</p>
+            <details><summary>Request and observation sources</summary>
+              <pre className="code-block">{formatValue(step.request)}</pre>
+              <ul>{step.observations.map((observation) => <li key={`${observation.label}-${observation.source}`}><strong>{observation.label}:</strong> {observation.value} · Source: {observation.source}</li>)}</ul>
+            </details>
+          </article>)}</div>
+        </div>}
+      </section>
+
+      <section className="workbench-section" aria-labelledby="catalogue-heading">
+        <div className="section-heading"><h2 id="catalogue-heading">Capability catalogue</h2></div>
+        <div className="status-grid">{(status?.catalogue ?? []).map((entry) => <article key={entry.id} className="status-card">
+          <div className="status-card-heading"><strong>{entry.title}</strong><span>{entry.availability}</span></div>
+          <p>{entry.explanation}</p>
+          {entry.prerequisite && <p className="field-help">Next: {entry.prerequisite}</p>}
+          <details><summary>Expected evidence</summary><ul>{entry.expectedEvidence.map((item) => <li key={item}>{item}</li>)}</ul></details>
+          {entry.requestTemplate && <div className="stack"><details><summary>Request template</summary><pre className="code-block">{formatValue(entry.requestTemplate)}</pre><p className="field-help">Authorization is added from the server environment and is not shown in the browser.</p></details><button className="button-secondary" type="button" onClick={() => loadRequestTemplate(entry.requestTemplate!)}>Edit this request</button></div>}
+        </article>)}</div>
+      </section>
+
+      <section className="workbench-section request-section" aria-labelledby="request-heading">
+        <div className="section-heading">
+          <h2 id="request-heading">HTTP request</h2>
+        </div>
+        <p className="request-description">Loopback <code>/v1/</code> requests only. Redirects are blocked. Server-side credentials stay on the server.</p>
+        <form className="stack" onSubmit={(event) => void runRequest(event)}>
+          <div className="request-controls-grid">
+            <div className="field"><label htmlFor="request-method">Method</label><select id="request-method" value={method} onChange={(event) => setMethod(event.target.value)}>{["GET", "POST", "PATCH", "PUT", "DELETE"].map((value) => <option key={value}>{value}</option>)}</select></div>
+            <div className="field"><label htmlFor="request-path">Path</label><input id="request-path" value={path} onChange={(event) => setPath(event.target.value)} placeholder="/v1/implemented-route" required /></div>
+            <div className="field"><label htmlFor="expected-status">Expected status <span className="label-optional">Optional</span></label><input id="expected-status" type="number" min="100" max="599" value={expectedStatus} onChange={(event) => setExpectedStatus(event.target.value)} placeholder="Any status" /></div>
+          </div>
+          <div className="field"><label htmlFor="request-headers">Headers <span className="label-optional">JSON</span></label><textarea className="code-input" id="request-headers" rows={3} value={headers} onChange={(event) => setHeaders(event.target.value)} spellCheck={false} /><details className="field-help"><summary>Allowed headers</summary><p>Accept, Content-Type, If-Match, If-None-Match, and Idempotency-Key. Credentials and browser security headers are rejected.</p></details></div>
+          <div className="field"><label htmlFor="request-body">Request body <span className="label-optional">JSON · optional</span></label><textarea className="code-input body-input" id="request-body" rows={5} value={body} onChange={(event) => setBody(event.target.value)} spellCheck={false} placeholder="Optional JSON body" /><small className="field-help">Invalid JSON is sent unchanged and omitted from saved history.</small></div>
+          <div className="request-submit-row"><button className="button-primary" type="submit" disabled={!status?.database.ready}>Send request</button><span className="field-help">Unknown outcomes are never retried automatically.</span></div>
+        </form>
+        {requestError && <p className="status-blocked" role="alert">{requestError}</p>}
+        {execution && <div className="result-panel stack" aria-live="polite">
+          <h3>Request result</h3>
+          <div className="result-summary">
+            <p><strong>Outcome</strong>{execution.outcome === "outcome_unknown" ? "Outcome unknown" : `HTTP ${execution.statusCode}`}</p>
+            <p><strong>Check</strong>{execution.result.replaceAll("_", " ")}</p>
+            <p><strong>History capture</strong>{execution.capture}</p>
+          </div>
+          {execution.message && <p className="notice">{execution.message}</p>}
+          {execution.redirectBlocked && <p>A redirect was returned and blocked. The workbench did not follow it.</p>}
+          <pre className="code-block">{formatValue({ route: execution.route, headers: execution.responseHeaders, response: execution.response })}</pre>
+        </div>}
+      </section>
+>>>>>>> 1d4ea0d9d27bcceb3f95e80d32223a521db91e59
 
       <section className="workbench-section history-section" aria-labelledby="history-heading"><div className="section-heading history-heading-row"><div><h2 id="history-heading">History</h2><p className="section-description">{history.length} of {historyCount} calls · sanitized and saved locally</p></div><div className="history-actions"><a className="button-secondary button-link" href="/api/workbench/export">Download masked JSON</a><button className="button-secondary" type="button" onClick={() => void clearHistory()}>Clear history</button></div></div>{history.length === 0 && <p className="empty-state">No local calls have been recorded yet.</p>}<div className="history-list">{history.map((record) => <article key={record.id} className="history-record"><div className="history-record-heading"><strong>{record.method} {record.route}</strong><span>{record.status_code === null ? "Outcome unknown" : `HTTP ${record.status_code}`}</span><span>{record.result_state.replaceAll("_", " ")}</span><span>Capture: {record.capture_state}</span></div><small className="field-help">{new Date(record.recorded_at).toLocaleString()} · Source: {record.source} · Attempt: {record.attempt} · Revision: {record.revision} · Dataset: {record.dataset_label}</small><details><summary>Inspect sanitized request and response</summary><pre className="code-block">{formatValue({ request: record.request_snapshot, expectation: record.expectation_snapshot, response: record.response_snapshot, errorCode: record.error_code, durationMs: record.duration_ms })}</pre></details></article>)}</div></section>
     </main>
