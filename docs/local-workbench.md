@@ -6,7 +6,7 @@ This document records local workbench decisions agreed with the product owner in
 
 Run `pnpm install` once, then `pnpm local` to start the loopback-only app and Supabase PostgreSQL stack. The command applies pending SQL migrations, checks the dedicated `local-test` marker by direct SQL, and prints `http://127.0.0.1:3000/workbench`. Docker and a Node.js 22+ runtime must already be installed and running. Stopping the app does not reset the PostgreSQL volume; `pnpm local:stop` stops the stack without resetting it. Supabase CLI runtime files stay in ignored `.local-supabase-home/`, and telemetry is disabled for these local commands.
 
-The workbench shows app/database status, a one-step readiness workflow, and a version-controlled catalogue. It marks HP-OS business routes and local LMNL integration unavailable. The manual request editor can prepare one request to a local `/v1/` route; it does not add a business API endpoint. Local workbench HTTP handlers are disabled in production, check the loopback Host, require a same-origin request for mutations, and reject non-local database and API targets. Redirects are not followed.
+The workbench opens an API Explorer in a browser window. A compact local service status strip uses a filled black dot for services ready or operating as intended, and a hollow white dot for unavailable capabilities or dependencies that need work. The generated database API is intentionally disabled and marked “Disabled by design” with a filled dot. Each status item has a title and a one-sentence function description that opens on demand. The Explorer keeps a searchable, domain-grouped endpoint list on the left, a request console in the center, and a glossary and contextual values panel on the right. The version-controlled endpoint catalogue is derived from the documented API reference and marks business operations unavailable until their routes are implemented. The available Custom `/v1` request mode can still prepare and send one local request; it does not add a business API endpoint. Local workbench HTTP handlers are disabled in production, check the loopback Host, require a same-origin request for mutations, and reject non-local database and API targets. Redirects are not followed.
 
 Diagnostic requests are stored in the private `workbench` PostgreSQL schema using direct SQL. The Supabase generated Data API is disabled. Request and response snapshots are sanitized before storage; usable credentials, buyer details, path tokens, query strings, arbitrary free text, and malformed bodies are excluded or redacted. History clearing deletes only diagnostic history. JSON export includes all saved, already-sanitized records. The viewer shows the latest 100 records.
 
@@ -16,9 +16,9 @@ No business API operation or local LMNL integration is implemented or simulated 
 
 ## Starting point
 
-Guided workflows are the default starting point. Each workflow explains its steps in plain technical English and provides access to inspect and edit the API requests. Manual requests are also available for testing an individual API call.
+The API Explorer is the default starting point. Choose an endpoint by its plain-language action, method, and path, or use the available Custom `/v1` request mode for an implemented local route. Endpoint selection never sends a request. Guided Workflows remain in their own area below the Explorer, and History remains at the bottom of the page.
 
-This gives a beginner a meaningful task to follow while retaining access to the underlying API. For example, a one-Ticket purchase workflow can guide the user through requesting a quote, creating an Order, simulating a payment report, and checking the issued Ticket. Simulated payment results establish local HP-OS behavior only; they do not prove a real payment integration.
+The request console presents readable named inputs first. Hovering or focusing an input gives a short definition; clicking it opens the fuller glossary entry on the right. Request details can be expanded to inspect and edit the exact method, path, headers, and JSON. Documented business endpoints are clearly marked unavailable until their implementation tickets add the corresponding routes, so the Explorer does not imply that contract documentation is runtime evidence.
 
 ## Execution
 
@@ -28,7 +28,7 @@ The default lets a beginner understand each operation and its result. The option
 
 ## Request editing
 
-Guided steps present plain labeled fields first. An expandable “Request details” section exposes the HTTP method, path, headers, and JSON body. The fields and request details are editable and stay synchronized, so either view represents the same request.
+The Explorer presents plain labeled fields first. An expandable “Request details” section exposes the HTTP method, path, headers, and JSON body. Named path, query, and body fields update their corresponding request details and remain editable. Examples appear as hints and are never sent unless the user enters them. The user must explicitly select Send request. The response appears below the request with status, headers, body, and history-capture state.
 
 For example, changing “Ticket quantity” from `1` to `2` changes `quantity` in the JSON body. This lets a beginner use understandable inputs while learning how they map to the API request.
 
@@ -42,7 +42,7 @@ Before/after observations must state their evidence source. State fetched after 
 
 ## Values shared between steps
 
-The workbench automatically fills later requests with values returned by earlier steps, including record identifiers and the versions required by guarded operations. It shows each value's source and allows the user to inspect or override it before execution. For example, an Order ID is labeled as coming from the Create Order step.
+The workbench can fill a later request with a unique compatible value returned by an earlier request in the current browser session, including record identifiers and versions required by guarded operations. It shows the source and allows the user to inspect or override it before execution. When several current-session values match, the user chooses one from the subtle Available values section in the right panel. Older saved History entries are not reused automatically; opening a historical call remains an explicit action.
 
 The workbench also manages idempotency keys: a retry of the same request reuses its key, while a new operation receives a new key. A record version protects an edit against overwriting a newer change; an idempotency key prevents a repeated request from creating a duplicate write. Both remain visible and overridable in request details. These controls reduce copying errors without hiding what is sent or replacing the API's concurrency and retry rules.
 

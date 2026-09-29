@@ -17,6 +17,8 @@ In a second terminal, `pnpm test` starts temporary app processes and verifies th
 
 This local foundation does not implement `/v1` business operations or a local LMNL integration. It does not establish hosted database, provider, device, or production readiness.
 
+The browser workbench opens the API Explorer by default. Browse documented endpoints by HP-OS domain in the left column, prepare requests in the center console, and read field definitions and current-session values in the right glossary panel. Documented business endpoints are marked unavailable until implemented; the Custom `/v1` request entry remains available for local routes that do exist. Guided Workflows sit below the Explorer, and shared sanitized History stays at the bottom of the page.
+
 ## Find the current guidance
 
 | Need | Source |
@@ -29,7 +31,7 @@ This local foundation does not implement `/v1` business operations or a local LM
 | Exact Site-to-HP-OS request, response, permission, and error rules | [API contract](docs/api/api.md) |
 | Agreed first-release language, hosting, and database approach | [Technology](docs/technology.md) |
 | Required LMNL release evidence and cutover procedure | [Release and cutover](docs/release-and-cutover.md) |
-| Settled local workbench workflow, test controls, delivery plan, and functional verification | [Local testing workbench](docs/local-workbench.md) |
+| Settled local API Explorer form factor, workbench workflow, test controls, delivery plan, and functional verification | [Local testing workbench](docs/local-workbench.md) |
 | Consolidated local workbench specification and implementation handoff | [HP-OS local API workbench implementation specification](https://github.com/fvckzest/HP-OS/issues/66) |
 | Current questions and work | [First-release Wayfinder issue](https://github.com/fvckzest/HP-OS/issues/1) and its linked tickets |
 | Dated source evidence | [Research](docs/research/) |
