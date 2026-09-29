@@ -158,6 +158,8 @@ Paths are relative to the base URL. `{...}` identifies a path parameter. All end
 | `POST /v1/admin/notification-jobs/{job_id}/outcome-reports` | Report dispatch completed, failed, or unknown. |
 | `POST /v1/admin/notification-jobs/{job_id}/delivery-reports` | Report provider-confirmed email delivery or failure. |
 
+Claims and reports require a Site API key, a UUID `Idempotency-Key`, and a system `actor` object with a Site-local `reference`. Outcome reports also require the claimed job's current `lease_fence`; an old claim ID or fence returns `409 claim_conflict`.
+
 ### Action names
 
 | Resource | Action | Meaning |
@@ -694,7 +696,11 @@ The contract also requires refund timestamps/history without enumerating every s
 | `payload` | object | Kind-specific operational delivery content. |
 | `claim_id` | string?; claim response | Lease identity; null if no jobs. |
 | `lease_expires_at` | timestamp?; claim response | Lease deadline; null if no jobs. |
+| `lease_fence` | integer; claimed job/outcome input | Monotonically increasing per-job fence; required when reporting a dispatch outcome. |
 | `jobs` | NotificationJob[]; claim response | Claimed work; [] if none. |
+| `dispatch_attempts` | object[]; job detail | Latest attempts with claim ID, fence, attempt number, outcome, safe provider reference, observation time, and error code. |
+| `delivery_reports` | object[]; job detail | Latest provider event reference, message reference, outcome, and observation time. |
+| `delivery_status` | enum?; job detail | Newest delivery observation; null before a provider report. |
 | `outcome` | enum; dispatch input | completed, failed, unknown. |
 | `observed_at` | timestamp; report input | Provider observation instant. |
 | `error_code` | string?; dispatch input | Provider failure reason when available. |
@@ -705,14 +711,14 @@ The contract also requires refund timestamps/history without enumerating every s
 
 | Kind | Content |
 | --- | --- |
-| `access_approved` | Attendee name/email and approval token. |
-| `tickets_ready` | Current delivery email, buyer name, Event/Order references, and Order token. |
-| `order_recovery` | Delivery email and matching Order references with temporary tokens/expiries. |
-| `event_changed` | Recipient/Order references and changed Event details. |
-| `event_canceled` | Recipient/Order references and canceled Event details. |
-| `wallet_update` | Ticket ID and changed operational data version. |
+| `access_approved` | `{ attendee: { name, email }, approval_token }`. |
+| `tickets_ready` | `{ recipient_email, buyer_name, event: { event_id, event_reference, title, starts_at, ends_at, time_zone, venue: { name, address } }, order: { order_id, order_reference, order_token } }`. |
+| `order_recovery` | `{ recipient_email, orders: [{ order_id, order_reference, order_token, expires_at }] }`. |
+| `event_changed` | `{ recipient_email, order: { order_id, order_reference }, event: { event_id, event_reference, title, starts_at, ends_at, time_zone, venue: { name, address }, changed_fields: [...] } }`. |
+| `event_canceled` | `{ recipient_email, order: { order_id, order_reference }, event: { event_id, event_reference, title, starts_at, ends_at, time_zone, venue: { name, address } }, canceled_at }`. |
+| `wallet_update` | `{ ticket_id, data_version }`. |
 
-Payload contents are specified semantically in the contract; exact nested member names are not yet enumerated there. This sheet does not invent additional wire fields. Templates, URLs, provider credentials, and Apple device/signing credentials belong to LMNL.
+All members shown are required. `venue.address` may be `null`; `changed_fields` and `orders` are nonempty arrays. Nested IDs match the related job IDs, and all timestamps include a UTC offset. Templates, URLs, provider credentials, and Apple device/signing credentials belong to LMNL.
 
 ### Wallet data, issues, and audit metadata
 
