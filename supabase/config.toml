@@ -1,0 +1,32 @@
+project_id = "hpos-issue-23-local-foundation-20260928"
+
+[api]
+enabled = false
+
+[db]
+port = 54322
+shadow_port = 54320
+
+[db.seed]
+enabled = false
+
+[studio]
+enabled = false
+
+[auth]
+enabled = false
+
+[storage]
+enabled = false
+
+[realtime]
+enabled = false
+
+[inbucket]
+enabled = false
+
+[analytics]
+enabled = false
+
+[edge_runtime]
+enabled = false

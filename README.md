@@ -1,6 +1,21 @@
 # HP-OS
 
-HP-OS is a shared cultural operations engine for LMNL-built websites. Events and ticketing are the first planned capabilities. LMNL is the first Site. This repository currently contains planning documents and research, not an implemented HP-OS application. The [first-release Wayfinder issue](https://github.com/fvckzest/HP-OS/issues/1) indexes current planning work; [issue #6](https://github.com/fvckzest/HP-OS/issues/6) settles the first-release jobs, [issue #7](https://github.com/fvckzest/HP-OS/issues/7) names their domain concepts, and [issue #8](https://github.com/fvckzest/HP-OS/issues/8) defines their detailed journey in the Events and Ticketing guidance below.
+HP-OS is a shared cultural operations engine for LMNL-built websites. Events and ticketing are the first planned business capabilities. LMNL is the first Site. The initial implementation in [issue #23](https://github.com/fvckzest/HP-OS/issues/23) adds the TypeScript/Next.js application, a persistent local PostgreSQL foundation, and a loopback-only testing workbench. Event, ticketing, Site authentication, and LMNL business operations remain unavailable. The [first-release Wayfinder issue](https://github.com/fvckzest/HP-OS/issues/1) indexes current planning work; [issue #6](https://github.com/fvckzest/HP-OS/issues/6) settles the first-release jobs, [issue #7](https://github.com/fvckzest/HP-OS/issues/7) names their domain concepts, and [issue #8](https://github.com/fvckzest/HP-OS/issues/8) defines their detailed journey in the Events and Ticketing guidance below.
+
+## Run locally
+
+First install Node.js 22 or later, pnpm 11, and a running Docker-compatible container service. The Supabase local stack uses Docker and must stay on the local machine.
+
+```sh
+pnpm install
+pnpm local
+```
+
+The `pnpm local` command starts local PostgreSQL, applies pending version-controlled migrations, verifies the dedicated local test database, binds the Next.js app to `127.0.0.1`, and prints the workbench URL. Open `http://127.0.0.1:3000/workbench`. Stop the app with Ctrl-C. The local database volume persists; `pnpm local:stop` stops its services without resetting data. Supabase runtime files stay in the ignored `.local-supabase-home/` directory, and CLI telemetry is disabled for these local commands.
+
+In a second terminal, `pnpm test` starts temporary app processes and verifies the real local PostgreSQL boundary, confirms the generated Supabase Data API is disabled, checks request redaction and local access guards, forces a diagnostic-history write failure, and verifies history across an app restart. It leaves one sanitized expected-404 probe in workbench history; its omitted HTML response body is marked incomplete. `pnpm typecheck` checks TypeScript; `pnpm build` creates the production build, where local workbench routes remain disabled.
+
+This local foundation does not implement `/v1` business operations or a local LMNL integration. It does not establish hosted database, provider, device, or production readiness.
 
 ## Find the current guidance
 
