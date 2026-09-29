@@ -6,6 +6,5 @@ coverage/
 .env.*
 !.env.example
 supabase/.temp/
-.local-workbench/
 .local-supabase-home/
 *.tsbuildinfo
