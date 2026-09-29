@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { foundationWorkflow, workbenchCatalog } from "@/src/workbench/catalog";
+import { foundationWorkflow } from "@/src/workbench/catalog";
 import type { HistoryRecord, RequestExecution } from "@/src/workbench/types";
 
 interface WorkbenchStatus {
@@ -26,12 +26,6 @@ async function readJson<T>(response: Response): Promise<T> {
     throw new Error(message);
   }
   return value as T;
-}
-
-function statusClass(state: string): string {
-  if (state === "ready" || state === "available" || state === "loopback-only") return "status-ready";
-  if (state === "blocked") return "status-blocked";
-  return "status-unavailable";
 }
 
 function formatValue(value: unknown): string { return JSON.stringify(value, null, 2); }
@@ -131,20 +125,21 @@ export default function WorkbenchClient() {
   }
 
   return (
-    <main className="page-shell stack">
-      <header className="stack">
-        <p className="eyebrow">HP-OS · local testing only</p>
-        <h1>Local testing workbench</h1>
-        <p>Inspect local service readiness, prepare an editable HTTP request, and keep a private history of its sanitized result.</p>
-        <p><Link href="/">Back to HP-OS</Link></p>
+    <main className="page-shell workbench-page">
+      <header className="workbench-header">
+        <div className="workbench-header-meta"><p>HP-OS · Local only</p><Link href="/">Home</Link></div>
+        <h1>Workbench</h1>
       </header>
-      {message && <p className="notice" role="status">{message}</p>}
+      {message && <p className={`notice workbench-message ${message.startsWith("Blocked") ? "notice-warning" : ""}`} role="status">{message}</p>}
 
-      <section className="panel stack" aria-labelledby="service-status-heading">
-        <div className="row"><h2 id="service-status-heading">Service and configuration status</h2><button type="button" onClick={() => void refreshAll()} disabled={loading}>Refresh</button></div>
+      <section className="workbench-section" aria-labelledby="service-status-heading">
+        <div className="section-heading">
+          <h2 id="service-status-heading">Service status</h2>
+          <button className="button-secondary" type="button" onClick={() => void refreshAll()} disabled={loading}>Refresh status</button>
+        </div>
         {loading && <p>Checking the local application and PostgreSQL…</p>}
         {!loading && !status && <p className="status-blocked">Status unavailable. Check that the local database and application are running.</p>}
-        {status && <div className="grid">
+        {status && <div className="status-grid">
           <StatusItem label="Application" state={status.application.state} detail={status.application.capability} />
           <StatusItem label="Workbench access" state={status.access.state} detail={status.access.origin} />
           <StatusItem label="Local PostgreSQL" state={status.database.ready ? "ready" : "blocked"} detail={`${status.database.message} Target: ${status.database.target}.`} />
@@ -152,68 +147,86 @@ export default function WorkbenchClient() {
           <StatusItem label="HP-OS business API" state={status.hposBusinessApi.state} detail={`${status.hposBusinessApi.reason} Site API key ${status.hposBusinessApi.siteKeyConfigured ? "is configured on the server" : "is not configured"}.`} />
           <StatusItem label="Local LMNL integration" state={status.lmnlIntegration.state} detail={status.lmnlIntegration.reason} />
         </div>}
-        {status && <p className="muted">Environment: {status.environment} · Dataset: {status.dataset} · Revision: {status.revision}</p>}
+        {status && <div className="environment-meta" aria-label="Local dataset details">
+          <span>Environment: {status.environment}</span>
+          <span>Dataset: {status.dataset}</span>
+          <span>Revision: <code>{status.revision}</code></span>
+        </div>}
       </section>
 
-      <section className="grid" aria-label="Guided workflow and capability catalogue">
-        <article className="panel stack">
-          <h2>{foundationWorkflow.title}</h2>
-          <p>{foundationWorkflow.explanation}</p>
-          {foundationWorkflow.steps.map((step, index) => <div key={step.id} className="stack">
-            <h3>Step {index + 1}: {step.title}</h3><p><strong>Expected:</strong> {step.expected}</p>
-            <button type="button" onClick={() => void runFoundationCheck()}>Run this step</button>
+      <section className="workbench-section" aria-labelledby="workflow-heading">
+        <div className="section-heading">
+          <h2 id="workflow-heading">Foundation check</h2>
+        </div>
+        <div className="workflow-card">
+          {foundationWorkflow.steps.map((step) => <div key={step.id} className="workflow-step">
+            <div className="workflow-step-copy">
+              <strong>{step.title}</strong>
+              <p>{step.expected}</p>
+            </div>
+            <button className="button-primary" type="button" onClick={() => void runFoundationCheck()}>Run check</button>
           </div>)}
-        </article>
-        <article className="panel stack">
-          <h2>Shared request catalogue</h2>
-          {workbenchCatalog.map((entry) => <section key={entry.id} className="history-item">
-            <p className={statusClass(entry.availability)}>{entry.availability.toUpperCase()} · {entry.title}</p>
-            <p>{entry.explanation}</p>
-            {entry.prerequisite && <p><strong>Prerequisite:</strong> {entry.prerequisite}</p>}
-            <p><strong>Expected evidence:</strong> {entry.expectedEvidence.join("; ")}</p>
-          </section>)}
-        </article>
+        </div>
       </section>
 
-      <section className="panel stack" aria-labelledby="request-heading">
-        <h2 id="request-heading">Manual HTTP request</h2>
-        <p className="muted">Requests are limited to this workbench’s loopback origin and the existing <code>/v1/</code> API path. Redirects are not followed. Site authentication, if configured, is added by the server and never returned to this page.</p>
+      <section className="workbench-section request-section" aria-labelledby="request-heading">
+        <div className="section-heading">
+          <h2 id="request-heading">HTTP request</h2>
+        </div>
+        <p className="request-description">Loopback <code>/v1/</code> requests only. Redirects are blocked. Server-side credentials stay on the server.</p>
         <form className="stack" onSubmit={(event) => void runRequest(event)}>
-          <div className="grid">
+          <div className="request-controls-grid">
             <div className="field"><label htmlFor="request-method">Method</label><select id="request-method" value={method} onChange={(event) => setMethod(event.target.value)}>{["GET", "POST", "PATCH", "PUT", "DELETE"].map((value) => <option key={value}>{value}</option>)}</select></div>
             <div className="field"><label htmlFor="request-path">Path</label><input id="request-path" value={path} onChange={(event) => setPath(event.target.value)} placeholder="/v1/implemented-route" required /></div>
-            <div className="field"><label htmlFor="expected-status">Expected HTTP status (optional)</label><input id="expected-status" type="number" min="100" max="599" value={expectedStatus} onChange={(event) => setExpectedStatus(event.target.value)} placeholder="No check" /></div>
+            <div className="field"><label htmlFor="expected-status">Expected status <span className="label-optional">Optional</span></label><input id="expected-status" type="number" min="100" max="599" value={expectedStatus} onChange={(event) => setExpectedStatus(event.target.value)} placeholder="Any status" /></div>
           </div>
-          <div className="field"><label htmlFor="request-headers">Headers (JSON)</label><textarea id="request-headers" value={headers} onChange={(event) => setHeaders(event.target.value)} spellCheck={false} /><small className="muted">Allowed: Accept, Content-Type, If-Match, If-None-Match, and Idempotency-Key. Credentials and browser security headers are not accepted here.</small></div>
-          <div className="field"><label htmlFor="request-body">JSON body</label><textarea id="request-body" value={body} onChange={(event) => setBody(event.target.value)} spellCheck={false} placeholder="Optional. Deliberately invalid JSON is preserved for the request but omitted from history." /></div>
-          <div className="row"><button type="submit" disabled={!status?.database.ready}>Send one request</button><span className="muted">Unknown outcomes are never retried automatically.</span></div>
+          <div className="field"><label htmlFor="request-headers">Headers <span className="label-optional">JSON</span></label><textarea className="code-input" id="request-headers" rows={3} value={headers} onChange={(event) => setHeaders(event.target.value)} spellCheck={false} /><details className="field-help"><summary>Allowed headers</summary><p>Accept, Content-Type, If-Match, If-None-Match, and Idempotency-Key. Credentials and browser security headers are rejected.</p></details></div>
+          <div className="field"><label htmlFor="request-body">Request body <span className="label-optional">JSON · optional</span></label><textarea className="code-input body-input" id="request-body" rows={5} value={body} onChange={(event) => setBody(event.target.value)} spellCheck={false} placeholder="Optional JSON body" /><small className="field-help">Invalid JSON is sent unchanged and omitted from saved history.</small></div>
+          <div className="request-submit-row"><button className="button-primary" type="submit" disabled={!status?.database.ready}>Send request</button><span className="field-help">Unknown outcomes are never retried automatically.</span></div>
         </form>
         {requestError && <p className="status-blocked" role="alert">{requestError}</p>}
-        {execution && <div className="result stack" aria-live="polite">
+        {execution && <div className="result-panel stack" aria-live="polite">
           <h3>Request result</h3>
-          <p><strong>Outcome:</strong> {execution.outcome === "outcome_unknown" ? "Outcome unknown" : `HTTP ${execution.statusCode}`}</p>
-          <p><strong>Check:</strong> {execution.result.replaceAll("_", " ")}</p>
-          <p><strong>History capture:</strong> {execution.capture}</p>
+          <div className="result-summary">
+            <p><strong>Outcome</strong>{execution.outcome === "outcome_unknown" ? "Outcome unknown" : `HTTP ${execution.statusCode}`}</p>
+            <p><strong>Check</strong>{execution.result.replaceAll("_", " ")}</p>
+            <p><strong>History capture</strong>{execution.capture}</p>
+          </div>
           {execution.message && <p className="notice">{execution.message}</p>}
           {execution.redirectBlocked && <p>A redirect was returned and blocked. The workbench did not follow it.</p>}
           <pre className="code-block">{formatValue({ route: execution.route, headers: execution.responseHeaders, response: execution.response })}</pre>
         </div>}
       </section>
 
-      <section className="panel stack" aria-labelledby="history-heading">
-        <div className="row"><h2 id="history-heading">Shared diagnostic history</h2><a href="/api/workbench/export">Download masked JSON</a><button type="button" onClick={() => void clearHistory()}>Clear history</button></div>
-        <p className="muted">The viewer shows the latest {history.length} of {historyCount} saved calls. The export includes all saved calls. History contains sanitized evidence and is stored separately from business records.</p>
-        {history.length === 0 && <p>No local calls have been recorded yet.</p>}
-        {history.map((record) => <article key={record.id} className="history-item stack">
-          <div className="row"><strong>{record.method} {record.route}</strong><span>{record.status_code === null ? "Outcome unknown" : `HTTP ${record.status_code}`}</span><span>{record.result_state.replaceAll("_", " ")}</span><span>Capture: {record.capture_state}</span></div>
-          <small className="muted">{new Date(record.recorded_at).toLocaleString()} · Source: {record.source} · Attempt: {record.attempt} · Revision: {record.revision} · Dataset: {record.dataset_label}</small>
+      <section className="workbench-section" aria-labelledby="history-heading">
+        <div className="section-heading history-heading-row">
+          <div><h2 id="history-heading">History</h2><p className="section-description">{history.length} of {historyCount} calls · sanitized and saved locally</p></div>
+          <div className="history-actions"><a className="button-secondary button-link" href="/api/workbench/export">Download masked JSON</a><button className="button-secondary" type="button" onClick={() => void clearHistory()}>Clear history</button></div>
+        </div>
+        {history.length === 0 && <p className="empty-state">No local calls have been recorded yet.</p>}
+        <div className="history-list">{history.map((record) => <article key={record.id} className="history-record">
+          <div className="history-record-heading"><strong>{record.method} {record.route}</strong><span>{record.status_code === null ? "Outcome unknown" : `HTTP ${record.status_code}`}</span><span>{record.result_state.replaceAll("_", " ")}</span><span>Capture: {record.capture_state}</span></div>
+          <small className="field-help">{new Date(record.recorded_at).toLocaleString()} · Source: {record.source} · Attempt: {record.attempt} · Revision: {record.revision} · Dataset: {record.dataset_label}</small>
           <details><summary>Inspect sanitized request and response</summary><pre className="code-block">{formatValue({ request: record.request_snapshot, expectation: record.expectation_snapshot, response: record.response_snapshot, errorCode: record.error_code, durationMs: record.duration_ms })}</pre></details>
         </article>)}
+        </div>
       </section>
     </main>
   );
 }
 
 function StatusItem({ label, state, detail }: { label: string; state: string; detail: string }) {
-  return <div><strong>{label}</strong><p className={statusClass(state)}>{state.toUpperCase()}</p><p>{detail}</p></div>;
+  return <article className="status-card">
+    <div className="status-card-heading"><strong>{label}</strong><span>{statusLabel(state)}</span></div>
+    <p>{detail}</p>
+  </article>;
+}
+
+function statusLabel(state: string): string {
+  if (state === "loopback-only") return "Loopback only";
+  if (state === "ready") return "Ready";
+  if (state === "available") return "Available";
+  if (state === "disabled") return "Disabled";
+  if (state === "blocked") return "Needs attention";
+  return "Unavailable";
 }

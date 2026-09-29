@@ -1,4 +1,4 @@
-project_id = "hpos-issue-23-local-foundation-20260928"
+project_id = "hp-os"
 
 [api]
 enabled = false
