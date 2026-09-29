@@ -30,7 +30,7 @@ HP-OS authenticates the Site API key, enforces Site ownership, and validates the
 
 ## Safe retries
 
-Requests that create records or perform actions use a unique idempotency key supplied by the Site backend. Within the replay period defined below, retrying the same operation with the same key and request details reuses the original operation and returns its original result without repeating its effects. For example, retrying checkout creation returns the existing Order and Reservation rather than creating another pair. Reusing the key with different request details returns an error. This prevents duplicate actions when HP-OS completes a request but its response does not reach the Site, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+Requests that create records or perform actions use a unique idempotency key supplied by the Site backend. Keys share one namespace per Site across write routes, including Event and notification operations. Within the replay period defined below, retrying the same operation with the same key and request details reuses the original operation and returns its original result without repeating its effects. Definitive 4xx domain outcomes also replay, so retrying a rejected publish or stale edit returns the same result. For example, retrying checkout creation returns the existing Order and Reservation rather than creating another pair. Reusing the key with different request details returns an error. This prevents duplicate actions when HP-OS completes a request but its response does not reach the Site, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10) and implemented across Site writes in [ticket #26](https://github.com/fvckzest/HP-OS/issues/26).
 
 The Site backend automatically retries network failures and HTTP `429`, `500`, and `503` responses with increasing delays. Retries of the same action reuse its idempotency key. HP-OS includes a `Retry-After` header on `429` and `503`, expressed as the number of seconds to wait; the Site observes this delay before retrying. Other errors require correction or state review before another attempt. For example, a version conflict requires reloading the record rather than repeatedly sending the outdated edit. These retry rules were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
 
@@ -61,6 +61,8 @@ Publishing an Event, stopping or resuming its sales, canceling it, and archiving
 | `POST /v1/admin/events/{event_id}/actions/{action}` | Perform an Event lifecycle action. |
 
 Supported actions are `publish`, `stop_sales`, `resume_sales`, `cancel`, and `archive`. Creation returns HTTP `201 Created`; reads, edits, and completed actions return HTTP `200 OK`, using the common success wrapper. All writes require `Idempotency-Key`; edits and lifecycle actions also require `expected_version`. The Site enforces staff permissions before calling these operations. These endpoints and request requirements were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+
+The route handlers and Site-wide replay storage are implemented for Event creation, editing, publishing, public listing, and public detail lookup in [ticket #26](https://github.com/fvckzest/HP-OS/issues/26). The other Event actions listed here remain contract requirements; local Event verification currently covers publish, cancel, and archive behavior only.
 
 ### Event write fields
 

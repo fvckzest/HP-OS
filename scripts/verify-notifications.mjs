@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -25,6 +25,12 @@ let app;
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  return JSON.stringify(value) ?? "null";
 }
 
 function isLocalDatabase(value) {
@@ -256,6 +262,22 @@ async function verifyNotificationApi(site, otherSite) {
   assert(unresolved.status === 200 && unresolved.data.data.requires_verification === true, "An inconclusive Site verification cleared the resend safeguard.");
 }
 
+async function verifyLegacyIdempotencyReplay(site) {
+  const body = { limit: 1, kinds: ["tickets_ready"], actor };
+  const key = randomUUID();
+  const route = "/v1/admin/notification-jobs/claims";
+  const oldFingerprint = createHash("sha256").update(`${route}\n${canonicalJson(body)}`, "utf8").digest("hex");
+  await pool.query(
+    `insert into hpos.api_idempotency_records (
+       site_id, idempotency_key, request_fingerprint, response_status,
+       response_data, completed_at
+     ) values ($1, $2, $3, 200, $4::jsonb, clock_timestamp())`,
+    [site.siteId, key, oldFingerprint, JSON.stringify({ replay: "before-site-wide-namespace" })],
+  );
+  const response = await api(site, route, { method: "POST", idempotencyKey: key, body });
+  assert(response.status === 200 && response.data.data.replay === "before-site-wide-namespace", "An in-flight notification idempotency key from before the Site-wide namespace migration did not replay.");
+}
+
 async function verifyConcurrentClaims(site) {
   const jobIds = [];
   for (let index = 0; index < 2; index += 1) {
@@ -316,6 +338,7 @@ async function main() {
     await waitForReady(app);
     const site = await createSiteFixture("Notification verification Site");
     const otherSite = await createSiteFixture("Notification isolation Site");
+    await verifyLegacyIdempotencyReplay(site);
     await verifyNotificationApi(site, otherSite);
     await verifyConcurrentClaims(site);
     await verifyBoundedAndOverlappingScheduler(site);

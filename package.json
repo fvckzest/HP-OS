@@ -17,7 +17,8 @@
     "typecheck": "tsc --noEmit",
     "test": "node scripts/verify-local.mjs",
     "verify:local": "node scripts/verify-local.mjs",
-    "verify:notifications": "node scripts/verify-notifications.mjs"
+    "verify:notifications": "node scripts/verify-notifications.mjs",
+    "verify:events": "node scripts/verify-events.mjs"
   },
   "dependencies": {
     "next": "16.3.6",
