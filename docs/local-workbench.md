@@ -1,6 +1,16 @@
 # Local testing workbench
 
-This document records local workbench decisions agreed with the product owner in [Choose the simplest beginner-friendly testing workflow](https://github.com/fvckzest/HP-OS/issues/58), [Decide repeatable test data and failure controls](https://github.com/fvckzest/HP-OS/issues/60), and [Settle incremental workbench delivery and verification](https://github.com/fvckzest/HP-OS/issues/61), under [Plan the HP-OS local API workbench](https://github.com/fvckzest/HP-OS/issues/56). The workbench is planned, not implemented.
+This document records local workbench decisions agreed with the product owner in [Choose the simplest beginner-friendly testing workflow](https://github.com/fvckzest/HP-OS/issues/58), [Decide repeatable test data and failure controls](https://github.com/fvckzest/HP-OS/issues/60), and [Settle incremental workbench delivery and verification](https://github.com/fvckzest/HP-OS/issues/61), under [Plan the HP-OS local API workbench](https://github.com/fvckzest/HP-OS/issues/56). The initial local foundation slice is implemented by [issue #23](https://github.com/fvckzest/HP-OS/issues/23); capability-specific workflows and controls remain for their existing implementation tickets.
+
+## Implemented local foundation
+
+Run `pnpm install` once, then `pnpm local` to start the loopback-only app and Supabase PostgreSQL stack. The command applies pending SQL migrations, checks the dedicated `local-test` marker by direct SQL, and prints `http://127.0.0.1:3000/workbench`. Docker and a Node.js 22+ runtime must already be installed and running. Stopping the app does not reset the PostgreSQL volume; `pnpm local:stop` stops the stack without resetting it. Supabase CLI runtime files stay in ignored `.local-supabase-home/`, and telemetry is disabled for these local commands.
+
+The workbench shows app/database status, a one-step readiness workflow, and a version-controlled catalogue. It marks HP-OS business routes and local LMNL integration unavailable. The manual request editor can prepare one request to a local `/v1/` route; it does not add a business API endpoint. Local workbench HTTP handlers are disabled in production, check the loopback Host, require a same-origin request for mutations, and reject non-local database and API targets. Redirects are not followed.
+
+Diagnostic requests are stored in the private `workbench` PostgreSQL schema using direct SQL. The Supabase generated Data API is disabled. Request and response snapshots are sanitized before storage; usable credentials, buyer details, path tokens, query strings, arbitrary free text, and malformed bodies are excluded or redacted. History clearing deletes only diagnostic history. JSON export includes all saved, already-sanitized records. The viewer shows the latest 100 records.
+
+Run `pnpm test` while the local Supabase database is running. It exercises the workbench HTTP boundary against real PostgreSQL, verifies remote targets and cross-origin mutations are refused, checks redaction, and restarts the app to confirm history persists. The check uses an absent `/v1/` path and creates no business record. It leaves one sanitized probe call in history. This verifies local foundation behavior only.
 
 ## Starting point
 

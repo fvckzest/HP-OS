@@ -1,12 +1,12 @@
 # First-release technology
 
-This document records the technology and implementation-order decisions agreed during [issue #11](https://github.com/fvckzest/HP-OS/issues/11). It describes the planned implementation, not an implemented or deployed service.
+This document records the technology and implementation-order decisions agreed during [issue #11](https://github.com/fvckzest/HP-OS/issues/11). The foundation slice in [issue #23](https://github.com/fvckzest/HP-OS/issues/23) now provides a local Next.js application, direct PostgreSQL access, version-controlled migrations, and a local testing workbench. Business operations and hosted readiness remain unimplemented.
 
 ## Language and deployment
 
 - Use TypeScript for version 1. Defer Rust until after moving to self-hosting, keeping the initial implementation and deployment simple.
 - Use one Next.js application for the small public website at `hp-os.dev` and the TypeScript API. Preserve the agreed `/v1` API paths. Keep business rules in ordinary TypeScript modules called by route handlers, so they can be tested separately from HTTP and scheduling.
-- Use Vercel for initial hosting. Future hosting is intended to use Coolify and Docker on local hardware; that migration is separate from the later language change.
+- Use Vercel for initial hosting. The repository declares the Next.js framework in `vercel.json`; actual deployment and hosted database connectivity remain unverified. Future hosting is intended to use Coolify and Docker on local hardware; that migration is separate from the later language change.
 - Use Supabase PostgreSQL as the database.
 
 These choices prioritize a manageable first release while preserving the user's intended path to self-hosting and Rust. They do not change the [API contract](api/api.md) or the [Site ownership and credential boundaries](ownership.md).
@@ -29,6 +29,8 @@ The database implementation must satisfy the contract's concurrency, retry, and 
 This approach keeps first-release scheduling on Vercel and durable recovery state in the existing database, without adding a separate queue service. Scheduler and worker behavior still require implementation evidence, including recovery when no visitor requests arrive. Site-owned workers need their own scheduled execution; scheduling HP-OS alone cannot complete the end-to-end recovery path. These responsibilities were agreed during [issue #11](https://github.com/fvckzest/HP-OS/issues/11) and preserve the credential boundary from [issue #10](https://github.com/fvckzest/HP-OS/issues/10).
 
 ## Local development and hosted cutover
+
+Issue #23 implements the local foundation with Supabase CLI-managed PostgreSQL and SQL migrations. `pnpm local` starts the local database and Next.js development server, applies pending migrations, verifies the `local-test` database marker, and binds the app to `127.0.0.1`. The migration places workbench diagnostics in a private PostgreSQL schema, and the generated Supabase Data API is disabled. Local-only workbench routes also require the explicit local enable flag, the expected loopback Host, and a same-origin check for mutations. These controls prepare local development only; they do not prove hosted database connectivity or authorize a production cutover.
 
 - Use the Supabase CLI with Docker to run the local Supabase environment during development and testing. A hosted HP-OS Supabase project is deferred until readiness for LMNL cutover because the current plan has no available project capacity.
 - Run the database-dependent Next.js application and HP-OS and Site processing locally against test data. Exercise scheduled processing through a local scheduler or test runner using the same processing code; Vercel Cron is the hosted scheduling target, not evidence of local execution.
