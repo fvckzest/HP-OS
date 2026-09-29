@@ -1,6 +1,7 @@
 import { apiFailure, apiSuccess } from "@/src/server/api-response";
 import { authenticateSiteRequest } from "@/src/server/site-auth";
 import { isPaymentConnectionId, readSitePaymentConfiguration, readSitePaymentConnection } from "@/src/server/site-payment-configuration";
+import { handleNotificationGet, handleNotificationPost } from "@/src/server/notifications";
 
 export const dynamic = "force-dynamic";
 
@@ -14,6 +15,9 @@ export async function GET(request: Request, context: RouteContext) {
   const { path } = await context.params;
 
   try {
+    const notificationResponse = await handleNotificationGet(request, authentication.site, path);
+    if (notificationResponse) return notificationResponse;
+
     if (path.length === 2 && path[0] === "admin" && path[1] === "payment-configuration") {
       const connection = await readSitePaymentConfiguration(authentication.site.siteId);
       return apiSuccess({ active_connection: connection });
@@ -30,6 +34,19 @@ export async function GET(request: Request, context: RouteContext) {
 
     return apiFailure(404, "not_found", "The requested API operation is unavailable.");
   } catch {
-    return apiFailure(503, "service_unavailable", "Payment configuration is temporarily unavailable.", { retryAfter: 1 });
+    return apiFailure(503, "service_unavailable", "The requested API operation is temporarily unavailable.", { retryAfter: 1 });
+  }
+}
+
+export async function POST(request: Request, context: RouteContext) {
+  const authentication = await authenticateSiteRequest(request);
+  if (authentication.error) return authentication.error;
+  const { path } = await context.params;
+
+  try {
+    const notificationResponse = await handleNotificationPost(request, authentication.site, path);
+    return notificationResponse ?? apiFailure(404, "not_found", "The requested API operation is unavailable.");
+  } catch {
+    return apiFailure(503, "service_unavailable", "The requested API operation is temporarily unavailable.", { retryAfter: 1 });
   }
 }

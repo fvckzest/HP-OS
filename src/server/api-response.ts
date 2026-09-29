@@ -1,7 +1,11 @@
 import { randomUUID } from "node:crypto";
 
-export function apiSuccess(data: unknown, status = 200): Response {
-  return Response.json({ data, request_id: randomUUID() }, {
+export function apiSuccess(data: unknown, status = 200, options: { nextCursor?: string | null } = {}): Response {
+  return Response.json({
+    data,
+    ...(Object.hasOwn(options, "nextCursor") ? { pagination: { next_cursor: options.nextCursor ?? null } } : {}),
+    request_id: randomUUID(),
+  }, {
     status,
     headers: { "Cache-Control": "no-store" },
   });
