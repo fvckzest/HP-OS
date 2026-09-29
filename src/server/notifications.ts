@@ -1,7 +1,9 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 import { getBusinessPool } from "./database";
 import { apiFailure, apiSuccess } from "./api-response";
+import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
+import type { IdempotentResult } from "./api-idempotency";
 import type { AuthenticatedSite } from "./site-auth";
 
 export const NOTIFICATION_KINDS = [
@@ -77,12 +79,7 @@ interface NotificationJobRow extends QueryResultRow {
   lease_fence: number | string;
 }
 
-interface IdempotentResult { data: unknown; status: number }
-class NotificationError extends Error {
-  constructor(readonly status: number, readonly code: string, message: string, readonly details: Array<{ field: string; code: string; message: string }> = []) {
-    super(message);
-  }
-}
+class NotificationError extends ApiOperationError {}
 
 function reject(status: number, code: string, message: string, details: Array<{ field: string; code: string; message: string }> = []): never {
   throw new NotificationError(status, code, message, details);
@@ -213,71 +210,19 @@ export async function supersedeUnsentNotificationJobs(client: PoolClient, input:
   return result.rowCount ?? 0;
 }
 
+function isPgCode(error: unknown, code: string): boolean {
+  return object(error) && error.code === code;
+}
+
 function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (object(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  if (Array.isArray(value)) return "[" + value.map(canonicalJson).join(",") + "]";
+  if (object(value)) return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + canonicalJson(value[key])).join(",") + "}";
   return JSON.stringify(value) ?? "null";
 }
 
-function fingerprint(route: string, body: unknown): string {
-  return createHash("sha256").update(`${route}\n${canonicalJson(body)}`, "utf8").digest("hex");
-}
-
-async function withIdempotency(
-  site: AuthenticatedSite,
-  key: string,
-  route: string,
-  body: unknown,
-  action: (client: PoolClient) => Promise<IdempotentResult>,
-): Promise<Response> {
-  if (!UUID_PATTERN.test(key)) return apiFailure(422, "validation_failed", "Idempotency-Key must be a UUID.", { details: [{ field: "headers.Idempotency-Key", code: "invalid_uuid", message: "Provide a UUID for this operation." }] });
-  const db = getBusinessPool();
-  const client = await db.connect();
-  const requestFingerprint = fingerprint(route, body);
-  try {
-    await client.query("begin");
-    const inserted = await client.query(
-      `insert into hpos.notification_idempotency_records (site_id, idempotency_key, request_fingerprint)
-       values ($1, $2, $3) on conflict (site_id, idempotency_key) do nothing returning idempotency_key`,
-      [site.siteId, key, requestFingerprint],
-    );
-    if (inserted.rowCount === 0) {
-      const saved = await client.query<{ request_fingerprint: string; response_status: number | null; response_data: unknown; completed_at: Date | null }>(
-        `select request_fingerprint, response_status, response_data, completed_at
-         from hpos.notification_idempotency_records
-         where site_id = $1 and idempotency_key = $2 for update`,
-        [site.siteId, key],
-      );
-      const record = saved.rows[0];
-      if (!record || record.request_fingerprint !== requestFingerprint) reject(409, "idempotency_conflict", "This Idempotency-Key was already used for a different notification operation.");
-      if (!record.completed_at || record.response_status === null || record.response_data === null) reject(409, "request_in_progress", "The original operation is still processing; retry with the same key after a short delay.");
-      if (record.completed_at.getTime() < Date.now() - 7 * 24 * 60 * 60 * 1000) reject(409, "idempotency_expired", "The replay window for this Idempotency-Key has expired; inspect the current job before taking another action.");
-      await client.query("commit");
-      return apiSuccess(record.response_data, record.response_status);
-    }
-
-    const result = await action(client);
-    await client.query(
-      `update hpos.notification_idempotency_records
-       set response_status = $3, response_data = $4::jsonb, completed_at = clock_timestamp()
-       where site_id = $1 and idempotency_key = $2`,
-      [site.siteId, key, result.status, JSON.stringify(result.data)],
-    );
-    await client.query("commit");
-    return apiSuccess(result.data, result.status);
-  } catch (error) {
-    await client.query("rollback").catch(() => undefined);
-    if (error instanceof NotificationError) return apiFailure(error.status, error.code, error.message, { details: error.details, retryAfter: error.status === 409 && error.code === "request_in_progress" ? 1 : undefined });
-    if (isPgCode(error, "55P03")) return apiFailure(409, "request_in_progress", "The original operation is still processing; retry with the same key after a short delay.", { retryAfter: 1 });
-    if (isPgCode(error, "23505")) return apiFailure(409, "claim_conflict", "A notification reference conflicts with an existing job or provider report.");
-    return apiFailure(503, "service_unavailable", "Notification processing is temporarily unavailable.", { retryAfter: 1 });
-  } finally {
-    client.release();
-  }
-}
-
-function isPgCode(error: unknown, code: string): boolean {
-  return object(error) && error.code === code;
+function mapUnexpectedNotificationError(error: unknown): Response {
+  if (isPgCode(error, "23505")) return apiFailure(409, "claim_conflict", "A notification reference conflicts with an existing job or provider report.");
+  return apiFailure(503, "service_unavailable", "Notification processing is temporarily unavailable.", { retryAfter: 1 });
 }
 
 function actorFrom(value: unknown): Actor | null {
@@ -302,14 +247,6 @@ function validateFields(value: Record<string, unknown>, allowed: string[], requi
 function requiredUuid(value: unknown, field: string): string {
   if (typeof value !== "string" || !UUID_PATTERN.test(value)) reject(422, "validation_failed", `${field} must be a UUID.`, [{ field, code: "invalid_uuid", message: "Provide a UUID." }]);
   return value;
-}
-
-function readIdempotencyKey(request: Request): string {
-  return request.headers.get("idempotency-key") ?? "";
-}
-
-function idempotencyRoute(request: Request): string {
-  return new URL(request.url).pathname;
 }
 
 export async function handleNotificationGet(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
@@ -340,7 +277,8 @@ export async function handleNotificationPost(request: Request, site: Authenticat
         }
         kinds = body.kinds as NotificationKind[];
       }
-      return withIdempotency(site, readIdempotencyKey(request), idempotencyRoute(request), { limit, kinds, actor }, (client) => claimJobs(client, site.siteId, Number(limit), kinds, actor));
+      const semanticBody = { limit: Number(limit), kinds, actor };
+      return withApiIdempotency(request, site, semanticBody, (client) => claimJobs(client, site.siteId, Number(limit), kinds, actor), mapUnexpectedNotificationError, semanticBody);
     } catch (error) { return errorResponse(error); }
   }
 
@@ -353,7 +291,8 @@ export async function handleNotificationPost(request: Request, site: Authenticat
     try {
       validateFields(body, ["actor"], ["actor"]);
       const actor = hasActor(body);
-      return withIdempotency(site, readIdempotencyKey(request), idempotencyRoute(request), { actor }, (client) => renewClaim(client, site.siteId, claimId, actor));
+      const semanticBody = { actor };
+      return withApiIdempotency(request, site, semanticBody, (client) => renewClaim(client, site.siteId, claimId, actor), mapUnexpectedNotificationError, semanticBody);
     } catch (error) { return errorResponse(error); }
   }
 
@@ -373,7 +312,7 @@ export async function handleNotificationPost(request: Request, site: Authenticat
       if (!validTimestamp(body.observed_at)) reject(422, "validation_failed", "observed_at must be an RFC 3339 timestamp with a UTC offset.", [{ field: "observed_at", code: "invalid_timestamp", message: "Include Z or a numeric UTC offset." }]);
       if (body.error_code !== null && (typeof body.error_code !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(body.error_code))) reject(422, "validation_failed", "error_code must be a short provider or Site error code, or null.", [{ field: "error_code", code: "invalid_error_code", message: "Use an identifier up to 200 characters, or null." }]);
       if (body.outcome === "completed" && body.error_code !== null) reject(422, "validation_failed", "A completed dispatch cannot include an error_code.", [{ field: "error_code", code: "unexpected_value", message: "Send null when dispatch completed." }]);
-      return withIdempotency(site, readIdempotencyKey(request), idempotencyRoute(request), body, (client) => reportOutcome(client, site.siteId, jobId, claimId, body as unknown as OutcomeReportInput, actor));
+      return withApiIdempotency(request, site, body, (client) => reportOutcome(client, site.siteId, jobId, claimId, body as unknown as OutcomeReportInput, actor), mapUnexpectedNotificationError, body);
     } catch (error) { return errorResponse(error); }
   }
 
@@ -390,7 +329,7 @@ export async function handleNotificationPost(request: Request, site: Authenticat
       if (!validText(body.provider_message_reference)) reject(422, "validation_failed", "provider_message_reference is required.", [{ field: "provider_message_reference", code: "required", message: "Use a provider message reference recorded for this job." }]);
       if (!validText(body.provider_event_reference)) reject(422, "validation_failed", "provider_event_reference is required.", [{ field: "provider_event_reference", code: "required", message: "Use the provider's stable delivery-event identity." }]);
       if (!validTimestamp(body.observed_at)) reject(422, "validation_failed", "observed_at must be an RFC 3339 timestamp with a UTC offset.", [{ field: "observed_at", code: "invalid_timestamp", message: "Include Z or a numeric UTC offset." }]);
-      return withIdempotency(site, readIdempotencyKey(request), idempotencyRoute(request), body, (client) => reportDelivery(client, site.siteId, jobId, body as unknown as DeliveryReportInput, actor));
+      return withApiIdempotency(request, site, body, (client) => reportDelivery(client, site.siteId, jobId, body as unknown as DeliveryReportInput, actor), mapUnexpectedNotificationError, body);
     } catch (error) { return errorResponse(error); }
   }
   return null;

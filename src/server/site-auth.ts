@@ -10,6 +10,7 @@ export function hashSiteApiKey(key: string): Buffer {
 
 export interface AuthenticatedSite {
   siteId: string;
+  cursorSigningKey: Buffer;
 }
 
 export type SiteAuthentication =
@@ -44,7 +45,7 @@ export async function authenticateSiteRequest(request: Request): Promise<SiteAut
         error: apiFailure(429, "rate_limited", "The Site request budget has been reached. Retry after the supplied delay.", { retryAfter: limit.retryAfter }),
       };
     }
-    return { site: { siteId: row.site_id }, error: null };
+    return { site: { siteId: row.site_id, cursorSigningKey: calculatedHash }, error: null };
   } catch {
     return { site: null, error: apiFailure(503, "service_unavailable", "Site authentication is temporarily unavailable.", { retryAfter: 1 }) };
   }

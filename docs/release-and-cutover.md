@@ -6,6 +6,12 @@ Settled guidance from [HP-OS ticket #12](https://github.com/fvckzest/HP-OS/issue
 
 LMNL is the only Site in this release proof. MASS is outside scope.
 
+## Development and LMNL merge timing
+
+HP-OS is the active development target for the current ticketing work. Use scoped LMNL draft pull requests to develop and exercise the Site integration against unreleased HP-OS behavior, including local and hosted test-payment proof. Keep those pull requests in Draft and unmerged through implementation and integration testing. This lets the team test the real cross-repository flow while keeping live LMNL on its current integration. This default was set while implementing [HP-OS issue #26](https://github.com/fvckzest/HP-OS/issues/26).
+
+At the cutover window, after all current LMNL Events are complete and public sales are closed, mark the LMNL changes ready for review, complete required review and acceptance, then merge them as part of the controlled switch. Then verify the production configuration and complete the controlled real purchase and refund below while public sales remain closed. A merge does not authorize opening sales; the user's explicit approval in step 4 is still required.
+
 Every required check must pass. A failure blocks release until it is fixed and retested. Record the environment, application revision, scenario, expected result, actual result, and supporting evidence for each check. Keep credentials and buyer access secrets out of evidence. Automated tests support the proof but do not replace complete journeys through LMNL, HP-OS, and the relevant external services.
 
 The sequence is:
