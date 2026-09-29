@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -100,6 +100,13 @@ async function api(site, pathName, { method = "GET", idempotencyKey, body } = {}
   let data = null;
   try { data = await response.json(); } catch {}
   return { status: response.status, headers: response.headers, data };
+}
+
+function signedEventCursor(site, payload) {
+  const encodedPayload = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const keyHash = createHash("sha256").update(site.apiKey, "utf8").digest();
+  const signature = createHmac("sha256", keyHash).update(encodedPayload).digest("base64url");
+  return `${encodedPayload}.${signature}`;
 }
 
 async function verifyDraftCreationAndReplay(site) {
@@ -299,6 +306,20 @@ async function verifyEventLifecycleAndDiscovery(site) {
   assert(invalidFilter.status === 422 && invalidFilter.data.error.code === "validation_failed", "An invalid Event filter did not return 422 validation_failed.");
   const unknownFilter = await api(site, "/v1/admin/events?unknown_filter=value");
   assert(unknownFilter.status === 422 && unknownFilter.data.error.code === "validation_failed", "An unsupported Event list parameter did not return 422 validation_failed.");
+  const emptyCursor = await api(site, "/v1/public/events?cursor=");
+  assert(emptyCursor.status === 422 && emptyCursor.data.error.code === "invalid_cursor", "An explicitly empty Event cursor was treated as an omitted cursor.");
+  const [encodedCursorPayload] = firstPage.data.pagination.next_cursor.split(".");
+  const expiredCursorPayload = JSON.parse(Buffer.from(encodedCursorPayload, "base64url").toString("utf8"));
+  expiredCursorPayload.issuedAt = new Date(Date.now() - 60 * 60 * 1000 - 1).toISOString();
+  const expiredCursor = signedEventCursor(site, expiredCursorPayload);
+  const expiredCursorResponse = await api(site, "/v1/public/events?period=current&limit=1&cursor=" + encodeURIComponent(expiredCursor));
+  assert(expiredCursorResponse.status === 422 && expiredCursorResponse.data.error.code === "invalid_cursor", "An expired Event cursor was accepted.");
+  const [cursorPayload, cursorSignature] = firstPage.data.pagination.next_cursor.split(".");
+  const tamperedPayload = JSON.parse(Buffer.from(cursorPayload, "base64url").toString("utf8"));
+  tamperedPayload.issuedAt = new Date(Date.now()).toISOString();
+  const tamperedCursor = `${Buffer.from(JSON.stringify(tamperedPayload), "utf8").toString("base64url")}.${cursorSignature}`;
+  const tamperedCursorResponse = await api(site, "/v1/public/events?period=current&limit=1&cursor=" + encodeURIComponent(tamperedCursor));
+  assert(tamperedCursorResponse.status === 422 && tamperedCursorResponse.data.error.code === "invalid_cursor", "A modified Event cursor was accepted.");
   const wrongScope = await api(site, "/v1/public/events?period=current&limit=2&cursor=" + encodeURIComponent(firstPage.data.pagination.next_cursor));
   assert(wrongScope.status === 422 && wrongScope.data.error.code === "invalid_cursor", "A cursor was accepted with a different page size.");
   const publicDetail = await api(site, "/v1/public/events/" + draft.event_id);

@@ -221,6 +221,8 @@ The Issue #26 Event handler currently supports only `publish` and `archive`. `st
 | `order_id` | Jobs | Restrict to one Order. |
 | `requires_verification` | Attempts/jobs | Select unresolved provider outcomes. |
 
+Event list endpoints reject unknown or invalid parameters with `422 validation_failed`. Their cursors are signed using the current Site API key and bound to the Site, endpoint, filters, ordering, and page size; they remain valid for one hour. After rotating the Site API key, start pagination again. Invalid, expired, or mismatched Event cursors return `422 invalid_cursor`.
+
 ## Headers
 
 

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import type { PoolClient, QueryResultRow } from "pg";
 import { apiFailure, apiSuccess } from "./api-response";
 import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
@@ -463,19 +463,30 @@ function mapEventDatabaseError(error: unknown): Response | null {
   return null;
 }
 
-function parseCursor(value: string | null, siteId: string, mode: string, scope: string): { at: string; id: string } | null | Response {
-  if (!value) return null;
+function parseCursor(value: string | null, site: AuthenticatedSite, mode: string, scope: string): { at: string; id: string } | null | Response {
+  if (value === null) return null;
   try {
-    if (value.length > 2048 || !/^[A-Za-z0-9_-]+$/.test(value)) throw new Error();
-    const decoded = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as unknown;
-    if (!object(decoded) || decoded.mode !== mode || decoded.siteId !== siteId || decoded.scope !== scope || typeof decoded.at !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(decoded.at) || !UUID_PATTERN.test(String(decoded.id ?? ""))) throw new Error();
+    const match = /^([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/.exec(value);
+    if (value.length > 2048 || !match) throw new Error();
+    const [, payload, signature] = match;
+    const expectedSignature = createHmac("sha256", site.cursorSigningKey).update(payload).digest();
+    const suppliedSignature = Buffer.from(signature, "base64url");
+    if (suppliedSignature.length !== expectedSignature.length || !timingSafeEqual(suppliedSignature, expectedSignature)) throw new Error();
+    const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as unknown;
+    if (!object(decoded) || decoded.mode !== mode || decoded.siteId !== site.siteId || decoded.scope !== scope || typeof decoded.at !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(decoded.at) || !UUID_PATTERN.test(String(decoded.id ?? ""))) throw new Error();
     if (!Number.isFinite(Date.parse(decoded.at))) throw new Error();
+    if (typeof decoded.issuedAt !== "string" || !RFC3339_PATTERN.test(decoded.issuedAt)) throw new Error();
+    const issuedAt = Date.parse(decoded.issuedAt);
+    const now = Date.now();
+    if (!Number.isFinite(issuedAt) || issuedAt < now - 60 * 60 * 1000 || issuedAt > now + 60_000) throw new Error();
     return { at: decoded.at, id: String(decoded.id) };
   } catch { return apiFailure(422, "invalid_cursor", "The cursor is invalid for this Event list."); }
 }
 
-function cursorFor(mode: string, siteId: string, scope: string, timestamp: string, id: string): string {
-  return Buffer.from(JSON.stringify({ mode, siteId, scope, at: timestamp, id }), "utf8").toString("base64url");
+function cursorFor(site: AuthenticatedSite, mode: string, scope: string, timestamp: string, id: string): string {
+  const payload = Buffer.from(JSON.stringify({ mode, siteId: site.siteId, scope, issuedAt: new Date().toISOString(), at: timestamp, id }), "utf8").toString("base64url");
+  const signature = createHmac("sha256", site.cursorSigningKey).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
 }
 
 function listLimit(value: string | null): number | Response {
@@ -529,7 +540,7 @@ async function listEvents(request: Request, site: AuthenticatedSite, admin: bool
     scope = { limit, period };
   }
   const cursorScope = JSON.stringify(scope);
-  const cursor = parseCursor(url.searchParams.get("cursor"), site.siteId, mode, cursorScope);
+  const cursor = parseCursor(url.searchParams.get("cursor"), site, mode, cursorScope);
   if (cursor instanceof Response) return cursor;
   if (cursor) {
     values.push(cursor.at, cursor.id);
@@ -558,7 +569,7 @@ async function listEvents(request: Request, site: AuthenticatedSite, admin: bool
   const hasMore = result.rows.length > limit;
   const last = rows.at(-1);
   const nextCursor = hasMore && last
-    ? cursorFor(mode, site.siteId, cursorScope, admin ? last.created_cursor_time! : last.starts_cursor_time!, last.id)
+    ? cursorFor(site, mode, cursorScope, admin ? last.created_cursor_time! : last.starts_cursor_time!, last.id)
     : null;
   return apiSuccess(rows.map((row) => eventData(row, admin)), 200, { nextCursor });
 }

@@ -380,7 +380,7 @@ All actions require `Idempotency-Key` and `expected_version`. The Site must veri
 
 Event, Order, Ticket, and Access Request lists use cursor pagination. Each request returns 50 records by default and permits a requested page size of at most 100. A response includes a continuation cursor when more results are available; the Site sends that cursor to retrieve the next page. This keeps responses manageable as Site history grows, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
 
-List parameters use `limit` and `cursor`; public Event lists additionally use `period`, as specified above. Cursors are opaque, bound to the authenticated Site and original filters, ordering, and page size, and valid for one hour. Changing those parameters requires starting a new list. An invalid, expired, or mismatched cursor returns HTTP `422` with `invalid_cursor`; the Site restarts from the first page.
+List parameters use `limit` and `cursor`; public Event lists additionally use `period`, as specified above. Event cursors are opaque, signed using the current Site API key, bound to the authenticated Site and original filters, ordering, and page size, and valid for one hour. Changing those parameters or rotating the Site API key requires starting a new list. An invalid, expired, or mismatched cursor returns HTTP `422` with `invalid_cursor`; the Site restarts from the first page.
 
 Pagination reads current data rather than a frozen snapshot. Records changed during browsing may move between pages; refreshing restarts the list. Event totals use a separately consistent snapshot.
 
