@@ -291,8 +291,16 @@ async function verifyEventLifecycleAndDiscovery(site) {
   assert(firstPage.status === 200 && firstPage.data.data.length === 1 && firstPage.data.pagination.next_cursor, "Current Event pagination did not return a deterministic cursor.");
   const secondPage = await api(site, "/v1/public/events?period=current&limit=1&cursor=" + encodeURIComponent(firstPage.data.pagination.next_cursor));
   assert(secondPage.status === 200 && secondPage.data.data.length === 1 && !secondPage.data.pagination.next_cursor, "The public Event cursor did not return the following page.");
+  const invalidLimit = await api(site, "/v1/public/events?limit=0");
+  assert(invalidLimit.status === 422 && invalidLimit.data.error.code === "validation_failed", "An invalid Event page size did not return 422 validation_failed.");
+  const invalidPeriod = await api(site, "/v1/public/events?period=upcoming");
+  assert(invalidPeriod.status === 422 && invalidPeriod.data.error.code === "validation_failed", "An invalid Event period did not return 422 validation_failed.");
+  const invalidFilter = await api(site, "/v1/admin/events?publication_status=archived");
+  assert(invalidFilter.status === 422 && invalidFilter.data.error.code === "validation_failed", "An invalid Event filter did not return 422 validation_failed.");
+  const unknownFilter = await api(site, "/v1/admin/events?unknown_filter=value");
+  assert(unknownFilter.status === 422 && unknownFilter.data.error.code === "validation_failed", "An unsupported Event list parameter did not return 422 validation_failed.");
   const wrongScope = await api(site, "/v1/public/events?period=current&limit=2&cursor=" + encodeURIComponent(firstPage.data.pagination.next_cursor));
-  assert(wrongScope.status === 400 && wrongScope.data.error.code === "invalid_cursor", "A cursor was accepted with a different page size.");
+  assert(wrongScope.status === 422 && wrongScope.data.error.code === "invalid_cursor", "A cursor was accepted with a different page size.");
   const publicDetail = await api(site, "/v1/public/events/" + draft.event_id);
   assert(publicDetail.status === 200 && publicDetail.data.data.title === "Issue 26 Local Test", "A published Event was missing from public detail lookup.");
 
@@ -315,7 +323,7 @@ async function verifyEventLifecycleAndDiscovery(site) {
   const crossSite = await api(other, "/v1/public/events/" + draft.event_id);
   assert(crossSite.status === 404, "A different Site could read this Event.");
   const otherSiteCursor = await api(other, "/v1/public/events?period=current&limit=1&cursor=" + encodeURIComponent(firstPage.data.pagination.next_cursor));
-  assert(otherSiteCursor.status === 400 && otherSiteCursor.data.error.code === "invalid_cursor", "A Site accepted another Site's cursor.");
+  assert(otherSiteCursor.status === 422 && otherSiteCursor.data.error.code === "invalid_cursor", "A Site accepted another Site's cursor.");
   assert(second.publication_status === "published", "The second cursor fixture was not published.");
 }
 

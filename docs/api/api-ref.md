@@ -104,7 +104,7 @@ Paths are relative to the base URL. `{...}` identifies a path parameter. All end
 | `GET /v1/admin/events/{event_id}` | Read Event configuration and operational state. |
 | `POST /v1/admin/events` | Create an incomplete draft. |
 | `PATCH /v1/admin/events/{event_id}` | Edit supplied Event/offering fields. |
-| `POST /v1/admin/events/{event_id}/actions/{action}` | Publish, stop/resume sales, cancel, or archive. |
+| `POST /v1/admin/events/{event_id}/actions/{action}` | Publish a draft or archive an eligible published Event. Other Event actions are later work. |
 | `PUT /v1/admin/events/{event_id}/provider-mappings/{connection_id}` | Set a verified provider resource mapping. |
 | `DELETE /v1/admin/events/{event_id}/provider-mappings/{connection_id}` | Remove a mapping for future Orders. |
 
@@ -165,9 +165,6 @@ Claims and reports require a Site API key, a UUID `Idempotency-Key`, and a syste
 | Resource | Action | Meaning |
 | --- | --- | --- |
 | Event | `publish` | Make a valid draft publicly discoverable. |
-| Event | `stop_sales` | Pause new checkouts. |
-| Event | `resume_sales` | Resume eligible new checkouts. |
-| Event | `cancel` | Stop sales and Admission; does not refund money. |
 | Event | `archive` | Archive an ended/canceled Event; retain history. |
 | Order | `retry_ticket_issuance` | Retry the complete Ticket set for verified payment. |
 | Order | `resend_ticket_email` | Queue another email for existing Tickets. |
@@ -176,6 +173,8 @@ Claims and reports require a Site API key, a UUID `Idempotency-Key`, and a syste
 | Access Request | `reject` | Reject the request without email. |
 | Access Request | `undo_decision` | Return to pending; revoke approval access if applicable. |
 | Payment attempt | `resolve` | Apply corrected verified evidence; retain history. |
+
+The Issue #26 Event handler currently supports only `publish` and `archive`. `stop_sales`, `resume_sales`, and `cancel` remain later contract work and return `404 not_found` until implemented.
 
 ## Parameters
 

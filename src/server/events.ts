@@ -471,7 +471,7 @@ function parseCursor(value: string | null, siteId: string, mode: string, scope: 
     if (!object(decoded) || decoded.mode !== mode || decoded.siteId !== siteId || decoded.scope !== scope || typeof decoded.at !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(decoded.at) || !UUID_PATTERN.test(String(decoded.id ?? ""))) throw new Error();
     if (!Number.isFinite(Date.parse(decoded.at))) throw new Error();
     return { at: decoded.at, id: String(decoded.id) };
-  } catch { return apiFailure(400, "invalid_cursor", "The cursor is invalid for this Event list."); }
+  } catch { return apiFailure(422, "invalid_cursor", "The cursor is invalid for this Event list."); }
 }
 
 function cursorFor(mode: string, siteId: string, scope: string, timestamp: string, id: string): string {
@@ -480,16 +480,22 @@ function cursorFor(mode: string, siteId: string, scope: string, timestamp: strin
 
 function listLimit(value: string | null): number | Response {
   if (value === null) return 50;
-  if (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 100) return apiFailure(400, "invalid_query", "limit must be an integer from 1 to 100.");
+  if (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 100) return fieldError("limit", "out_of_range", "limit must be an integer from 1 to 100.");
   return Number(value);
 }
 
 async function listEvents(request: Request, site: AuthenticatedSite, admin: boolean): Promise<Response> {
   const url = new URL(request.url);
+  const allowedParameters = new Set(admin
+    ? ["limit", "cursor", "publication_status", "visibility", "is_archived", "is_canceled"]
+    : ["limit", "cursor", "period"]);
+  for (const name of url.searchParams.keys()) {
+    if (!allowedParameters.has(name)) return fieldError(name, "unknown_filter", "Remove the unsupported Event list parameter.");
+  }
   const limit = listLimit(url.searchParams.get("limit"));
   if (limit instanceof Response) return limit;
   const period = url.searchParams.get("period") ?? "current";
-  if (!admin && period !== "current" && period !== "past") return apiFailure(400, "invalid_query", "period must be current or past.");
+  if (!admin && period !== "current" && period !== "past") return fieldError("period", "unsupported_value", "period must be current or past.");
   const mode = admin ? "admin" : period;
   const where = ["e.site_id = $1"];
   const values: unknown[] = [site.siteId];
@@ -500,13 +506,13 @@ async function listEvents(request: Request, site: AuthenticatedSite, admin: bool
     for (const [name, allowed] of filters) {
       const value = url.searchParams.get(name);
       if (value !== null) {
-        if (!allowed.includes(value)) return apiFailure(400, "invalid_query", `${name} has an unsupported value.`);
+        if (!allowed.includes(value)) return fieldError(name, "unsupported_value", `${name} has an unsupported value.`);
         add(`e.${name} = ?`, value);
       }
     }
     for (const name of ["is_archived", "is_canceled"] as const) {
       const value = url.searchParams.get(name);
-      if (value !== null && value !== "true" && value !== "false") return apiFailure(400, "invalid_query", `${name} must be true or false.`);
+      if (value !== null && value !== "true" && value !== "false") return fieldError(name, "invalid_boolean", `${name} must be true or false.`);
       if (value !== null || name === "is_archived") add(`e.${name} = ?`, value === "true");
     }
     scope = {
