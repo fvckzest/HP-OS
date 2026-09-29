@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createConnection, createServer } from "node:net";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import pg from "pg";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const supabaseHome = path.join(root, ".local-supabase-home");
@@ -85,6 +86,44 @@ async function assertDatabaseApiIsNotExposed() {
   });
 }
 
+async function verifyCaptureFailureIsolation() {
+  const pool = new pg.Pool({ connectionString: databaseUrl, max: 1, connectionTimeoutMillis: 2_000 });
+  try {
+    // Remove a stale, narrowly scoped trigger if a previous verification was interrupted.
+    await pool.query("drop trigger if exists local_workbench_capture_failure_probe on workbench.call_history");
+    await pool.query("drop function if exists workbench.reject_capture_failure_probe()");
+    await pool.query(`
+      create function workbench.reject_capture_failure_probe() returns trigger
+      language plpgsql as $capture$
+      begin
+        raise exception 'intentional local workbench capture failure probe';
+      end;
+      $capture$
+    `);
+    await pool.query(`
+      create trigger local_workbench_capture_failure_probe
+      before insert on workbench.call_history
+      for each row
+      when (new.request_snapshot #>> '{body,code}' = 'hpos_capture_failure_probe')
+      execute function workbench.reject_capture_failure_probe()
+    `);
+
+    const response = await fetch(`${origin}/api/workbench/requests`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: origin },
+      body: JSON.stringify({ method: "POST", path: "/v1/__workbench_capture_failure_probe", headers: { Accept: "application/json" }, body: JSON.stringify({ code: "hpos_capture_failure_probe" }), expectedStatus: 404 }),
+    });
+    assert(response.status === 200, "A diagnostic history write failure changed the local API response status.");
+    const execution = await response.json();
+    assert(execution.statusCode === 404 && execution.result === "passed", "The local HTTP operation did not preserve its observed result when history storage failed.");
+    assert(execution.capture === "incomplete" && execution.id === null, "The workbench did not report the history capture failure.");
+  } finally {
+    await pool.query("drop trigger if exists local_workbench_capture_failure_probe on workbench.call_history").catch(() => undefined);
+    await pool.query("drop function if exists workbench.reject_capture_failure_probe()").catch(() => undefined);
+    await pool.end();
+  }
+}
+
 function assertStartupRefusesRemoteTargets() {
   const badDatabase = spawnSync(process.execPath, ["scripts/start-local.mjs"], {
     cwd: root,
@@ -120,7 +159,7 @@ async function main() {
     });
     assert(response.status === 200, "The workbench HTTP request runner did not return an execution result.");
     const execution = await response.json();
-    assert(execution.statusCode === 404 && execution.result === "passed" && execution.capture === "stored", "The local probe did not produce its expected recorded 404 response.");
+    assert(execution.statusCode === 404 && execution.result === "passed" && execution.capture === "incomplete", "The local probe did not produce its expected 404 response with an explicit omitted-body marker.");
     probeId = execution.id;
     assert(typeof probeId === "string" && probeId.length > 0, "The request result was not saved to PostgreSQL.");
     const savedResponse = await fetch(`${origin}/api/workbench/history`, { headers: { Origin: origin } });
@@ -132,6 +171,7 @@ async function main() {
       assert(!capturedJson.includes(secret), `History exposed a protected value: ${secret}.`);
     }
     assert(JSON.stringify(probe.request_snapshot).includes("[REDACTED]"), "History did not mark protected request fields as redacted.");
+    await verifyCaptureFailureIsolation();
   } finally {
     await stopApp(first);
   }

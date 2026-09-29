@@ -10,7 +10,9 @@ The workbench shows app/database status, a one-step readiness workflow, and a ve
 
 Diagnostic requests are stored in the private `workbench` PostgreSQL schema using direct SQL. The Supabase generated Data API is disabled. Request and response snapshots are sanitized before storage; usable credentials, buyer details, path tokens, query strings, arbitrary free text, and malformed bodies are excluded or redacted. History clearing deletes only diagnostic history. JSON export includes all saved, already-sanitized records. The viewer shows the latest 100 records.
 
-Run `pnpm test` while the local Supabase database is running. It exercises the workbench HTTP boundary against real PostgreSQL, verifies remote targets and cross-origin mutations are refused, checks redaction, and restarts the app to confirm history persists. The check uses an absent `/v1/` path and creates no business record. It leaves one sanitized probe call in history. This verifies local foundation behavior only.
+Run `pnpm test` while the local Supabase database is running. It exercises the workbench HTTP boundary against real PostgreSQL, verifies remote targets and cross-origin mutations are refused, checks redaction, forces one narrowly scoped diagnostic-history write failure, and restarts the app to confirm history persists. The check uses absent `/v1/` paths and creates no business record. It leaves one sanitized expected-404 probe in history; its omitted HTML response body is marked incomplete. This verifies local foundation behavior only.
+
+No business API operation or local LMNL integration is implemented or simulated by this slice. Business success, expected-rejection, retry, concurrency, interruption, and recovery checks remain unavailable until the corresponding operations exist. The local verification command confirms that a diagnostic-history write failure leaves the HTTP result unchanged and marks capture incomplete. Run-time PostgreSQL boundary and restart evidence also remains unverified until the local container runtime is available.
 
 ## Starting point
 

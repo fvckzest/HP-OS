@@ -106,7 +106,11 @@ export default function WorkbenchClient() {
       });
       const result = await readJson<RequestExecution>(response);
       setExecution(result);
-      setMessage(result.capture === "stored" ? "Request result was recorded in local PostgreSQL." : "The request result arrived, but history capture is incomplete. The operation was not retried.");
+      setMessage(result.id
+        ? result.capture === "stored"
+          ? "Request result was recorded in local PostgreSQL."
+          : "Request result was recorded; omitted or truncated evidence is marked in history."
+        : "The request result arrived, but history could not be saved. The operation was not retried.");
       await refreshHistory();
     } catch (error) {
       setRequestError(error instanceof Error ? error.message : "The request could not be completed.");

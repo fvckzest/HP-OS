@@ -13,7 +13,7 @@ pnpm local
 
 The `pnpm local` command starts local PostgreSQL, applies pending version-controlled migrations, verifies the dedicated local test database, binds the Next.js app to `127.0.0.1`, and prints the workbench URL. Open `http://127.0.0.1:3000/workbench`. Stop the app with Ctrl-C. The local database volume persists; `pnpm local:stop` stops its services without resetting data. Supabase runtime files stay in the ignored `.local-supabase-home/` directory, and CLI telemetry is disabled for these local commands.
 
-In a second terminal, `pnpm test` starts a temporary app process and verifies the real local PostgreSQL boundary, confirms the generated Supabase Data API is disabled, checks request redaction and local access guards, and verifies history across an app restart. It leaves its sanitized verification call in workbench history. `pnpm typecheck` checks TypeScript; `pnpm build` creates the production build, where local workbench routes remain disabled.
+In a second terminal, `pnpm test` starts temporary app processes and verifies the real local PostgreSQL boundary, confirms the generated Supabase Data API is disabled, checks request redaction and local access guards, forces a diagnostic-history write failure, and verifies history across an app restart. It leaves one sanitized expected-404 probe in workbench history; its omitted HTML response body is marked incomplete. `pnpm typecheck` checks TypeScript; `pnpm build` creates the production build, where local workbench routes remain disabled.
 
 This local foundation does not implement `/v1` business operations or a local LMNL integration. It does not establish hosted database, provider, device, or production readiness.
 

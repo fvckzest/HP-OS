@@ -23,7 +23,7 @@ async function readResponseSummary(response: Response): Promise<{ value: SafeJso
   const contentType = response.headers.get("content-type") ?? "";
   if (!contentType.toLowerCase().includes("application/json")) {
     await response.body?.cancel().catch(() => undefined);
-    return { value: { kind: "body_omitted", reason: "response was not JSON", contentType: contentType.slice(0, 100) || null } as SafeJson, truncated: false, byteLength: 0 };
+    return { value: { kind: "body_omitted", reason: "response was not JSON", contentType: contentType.slice(0, 100) || null } as SafeJson, truncated: true, byteLength: 0 };
   }
 
   if (!response.body) return { value: null, truncated: false, byteLength: 0 };
@@ -45,7 +45,7 @@ async function readResponseSummary(response: Response): Promise<{ value: SafeJso
   if (truncated) return { value: { kind: "body_truncated", byteLengthAtLeast: total } as SafeJson, truncated: true, byteLength: total };
   const text = new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
   const parsed = sanitizeJsonText(text);
-  return { value: parsed.value as SafeJson | null, truncated: parsed.truncated || (text.length > 0 && typeof parsed.value === "object" && parsed.value !== null && "_capture" in parsed.value), byteLength: parsed.bytes };
+  return { value: parsed.value as SafeJson | null, truncated: parsed.truncated, byteLength: parsed.bytes };
 }
 
 function parseManualRequest(value: unknown): { input: ManualRequestInput | null; error: string | null } {
@@ -114,12 +114,7 @@ export async function POST(request: Request) {
   if (process.env.HPOS_SITE_API_KEY) headers.set("authorization", `Bearer ${process.env.HPOS_SITE_API_KEY}`);
 
   const requestBodySummary = sanitizeJsonText(input.body);
-  const requestBodyIncomplete = Boolean(
-    requestBodySummary.value &&
-    typeof requestBodySummary.value === "object" &&
-    !Array.isArray(requestBodySummary.value) &&
-    "_capture" in requestBodySummary.value,
-  );
+  const requestBodyIncomplete = requestBodySummary.truncated;
   const safeRequestSnapshot = {
     method: input.method,
     route: safeRoute(target.pathname),
@@ -192,7 +187,7 @@ export async function POST(request: Request) {
     response_snapshot: responseSnapshot,
     error_code: errorCode,
     duration_ms: durationMs,
-    capture_state: responseTruncated ? "incomplete" as const : "stored" as const,
+    capture_state: responseTruncated || requestBodyIncomplete ? "incomplete" as const : "stored" as const,
     environment: "local",
     dataset_label: "local-foundation-empty",
     revision: process.env.HPOS_REVISION ?? process.env.VERCEL_GIT_COMMIT_SHA ?? "unknown",

@@ -8,6 +8,16 @@ const SECRET_HEADER = /^(authorization|proxy-authorization|cookie|set-cookie|x-a
 
 export type SafeJson = null | boolean | number | string | SafeJson[] | { [key: string]: SafeJson };
 
+function containsCaptureGap(value: SafeJson | null): boolean {
+  if (typeof value === "string") return value.startsWith("[TRUNCATED:");
+  if (Array.isArray(value)) return value.some(containsCaptureGap);
+  if (value && typeof value === "object") {
+    if ("_capture" in value) return true;
+    return Object.values(value).some(containsCaptureGap);
+  }
+  return false;
+}
+
 export function sanitizeValue(value: unknown, depth = 0, parentKey?: string): SafeJson {
   if (depth > MAX_DEPTH) return "[TRUNCATED: maximum depth]";
   if (value === null || typeof value === "boolean" || typeof value === "number") return value;
@@ -38,9 +48,10 @@ export function sanitizeJsonText(raw: string | null | undefined): { value: SafeJ
   try {
     const parsed: unknown = JSON.parse(raw);
     if (typeof parsed === "string") return { value: "[REDACTED: free-text JSON value]", bytes, truncated: false };
-    return { value: sanitizeValue(parsed), bytes, truncated: false };
+    const value = sanitizeValue(parsed);
+    return { value, bytes, truncated: containsCaptureGap(value) };
   } catch {
-    return { value: { _capture: "body is not valid JSON; contents were omitted", bytes }, bytes, truncated: false };
+    return { value: { _capture: "body is not valid JSON; contents were omitted", bytes }, bytes, truncated: true };
   }
 }
 
