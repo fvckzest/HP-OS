@@ -6,6 +6,10 @@
 - Do not perform visual review unless the user asks for it.
 - Explain substantial changes in small, clear steps for a novice coder. Use standardized technical English.
 
+## HP-OS and LMNL development
+
+HP-OS is the active development target for the current ticketing work. Build current capabilities in HP-OS and use scoped LMNL draft pull requests to develop and test Site integration against unreleased HP-OS behavior. Keep those LMNL pull requests in Draft and unmerged through development and integration proof. At the LMNL cutover window, after current LMNL Events are complete and public sales are closed, mark the changes ready for review, complete required review and acceptance, then merge them as part of the controlled switch. Merging does not open sales; follow the [release and cutover procedure](docs/release-and-cutover.md), agreed in [ticket #12](https://github.com/fvckzest/HP-OS/issues/12). This keeps live LMNL unchanged while the new integration is developed and exercised; see [issue #26](https://github.com/fvckzest/HP-OS/issues/26).
+
 <!-- BEGIN:nextjs-agent-rules -->
 
 # This is NOT the Next.js you know
