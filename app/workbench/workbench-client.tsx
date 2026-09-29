@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { foundationWorkflow } from "@/src/workbench/catalog";
+import { foundationWorkflow, siteAccessWorkflow } from "@/src/workbench/catalog";
 import type { HistoryRecord, RequestExecution } from "@/src/workbench/types";
 
 interface WorkbenchStatus {
@@ -15,9 +15,28 @@ interface WorkbenchStatus {
   environment: string;
   dataset: string;
   revision: string;
+  catalogue: Array<{ id: string; title: string; kind: string; availability: string; explanation: string; prerequisite?: string; expectedEvidence: string[]; requestTemplate?: { method: string; path: string; headers: Record<string, string>; body: string; expectedStatus: number } }>;
 }
 
 interface HistoryResponse { records: HistoryRecord[]; total: number }
+interface SiteAccessCheckResult {
+  result: "passed" | "failed";
+  message: string;
+  evidence: { executionMode: string; fixtureMode: string };
+  steps: Array<{
+    id: string;
+    title: string;
+    expected: string;
+    statusCode: number | null;
+    actual: string;
+    request: { method: string; path: string; headers: Record<string, string> };
+    observations: Array<{ label: string; source: string; value: string }>;
+    executionMode: string;
+    fixtureMode: string;
+    result: "passed" | "failed";
+    capture: "stored" | "incomplete";
+  }>;
+}
 
 async function readJson<T>(response: Response): Promise<T> {
   const value: unknown = await response.json();
@@ -38,11 +57,20 @@ export default function WorkbenchClient() {
   const [message, setMessage] = useState("");
   const [requestError, setRequestError] = useState("");
   const [execution, setExecution] = useState<RequestExecution | null>(null);
+  const [siteAccessResult, setSiteAccessResult] = useState<SiteAccessCheckResult | null>(null);
+  const [siteAccessRunning, setSiteAccessRunning] = useState(false);
   const [method, setMethod] = useState("GET");
   const [path, setPath] = useState("");
   const [headers, setHeaders] = useState('{\n  "Accept": "application/json"\n}');
   const [body, setBody] = useState("");
   const [expectedStatus, setExpectedStatus] = useState("");
+  const siteAccessCapability = status?.catalogue.find((entry) => entry.id === "site-payment-configuration");
+  const siteAccessReady = Boolean(status?.database.ready
+    && status.hposBusinessApi.state === "available"
+    && siteAccessCapability?.availability === "available");
+  const siteAccessBlockReason = status && !siteAccessReady
+    ? !status.database.ready ? status.database.message : siteAccessCapability?.prerequisite ?? status.hposBusinessApi.reason
+    : "";
 
   const refreshStatus = useCallback(async () => {
     const response = await fetch("/api/workbench/status", { cache: "no-store" });
@@ -84,6 +112,23 @@ export default function WorkbenchClient() {
     }
   }
 
+  async function runSiteAccessCheck() {
+    setSiteAccessRunning(true);
+    setSiteAccessResult(null);
+    setMessage("Running Site access and configuration checks through the HTTP API…");
+    try {
+      const response = await fetch("/api/workbench/site-access-check", { method: "POST" });
+      const result = await readJson<SiteAccessCheckResult>(response);
+      setSiteAccessResult(result);
+      setMessage(result.message);
+      await Promise.all([refreshHistory(), refreshStatus()]);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "The Site access check could not complete.");
+    } finally {
+      setSiteAccessRunning(false);
+    }
+  }
+
   async function runRequest(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setRequestError("");
@@ -109,6 +154,17 @@ export default function WorkbenchClient() {
     } catch (error) {
       setRequestError(error instanceof Error ? error.message : "The request could not be completed.");
     }
+  }
+
+  function loadRequestTemplate(template: NonNullable<WorkbenchStatus["catalogue"][number]["requestTemplate"]>) {
+    setMethod(template.method);
+    setPath(template.path);
+    setHeaders(JSON.stringify(template.headers, null, 2));
+    setBody(template.body);
+    setExpectedStatus(String(template.expectedStatus));
+    document.getElementById("request-heading")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    document.getElementById("request-method")?.focus({ preventScroll: true });
+    setMessage("Request template loaded. Review or edit it before sending; the configured Site key is added on the server.");
   }
 
   async function clearHistory() {
@@ -167,6 +223,55 @@ export default function WorkbenchClient() {
             <button className="button-primary" type="button" onClick={() => void runFoundationCheck()}>Run check</button>
           </div>)}
         </div>
+      </section>
+
+      <section className="workbench-section" aria-labelledby="site-access-heading">
+        <div className="section-heading">
+          <h2 id="site-access-heading">{siteAccessWorkflow.title}</h2>
+        </div>
+        <p className="section-description">{siteAccessWorkflow.explanation}</p>
+        <div className="workflow-card">
+          {siteAccessWorkflow.steps.map((step) => <div key={step.id} className="workflow-step">
+            <div className="workflow-step-copy">
+              <strong>{step.title}</strong>
+              <p>{step.expected}</p>
+            </div>
+          </div>)}
+          <div className="workflow-step">
+            <div className="workflow-step-copy">
+              <strong>Run API checks</strong>
+              <p>Each request uses generated test keys held only in server memory. No credential is shown in the browser or saved in history.</p>
+              {siteAccessBlockReason && <p className="field-help">Blocked: {siteAccessBlockReason}</p>}
+            </div>
+            <button className="button-primary" type="button" onClick={() => void runSiteAccessCheck()} disabled={!siteAccessReady || siteAccessRunning}>
+              {siteAccessRunning ? "Running checks…" : "Run Site access checks"}
+            </button>
+          </div>
+        </div>
+        {siteAccessResult && <div className="result-panel stack" aria-live="polite">
+          <h3>Site access check: {siteAccessResult.result}</h3>
+          <p>Evidence: {siteAccessResult.evidence.executionMode.replaceAll("_", " ")} using {siteAccessResult.evidence.fixtureMode} records.</p>
+          <div className="history-list">{siteAccessResult.steps.map((step) => <article key={step.id} className="history-record">
+            <div className="history-record-heading"><strong>{step.title}</strong><span>{step.result}</span><span>{step.statusCode === null ? "Outcome unknown" : `HTTP ${step.statusCode}`}</span><span>Capture: {step.capture}</span></div>
+            <p><strong>Expected:</strong> {step.expected}</p>
+            <p><strong>Observed:</strong> {step.actual}</p>
+            <details><summary>Request and observation sources</summary>
+              <pre className="code-block">{formatValue(step.request)}</pre>
+              <ul>{step.observations.map((observation) => <li key={`${observation.label}-${observation.source}`}><strong>{observation.label}:</strong> {observation.value} · Source: {observation.source}</li>)}</ul>
+            </details>
+          </article>)}</div>
+        </div>}
+      </section>
+
+      <section className="workbench-section" aria-labelledby="catalogue-heading">
+        <div className="section-heading"><h2 id="catalogue-heading">Capability catalogue</h2></div>
+        <div className="status-grid">{(status?.catalogue ?? []).map((entry) => <article key={entry.id} className="status-card">
+          <div className="status-card-heading"><strong>{entry.title}</strong><span>{entry.availability}</span></div>
+          <p>{entry.explanation}</p>
+          {entry.prerequisite && <p className="field-help">Next: {entry.prerequisite}</p>}
+          <details><summary>Expected evidence</summary><ul>{entry.expectedEvidence.map((item) => <li key={item}>{item}</li>)}</ul></details>
+          {entry.requestTemplate && <div className="stack"><details><summary>Request template</summary><pre className="code-block">{formatValue(entry.requestTemplate)}</pre><p className="field-help">Authorization is added from the server environment and is not shown in the browser.</p></details><button className="button-secondary" type="button" onClick={() => loadRequestTemplate(entry.requestTemplate!)}>Edit this request</button></div>}
+        </article>)}</div>
       </section>
 
       <section className="workbench-section request-section" aria-labelledby="request-heading">
