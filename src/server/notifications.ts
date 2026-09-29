@@ -723,10 +723,6 @@ export async function runBoundedProcessing(trigger: ProcessingTrigger): Promise<
     await client.query("begin");
     const clock = await client.query<{ started_at: Date }>(`select clock_timestamp() as started_at`);
     const startedAt = clock.rows[0].started_at;
-    await client.query(
-      `update hpos.processing_state set run_id = $1, trigger = $2, started_at = $3, finished_at = null, result = null where singleton = true`,
-      [runId, trigger, startedAt],
-    );
     const expired = await client.query<{ id: string; claim_id: string }>(
       `select j.id, j.claim_id
        from hpos.notification_jobs j
@@ -769,20 +765,12 @@ export async function runBoundedProcessing(trigger: ProcessingTrigger): Promise<
       has_more: (more.rowCount ?? 0) > 0,
       site_execution: "separate",
     };
-    await client.query(`update hpos.processing_state set finished_at = $2, result = $3::jsonb where singleton = true and run_id = $1`, [runId, finishedAt, JSON.stringify(result)]);
     await client.query("commit");
     return result;
   } catch (error) {
     await client.query("rollback").catch(() => undefined);
     throw error;
   } finally { client.release(); }
-}
-
-export async function readProcessingState(): Promise<{ run_id: string | null; trigger: ProcessingTrigger | null; started_at: Date | null; finished_at: Date | null; result: ProcessingResult | null }> {
-  const result = await getBusinessPool().query<{ run_id: string | null; trigger: ProcessingTrigger | null; started_at: Date | null; finished_at: Date | null; result: ProcessingResult | null }>(
-    `select run_id, trigger, started_at, finished_at, result from hpos.processing_state where singleton = true`,
-  );
-  return result.rows[0] ?? { run_id: null, trigger: null, started_at: null, finished_at: null, result: null };
 }
 
 export async function handleScheduledProcessing(request: Request): Promise<Response> {
