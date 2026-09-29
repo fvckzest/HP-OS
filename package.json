@@ -10,6 +10,7 @@
     "local": "node scripts/start-local.mjs",
     "local:stop": "node scripts/stop-local.mjs",
     "dev": "next dev --hostname 127.0.0.1 --port 3000",
+    "operator": "node scripts/operator.mjs",
     "build": "next build",
     "start": "next start --hostname 127.0.0.1 --port 3000",
     "typecheck": "tsc --noEmit",
