@@ -1,6 +1,6 @@
 # HP-OS API reference
 
-Compact lookup sheet for the planned `/v1` API. The [full contract](api.md) defines validation, ordering, and recovery rules; neither document proves an implemented service. Decisions: [issue #10](https://github.com/fvckzest/HP-OS/issues/10).
+Compact lookup sheet for the `/v1` API contract. The [full contract](api.md) defines validation, ordering, and recovery rules and identifies which portions have local implementation evidence; local evidence does not prove hosted operation. Contract decisions: [issue #10](https://github.com/fvckzest/HP-OS/issues/10).
 
 ## Contents
 
@@ -166,6 +166,8 @@ Claims and reports require a Site API key, a UUID `Idempotency-Key`, and a syste
 | --- | --- | --- |
 | Event | `publish` | Make a valid draft publicly discoverable. |
 | Event | `archive` | Archive an ended/canceled Event; retain history. |
+| Event | `stop_sales` | Pause new checkout for an eligible published Event. |
+| Event | `resume_sales` | Resume a paused Event when its window and capacity permit sales. |
 | Order | `retry_ticket_issuance` | Retry the complete Ticket set for verified payment. |
 | Order | `resend_ticket_email` | Queue another email for existing Tickets. |
 | Order | `correct_delivery_email` | Replace buyer page links and resend to a verified address. |
@@ -174,7 +176,7 @@ Claims and reports require a Site API key, a UUID `Idempotency-Key`, and a syste
 | Access Request | `undo_decision` | Return to pending; revoke approval access if applicable. |
 | Payment attempt | `resolve` | Apply corrected verified evidence; retain history. |
 
-The Issue #26 Event handler currently supports only `publish` and `archive`. `stop_sales`, `resume_sales`, and `cancel` remain later contract work and return `404 not_found` until implemented.
+The local Event handler supports `publish`, `archive`, `stop_sales`, and `resume_sales`. `cancel` remains later contract work and returns `404 not_found`. See the [full contract](api.md#admin-event-endpoints) for local implementation boundaries and action requirements.
 
 ## Parameters
 

@@ -658,6 +658,16 @@ async function writeEventPatch(client: PoolClient, site: AuthenticatedSite, even
     ].filter((field): field is string => field !== null);
     if (clearing.length) operationError(409, "sales_configuration_locked", "A complete sales configuration cannot be cleared after it has been saved.", clearing.map((field) => ({ field, code: "cannot_clear", message: "Set a replacement value instead of clearing this field." })));
   }
+  if (offer && Object.hasOwn(offer, "capacity")) {
+    const committedQuantity = Number(current.reserved_quantity);
+    if (committedQuantity > 0 && (offer.capacity === null || (typeof offer.capacity === "number" && offer.capacity < committedQuantity))) {
+      operationError(422, "validation_failed", "Capacity cannot be lower than the quantity already committed.", [{
+        field: "ticket_offering.capacity",
+        code: "below_committed_capacity",
+        message: "Choose a capacity that covers the current committed quantity.",
+      }]);
+    }
+  }
   const eventSets: string[] = [];
   const eventArgs: unknown[] = [site.siteId, eventId];
   const addEvent = (column: string, value: unknown) => { eventArgs.push(value); eventSets.push(`${column}=$${eventArgs.length}`); };
@@ -739,6 +749,28 @@ async function writeEventAction(client: PoolClient, site: AuthenticatedSite, eve
   } else if (action === "archive") {
     if (current.publication_status !== "published" || current.is_archived || (!current.is_canceled && (!current.ends_at || current.ends_at.getTime() > now))) operationError(409, "invalid_state", "Only an ended or canceled published Event can be archived.");
     column = "is_archived"; value = true;
+  } else if (action === "stop_sales") {
+    if (current.publication_status !== "published" || current.is_archived || current.is_canceled || !current.ends_at || current.ends_at.getTime() <= now || current.sales_paused) {
+      operationError(409, "invalid_state", "Sales can be stopped once on a published Event that has not ended or been canceled.");
+    }
+    column = "sales_paused"; value = true;
+  } else if (action === "resume_sales") {
+    const configured = current.price_amount !== null
+      && current.currency !== null
+      && current.capacity !== null
+      && current.sales_opens_at !== null
+      && current.sales_closes_at !== null;
+    const withinSalesWindow = current.sales_opens_at !== null
+      && current.sales_closes_at !== null
+      && current.sales_opens_at.getTime() <= now
+      && current.sales_closes_at.getTime() > now;
+    const capacityAvailable = current.capacity !== null
+      && Number(current.capacity) > Number(current.reserved_quantity);
+    if (current.publication_status !== "published" || current.is_archived || current.is_canceled || !current.ends_at || current.ends_at.getTime() <= now
+      || !current.sales_paused || !configured || !withinSalesWindow || !capacityAvailable) {
+      operationError(409, "invalid_state", "Sales can resume only while the published Event is within its configured sales window and has available capacity.");
+    }
+    column = "sales_paused"; value = false;
   } else operationError(404, "not_found", "The Event action is unavailable.");
   await client.query(`update hpos.events set ${column}=$3, version=version+1, updated_at=clock_timestamp(), updated_actor_type=$4, updated_actor_reference=$5 where site_id=$1 and id=$2`, [site.siteId, eventId, value, actor.type, actor.reference]);
   const event = await readAdminEvent(client, site.siteId, eventId);
