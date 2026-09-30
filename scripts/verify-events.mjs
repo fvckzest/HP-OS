@@ -85,8 +85,20 @@ function createSiteFixture(withPilotFee = true) {
   const organization = runOperator(["organization", "create", "--name", "Issue 28 verification " + randomUUID(), ...feeOptions]);
   organizationIds.push(organization.organization_id);
   const site = runOperator(["site", "create", "--organization", organization.organization_id, "--name", "Issue 26 verification Site"]);
+  const connection = runOperator([
+    "payment-connection", "create", "--organization", organization.organization_id,
+    "--provider", "square", "--environment", "test",
+    "--account-reference", "ref:verify-events-square-seller",
+    "--location-reference", "ref:verify-events-square-location",
+  ]);
+  runOperator([
+    "payment-connection", "eligibility-record", "--connection", connection.connection_id,
+    "--account-status", "eligible", "--platform-fee-status", "ineligible",
+    "--evidence-reference", "ref:verify-events-square-sandbox",
+  ]);
+  runOperator(["site", "assign-connection", "--site", site.site_id, "--connection", connection.connection_id]);
   const key = runOperator(["site-key", "issue", "--site", site.site_id]);
-  return { siteId: site.site_id, apiKey: key.site_api_key };
+  return { siteId: site.site_id, apiKey: key.site_api_key, connectionId: connection.connection_id };
 }
 
 async function api(site, pathName, { method = "GET", idempotencyKey, body } = {}) {
@@ -482,6 +494,194 @@ async function verifyPublicSingleTicketCheckout(site) {
   assert(expiredHold.rows[0]?.reserved_quantity === "0" && expiredHold.rows[0]?.status === "released"
     && expiredHold.rows[0]?.checkout_status === "expired",
     "Expired prepayment cleanup did not release capacity and expire the Order atomically.");
+}
+
+async function verifyPublicPaymentAttemptLifecycle(site) {
+  const event = await createPublishedEvent(site, {
+    title: "Issue 29 Payment Attempt Verification",
+    startsAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+    endsAt: new Date(Date.now() + 2 * 60 * 60_000).toISOString(),
+    timeZone: "UTC",
+    ticketOffering: { price: { amount: 2500, currency: "USD" }, capacity: 2, tax_amount: 0, buyer_fees: [] },
+  });
+  const quote = await api(site, `/v1/public/events/${event.event_id}/quotes`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
+  });
+  assert(quote.status === 201, "The payment-attempt fixture could not obtain an Order quote.");
+  const order = await api(site, "/v1/public/orders", {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { quote_id: quote.data.data.quote_id, buyer: { name: "Attempt Buyer", email: "attempt@example.test" } },
+  });
+  assert(order.status === 201, "The payment-attempt fixture could not create an Order.");
+
+  const actor = { type: "system", reference: "test:issue-29" };
+  const firstKey = randomUUID();
+  const firstAttempt = await api(site, `/v1/admin/orders/${order.data.data.order_id}/payment-attempts`, {
+    method: "POST", idempotencyKey: firstKey, body: { actor },
+  });
+  assert(firstAttempt.status === 201, "A verified test connection could not create a payment attempt: " + JSON.stringify(firstAttempt.data));
+  assert(firstAttempt.data.data.total.amount === 2500 && firstAttempt.data.data.platform_fee.amount === 250,
+    "The payment attempt did not freeze the accepted Order total and platform fee.");
+  assert(firstAttempt.data.data.connection.connection_id === site.connectionId
+    && firstAttempt.data.data.connection.account_eligibility_status === "eligible"
+    && firstAttempt.data.data.connection.platform_fee_eligibility_status === "ineligible",
+    "The payment attempt did not freeze its verified Sandbox connection state.");
+  const replay = await api(site, `/v1/admin/orders/${order.data.data.order_id}/payment-attempts`, {
+    method: "POST", idempotencyKey: firstKey, body: { actor },
+  });
+  assert(replay.status === 201 && replay.data.data.attempt_id === firstAttempt.data.data.attempt_id,
+    "Replaying an attempt-creation key created another provider attempt.");
+
+  const attemptId = firstAttempt.data.data.attempt_id;
+  const unresolved = await api(site, `/v1/admin/payment-attempts/${attemptId}`);
+  assert(unresolved.status === 200 && unresolved.data.data.status === "creating"
+    && unresolved.headers.get("cache-control") === "no-store",
+    "The Site could not safely inspect its unresolved payment attempt.");
+  const outsider = createSiteFixture();
+  const hidden = await api(outsider, `/v1/admin/payment-attempts/${attemptId}`);
+  assert(hidden.status === 404, "Another Site could read a payment attempt.");
+
+  const concurrent = await api(site, `/v1/admin/orders/${order.data.data.order_id}/payment-attempts`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor },
+  });
+  assert(concurrent.status === 409 && concurrent.data.error.code === "payment_attempt_in_progress",
+    "HP-OS created concurrent payment-capable attempts for one Order.");
+
+  const referenceBody = {
+    actor,
+    connection_id: site.connectionId,
+    provider_checkout_reference: "square-test-link-29-1",
+    provider_can_take_payment: true,
+  };
+  const registered = await api(site, `/v1/admin/payment-attempts/${attemptId}/checkout-reference`, {
+    method: "POST", idempotencyKey: randomUUID(), body: referenceBody,
+  });
+  assert(registered.status === 200 && registered.data.data.status === "open"
+    && registered.data.data.provider_can_take_payment === true,
+    "HP-OS did not register the provider checkout before opening the attempt.");
+
+  const closureBody = {
+    actor,
+    connection_id: site.connectionId,
+    source_reference: "ref:verify-square-checkout-closed-29-1",
+    provider_checkout_reference: "square-test-link-29-1",
+    observed_at: new Date().toISOString(),
+    provider_checkout_closed: true,
+    payment_outcome: "canceled",
+  };
+  const closure = await api(site, `/v1/admin/payment-attempts/${attemptId}/closure-reports`, {
+    method: "POST", idempotencyKey: randomUUID(), body: closureBody,
+  });
+  assert(closure.status === 200 && closure.data.data.status === "closed",
+    "A verified provider closure did not close the original attempt.");
+  const closureReplay = await api(site, `/v1/admin/payment-attempts/${attemptId}/closure-reports`, {
+    method: "POST", idempotencyKey: randomUUID(), body: closureBody,
+  });
+  assert(closureReplay.status === 200 && closureReplay.data.data.status === "closed",
+    "A repeated verified provider observation created another closure effect.");
+  const conflictingClosure = await api(site, `/v1/admin/payment-attempts/${attemptId}/closure-reports`, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { ...closureBody, payment_outcome: "failed" },
+  });
+  assert(conflictingClosure.status === 409 && conflictingClosure.data.error.code === "payment_report_conflict",
+    "A provider closure source reference was accepted with contradictory evidence.");
+  const capacityAfterClosure = await pool.query(
+    `select offering.reserved_quantity, reservation.status, reservation.awaiting_provider_verification,
+            order_row.checkout_status
+     from hpos.ticket_offerings offering
+     join hpos.reservations reservation on reservation.offering_id = offering.id
+     join hpos.orders order_row on order_row.id = reservation.order_id
+     where order_row.id = $1`,
+    [order.data.data.order_id],
+  );
+  assert(capacityAfterClosure.rows[0]?.reserved_quantity === "1"
+    && capacityAfterClosure.rows[0]?.status === "held"
+    && capacityAfterClosure.rows[0]?.awaiting_provider_verification === false
+    && capacityAfterClosure.rows[0]?.checkout_status === "active",
+    "A closed provider checkout released capacity before its original Order deadline.");
+
+  const replacement = await api(site, `/v1/admin/orders/${order.data.data.order_id}/payment-attempts`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor },
+  });
+  assert(replacement.status === 201 && replacement.data.data.attempt_id !== attemptId,
+    "A confirmed closed checkout did not permit one replacement attempt within the Order window.");
+  const uncertainFailure = await api(site, `/v1/admin/payment-attempts/${replacement.data.data.attempt_id}/setup-failure`, {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor, reason: "provider_unavailable", provider_checkout_closed: false, payment_outcome: "not_started",
+    },
+  });
+  assert(uncertainFailure.status === 422, "An unverified provider closure was accepted as a safe setup failure.");
+
+  const safeFailure = await api(site, `/v1/admin/payment-attempts/${replacement.data.data.attempt_id}/setup-failure`, {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor, reason: "provider_unavailable", provider_checkout_closed: true, payment_outcome: "not_started",
+    },
+  });
+  assert(safeFailure.status === 200 && safeFailure.data.data.status === "closed",
+    "A confirmed provider setup failure did not close its attempt.");
+  const released = await pool.query(
+    `select offering.reserved_quantity, reservation.status, reservation.awaiting_provider_verification,
+            order_row.checkout_status
+     from hpos.ticket_offerings offering
+     join hpos.reservations reservation on reservation.offering_id = offering.id
+     join hpos.orders order_row on order_row.id = reservation.order_id
+     where order_row.id = $1`,
+    [order.data.data.order_id],
+  );
+  assert(released.rows[0]?.reserved_quantity === "0" && released.rows[0]?.status === "released"
+    && released.rows[0]?.awaiting_provider_verification === false
+    && released.rows[0]?.checkout_status === "ended",
+    "HP-OS did not release capacity after a confirmed pre-provider setup failure.");
+
+  const lateEvent = await createPublishedEvent(site, {
+    title: "Issue 29 Late Provider Setup Verification",
+    startsAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+    endsAt: new Date(Date.now() + 2 * 60 * 60_000).toISOString(),
+    timeZone: "UTC",
+    ticketOffering: { price: { amount: 2500, currency: "USD" }, capacity: 1, tax_amount: 0, buyer_fees: [] },
+  });
+  const lateQuote = await api(site, `/v1/public/events/${lateEvent.event_id}/quotes`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
+  });
+  const lateOrder = await api(site, "/v1/public/orders", {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { quote_id: lateQuote.data.data.quote_id, buyer: { name: "Late Buyer", email: "late@example.test" } },
+  });
+  const lateAttempt = await api(site, `/v1/admin/orders/${lateOrder.data.data.order_id}/payment-attempts`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor },
+  });
+  await pool.query(
+    `update hpos.orders set checkout_expires_at = clock_timestamp() - interval '1 second' where id = $1`,
+    [lateOrder.data.data.order_id],
+  );
+  const lateRegistration = await api(site, `/v1/admin/payment-attempts/${lateAttempt.data.data.attempt_id}/checkout-reference`, {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      ...referenceBody,
+      provider_checkout_reference: "square-test-link-29-late",
+    },
+  });
+  assert(lateRegistration.status === 409 && lateRegistration.data.error.code === "checkout_expired",
+    "HP-OS registered provider checkout after its accepted Order deadline.");
+  const lateClosure = await api(site, `/v1/admin/payment-attempts/${lateAttempt.data.data.attempt_id}/closure-reports`, {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      ...closureBody,
+      source_reference: "ref:verify-square-checkout-closed-29-late",
+      provider_checkout_reference: "square-test-link-29-late",
+    },
+  });
+  assert(lateClosure.status === 200 && lateClosure.data.data.status === "closed",
+    "The Site could not report verified closure for a late provider setup.");
+  const lateCapacity = await pool.query(
+    `select offering.reserved_quantity, reservation.status, order_row.checkout_status
+     from hpos.ticket_offerings offering
+     join hpos.reservations reservation on reservation.offering_id = offering.id
+     join hpos.orders order_row on order_row.id = reservation.order_id
+     where order_row.id = $1`,
+    [lateOrder.data.data.order_id],
+  );
+  assert(lateCapacity.rows[0]?.reserved_quantity === "0" && lateCapacity.rows[0]?.status === "released"
+    && lateCapacity.rows[0]?.checkout_status === "expired",
+    "A late provider checkout kept capacity after the Site verified it was closed.");
 }
 
 async function verifyReservationBackedSalesControls(site) {
@@ -1024,13 +1224,14 @@ async function main() {
     await verifyEventLifecycleAndDiscovery(site);
     await verifySalesControlsAndCapacity(site);
     await verifyPublicSingleTicketCheckout(site);
+    await verifyPublicPaymentAttemptLifecycle(site);
     await verifyReservationBackedSalesControls(site);
   } finally {
     await cleanup();
     await stopApp(app);
     await pool.end();
   }
-  console.log("Local Event and checkout API verification passed: sales controls with actual Reservations, preserved purchase terms, capacity release, Organization pilot fees, explicit pricing, single-Ticket quotes, idempotent unpaid Orders, Reservation expiry, and concurrent last-capacity protection.");
+  console.log("Local Event and checkout API verification passed: sales controls with actual Reservations, preserved purchase terms, capacity release, Organization pilot fees, explicit pricing, single-Ticket quotes, payment-attempt idempotency, provider closure safety, Reservation expiry, and concurrent last-capacity protection.");
 }
 
 main().catch((error) => {

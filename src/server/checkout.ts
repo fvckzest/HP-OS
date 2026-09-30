@@ -51,6 +51,16 @@ interface QuoteRow extends QueryResultRow {
   expires_at: Date;
 }
 
+interface PaymentConnectionRow extends QueryResultRow {
+  id: string;
+  provider: "square" | "stripe";
+  environment: "test" | "live";
+  account_reference: string;
+  location_reference: string | null;
+  account_eligibility_status: "pending_validation" | "eligible" | "ineligible";
+  platform_fee_eligibility_status: "pending_validation" | "eligible" | "ineligible";
+}
+
 function object(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -252,6 +262,29 @@ async function createOrder(
 
   const row = await lockedPricing(client, site.siteId, quote.event_id);
   assertPublicSalesOpen(row);
+
+  const selectedConnection = await client.query<PaymentConnectionRow>(
+    `select connection.id, connection.provider, connection.environment,
+            connection.account_reference, connection.location_reference,
+            connection.account_eligibility_status, connection.platform_fee_eligibility_status
+     from hpos.site_payment_connection_assignments assignment
+     join hpos.payment_connections connection
+       on connection.id = assignment.connection_id
+      and connection.organization_id = assignment.organization_id
+     where assignment.site_id = $1 and assignment.unassigned_at is null
+     for update of assignment, connection`,
+    [site.siteId],
+  );
+  const connection = selectedConnection.rows[0];
+  if (!connection
+    || connection.account_eligibility_status !== "eligible"
+    || (connection.platform_fee_eligibility_status !== "eligible"
+      && !(connection.provider === "square" && connection.environment === "test"
+        && connection.platform_fee_eligibility_status === "ineligible"))
+    || (connection.provider === "square" && !connection.location_reference)) {
+    operationError(503, "payment_configuration_unavailable", "The Site does not have a verified, eligible payment connection for new Orders.");
+  }
+
   if (Number(row.reserved_quantity) >= Number(row.capacity)) operationError(409, "sold_out", "No Tickets remain available for this Event.");
   const pricing = validatedPricing(row);
   if (pricing.currency !== quote.currency || pricing.price !== Number(quote.unit_price)
@@ -279,11 +312,11 @@ async function createOrder(
     `insert into hpos.orders (
        id, site_id, event_id, offering_id, buyer_id, quote_id, order_reference,
        buyer_name, delivery_email, checkout_identity, accepted_quote,
-       checkout_expires_at, order_token_hash
+       checkout_expires_at, order_token_hash, payment_connection_id
      )
      select
        $1, $2, $3, $4, $5, quote_row.id, $7, $8, $9, $10::jsonb, $11::jsonb,
-       clock_timestamp() + interval '15 minutes', $12
+       clock_timestamp() + interval '15 minutes', $12, $13
      from hpos.public_quotes quote_row
      where quote_row.id = $6 and quote_row.site_id = $2
        and quote_row.expires_at > clock_timestamp()
@@ -302,7 +335,7 @@ async function createOrder(
         platform_fee: money(quote.platform_fee_amount, quote.currency),
         platform_fee_basis_points: quote.platform_fee_basis_points,
       }),
-      orderTokenHash],
+      orderTokenHash, connection.id],
   );
   if (insertedOrder.rowCount !== 1) {
     operationError(409, "quote_expired", "This quote expired. Request a new quote and show its total before checkout.");
