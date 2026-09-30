@@ -280,10 +280,14 @@ async function createOrder(
        id, site_id, event_id, offering_id, buyer_id, quote_id, order_reference,
        buyer_name, delivery_email, checkout_identity, accepted_quote,
        checkout_expires_at, order_token_hash
-     ) values (
-       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb,
+     )
+     select
+       $1, $2, $3, $4, $5, quote_row.id, $7, $8, $9, $10::jsonb, $11::jsonb,
        clock_timestamp() + interval '15 minutes', $12
-     ) returning created_at, checkout_expires_at`,
+     from hpos.public_quotes quote_row
+     where quote_row.id = $6 and quote_row.site_id = $2
+       and quote_row.expires_at > clock_timestamp()
+     returning created_at, checkout_expires_at`,
     [orderId, site.siteId, quote.event_id, row.ticket_offering_id, buyerRow.rows[0].id,
       quote.id, orderReference, buyer.name, buyer.email,
       JSON.stringify({ name: buyer.name, email: buyer.email }),
@@ -300,6 +304,9 @@ async function createOrder(
       }),
       orderTokenHash],
   );
+  if (insertedOrder.rowCount !== 1) {
+    operationError(409, "quote_expired", "This quote expired. Request a new quote and show its total before checkout.");
+  }
   const reservationExpiry = insertedOrder.rows[0].checkout_expires_at;
   const reserved = await client.query(
     `update hpos.ticket_offerings

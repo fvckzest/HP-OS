@@ -284,7 +284,6 @@ Use `error.code` for program logic; use `error.message` for explanation. Retry n
 | `claim_conflict` | Claim expired or does not own the job. |
 | `sales_not_configured` | Required sales settings missing. |
 | `sales_configuration_locked` | A previously complete sales configuration cannot be cleared. |
-| `capacity_below_committed` | Capacity cannot be reduced below held Reservations or issued Tickets. |
 | `sales_not_open` | Sales opening time has not arrived. |
 | `sales_paused` | New checkouts manually stopped. |
 | `sales_closed` | Sales window/Event ended. |
