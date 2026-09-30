@@ -2,6 +2,7 @@ import { apiFailure, apiSuccess } from "@/src/server/api-response";
 import { authenticateSiteRequest } from "@/src/server/site-auth";
 import { isPaymentConnectionId, readSitePaymentConfiguration, readSitePaymentConnection } from "@/src/server/site-payment-configuration";
 import { handleNotificationGet, handleNotificationPost } from "@/src/server/notifications";
+import { handleCheckoutPost } from "@/src/server/checkout";
 import { handleEventActionPost, handleEventGet, handleEventPatch, handleEventPost } from "@/src/server/events";
 
 export const dynamic = "force-dynamic";
@@ -48,6 +49,9 @@ export async function POST(request: Request, context: RouteContext) {
   const { path } = await context.params;
 
   try {
+    const checkoutResponse = await handleCheckoutPost(request, authentication.site, path);
+    if (checkoutResponse) return checkoutResponse;
+
     const eventResponse = await handleEventPost(request, authentication.site, path)
       ?? await handleEventActionPost(request, authentication.site, path);
     if (eventResponse) return eventResponse;

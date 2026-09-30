@@ -86,6 +86,8 @@ function newSiteKey(): SiteKey {
 const help = `HP-OS operator setup (database changes are direct operator actions; no customer onboarding UI is created)
 
   pnpm operator organization create --name "LMNL"
+  pnpm operator organization create --name "LMNL" --pilot-fee-rate-basis-points 1000
+  pnpm operator organization pilot-fee-set --organization <organization-id> --rate-basis-points 1000
   pnpm operator site create --organization <organization-id> --name "LMNL main"
   pnpm operator payment-connection create --organization <organization-id> --provider square --environment test --account-reference ref:venue-square [--location-reference ref:main-hall]
   pnpm operator site assign-connection --site <site-id> --connection <connection-id>
@@ -110,8 +112,16 @@ const pool = new Pool({ connectionString: databaseUrl, max: 1, connectionTimeout
 try {
   if (group === "organization" && action === "create") {
     const name = boundedName(required(options, "name"), "name");
-    const result = await pool.query<{ id: string }>(`insert into hpos.organizations (name) values ($1) returning id`, [name]);
-    console.log(JSON.stringify({ organization_id: result.rows[0].id, fee_terms_status: "pending_validation" }));
+    const feeRate = options["pilot-fee-rate-basis-points"] === undefined
+      ? null
+      : Number(options["pilot-fee-rate-basis-points"]);
+    if (feeRate !== null && feeRate !== 1000) fail("--pilot-fee-rate-basis-points must be 1000 for the 10% pilot fee.");
+    const result = await pool.query<{ id: string }>(
+      `insert into hpos.organizations (name, fee_terms_status, platform_fee_basis_points)
+       values ($1, $2, $3) returning id`,
+      [name, feeRate === null ? "pending_validation" : "configured", feeRate],
+    );
+    console.log(JSON.stringify({ organization_id: result.rows[0].id, fee_terms_status: feeRate === null ? "pending_validation" : "configured", platform_fee_basis_points: feeRate }));
   } else if (group === "site" && action === "create") {
     const organizationId = uuid(required(options, "organization"), "organization");
     const name = boundedName(required(options, "name"), "name");
@@ -166,9 +176,21 @@ try {
     console.log(JSON.stringify({ site_id: siteId, request_limit_per_minute: perMinute }));
   } else if (group === "organization" && action === "fee-terms-pending") {
     const organizationId = uuid(required(options, "organization"), "organization");
-    const result = await pool.query(`update hpos.organizations set fee_terms_status = 'pending_validation' where id = $1 returning id`, [organizationId]);
+    const result = await pool.query(`update hpos.organizations set fee_terms_status = 'pending_validation', platform_fee_basis_points = null where id = $1 returning id`, [organizationId]);
     if (result.rowCount !== 1) fail("The organization does not exist.");
     console.log(JSON.stringify({ organization_id: organizationId, fee_terms_status: "pending_validation" }));
+  } else if (group === "organization" && action === "pilot-fee-set") {
+    const organizationId = uuid(required(options, "organization"), "organization");
+    const feeRate = Number(required(options, "rate-basis-points"));
+    if (feeRate !== 1000) fail("--rate-basis-points must be 1000 for the 10% pilot fee.");
+    const result = await pool.query(
+      `update hpos.organizations
+       set fee_terms_status = 'configured', platform_fee_basis_points = $2
+       where id = $1 returning id`,
+      [organizationId, feeRate],
+    );
+    if (result.rowCount !== 1) fail("The organization does not exist.");
+    console.log(JSON.stringify({ organization_id: organizationId, fee_terms_status: "configured", platform_fee_basis_points: feeRate }));
   } else if (group === "site-key" && ["issue", "rotate", "revoke"].includes(action)) {
     const siteId = uuid(required(options, "site"), "site");
     if (action === "revoke") {

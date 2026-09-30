@@ -1,6 +1,6 @@
 # First-release technology
 
-This document records the technology and implementation-order decisions agreed during [issue #11](https://github.com/fvckzest/HP-OS/issues/11). [Issue #23](https://github.com/fvckzest/HP-OS/issues/23) provides a local Next.js application, direct PostgreSQL access, and version-controlled migrations. [Issue #24](https://github.com/fvckzest/HP-OS/issues/24) adds the first `/v1` slice for Site-key authentication and payment-configuration reads. Events, ticketing, and hosted readiness remain unimplemented or unverified.
+This document records the technology and implementation-order decisions agreed during [issue #11](https://github.com/fvckzest/HP-OS/issues/11). [Issue #23](https://github.com/fvckzest/HP-OS/issues/23) provides a local Next.js application, direct PostgreSQL access, and version-controlled migrations. [Issue #24](https://github.com/fvckzest/HP-OS/issues/24) adds the first `/v1` slice for Site-key authentication and payment-configuration reads. Issues #26–#28 add local Event setup and sales, plus a public single-Ticket quote and unpaid Order/Reservation slice. Provider payment, Ticket issuance, broader ticketing, and hosted readiness remain incomplete or unverified.
 
 ## Language and deployment
 

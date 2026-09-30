@@ -649,6 +649,7 @@ export interface ProcessingResult {
   started_at: string;
   finished_at: string;
   recovered_jobs: number;
+  released_reservations: number;
   batch_limit: number;
   has_more: boolean;
   site_execution: "separate";
@@ -689,9 +690,75 @@ export async function runBoundedProcessing(trigger: ProcessingTrigger): Promise<
         [claimIds],
       );
     }
+    const expiredReservations = await client.query<{ id: string; order_id: string; offering_id: string; site_id: string; quantity: number }>(
+      `select reservation.id, reservation.order_id, reservation.offering_id,
+              reservation.site_id, reservation.quantity
+       from hpos.reservations reservation
+       join hpos.orders order_row
+         on order_row.id = reservation.order_id
+        and order_row.site_id = reservation.site_id
+       where reservation.status = 'held'
+         and reservation.awaiting_provider_verification = false
+         and reservation.expires_at <= clock_timestamp()
+         and order_row.checkout_status = 'active'
+         and order_row.payment_status = 'unpaid'
+       order by reservation.expires_at, reservation.id
+       limit $1
+       for update of reservation, order_row skip locked`,
+      [MAX_PROCESS_BATCH],
+    );
+    const reservationIds = expiredReservations.rows.map((row) => row.id);
+    const orderIds = expiredReservations.rows.map((row) => row.order_id);
+    let releasedReservations = 0;
+    if (reservationIds.length) {
+      const offeringIds = [...new Set(expiredReservations.rows.map((row) => row.offering_id))];
+      const releaseCapacity = await client.query(
+        `with release_totals as (
+           select offering_id, site_id, sum(quantity)::bigint as quantity
+           from hpos.reservations
+           where id = any($1::uuid[]) and status = 'held'
+           group by offering_id, site_id
+         )
+         update hpos.ticket_offerings offering
+         set reserved_quantity = offering.reserved_quantity - release_totals.quantity
+         from release_totals
+         where offering.id = release_totals.offering_id
+           and offering.site_id = release_totals.site_id
+           and offering.reserved_quantity >= release_totals.quantity
+         returning offering.id`,
+        [reservationIds],
+      );
+      if (releaseCapacity.rowCount !== offeringIds.length) throw new Error("Expired Reservation capacity counters did not match their holds.");
+      const released = await client.query(
+        `update hpos.reservations
+         set status = 'released', updated_at = clock_timestamp()
+         where id = any($1::uuid[]) and status = 'held'
+         returning id`,
+        [reservationIds],
+      );
+      if (released.rowCount !== reservationIds.length) throw new Error("An expired Reservation changed before it could be released.");
+      await client.query(
+        `update hpos.orders
+         set checkout_status = 'expired', version = version + 1, updated_at = clock_timestamp()
+         where id = any($1::uuid[]) and checkout_status = 'active' and payment_status = 'unpaid'`,
+        [orderIds],
+      );
+      releasedReservations = released.rowCount;
+    }
     const more = await client.query(
       `select 1 from hpos.notification_jobs j join hpos.notification_claims c on c.id = j.claim_id and c.site_id = j.site_id
        where j.status = 'pending' and (c.closed_at is not null or c.lease_expires_at <= clock_timestamp()) limit 1`,
+    );
+    const moreReservations = await client.query(
+      `select 1
+       from hpos.reservations reservation
+       join hpos.orders order_row on order_row.id = reservation.order_id and order_row.site_id = reservation.site_id
+       where reservation.status = 'held'
+         and reservation.awaiting_provider_verification = false
+         and reservation.expires_at <= clock_timestamp()
+         and order_row.checkout_status = 'active'
+         and order_row.payment_status = 'unpaid'
+       limit 1`,
     );
     const finishedAt = (await client.query<{ finished_at: Date }>(`select clock_timestamp() as finished_at`)).rows[0].finished_at;
     const result: ProcessingResult = {
@@ -700,8 +767,9 @@ export async function runBoundedProcessing(trigger: ProcessingTrigger): Promise<
       started_at: startedAt.toISOString(),
       finished_at: finishedAt.toISOString(),
       recovered_jobs: jobIds.length,
+      released_reservations: releasedReservations,
       batch_limit: MAX_PROCESS_BATCH,
-      has_more: (more.rowCount ?? 0) > 0,
+      has_more: (more.rowCount ?? 0) > 0 || (moreReservations.rowCount ?? 0) > 0,
       site_execution: "separate",
     };
     await client.query("commit");

@@ -50,6 +50,8 @@ interface EventRow extends QueryResultRow {
   updated_actor_reference: string;
   price_amount: string | null;
   currency: string | null;
+  tax_amount: string | null;
+  buyer_fees: Array<{ code: string; label: string; amount: number; currency: string }> | null;
   capacity: string | null;
   reserved_quantity: string;
   sales_opens_at: Date | null;
@@ -59,6 +61,21 @@ interface EventRow extends QueryResultRow {
   sales_ever_configured?: boolean;
   created_cursor_time?: string;
   starts_cursor_time?: string;
+}
+
+export type SalesStatus = "canceled" | "closed" | "not_configured" | "scheduled" | "paused" | "sold_out" | "open";
+
+export interface EventSalesState {
+  is_canceled: boolean;
+  ends_at: Date | null;
+  price_amount: string | null;
+  tax_amount: string | null;
+  buyer_fees: EventRow["buyer_fees"];
+  capacity: string | null;
+  sales_opens_at: Date | null;
+  sales_closes_at: Date | null;
+  sales_paused: boolean;
+  reserved_quantity: string;
 }
 
 interface EventInput {
@@ -76,6 +93,8 @@ interface EventInput {
     capacity?: number | null;
     sales_opens_at?: ParsedTimestamp | null;
     sales_closes_at?: ParsedTimestamp | null;
+    tax_amount?: number | null;
+    buyer_fees?: Array<{ code: string; label: string; amount: number; currency: string }> | null;
   };
 }
 
@@ -255,8 +274,8 @@ function parseEventInput(value: Record<string, unknown>): EventInput | Response 
     else return fieldError("visibility", "invalid_enum", "Use public or private visibility.");
   }
   if (Object.hasOwn(value, "ticket_offering")) {
-    if (!object(value.ticket_offering) || !hasOnlyKeys(value.ticket_offering, ["price", "capacity", "sales_opens_at", "sales_closes_at"])) {
-      return fieldError("ticket_offering", "invalid_object", "Use only price, capacity, sales_opens_at, and sales_closes_at.");
+    if (!object(value.ticket_offering) || !hasOnlyKeys(value.ticket_offering, ["price", "capacity", "sales_opens_at", "sales_closes_at", "tax_amount", "buyer_fees"])) {
+      return fieldError("ticket_offering", "invalid_object", "Use only price, capacity, sales times, tax_amount, and buyer_fees.");
     }
     input.ticket_offering = {};
     if (Object.hasOwn(value.ticket_offering, "price")) {
@@ -276,6 +295,37 @@ function parseEventInput(value: Record<string, unknown>): EventInput | Response 
         return fieldError("ticket_offering.capacity", "out_of_range", "Capacity must be a nonnegative safe integer or null.");
       }
       input.ticket_offering.capacity = capacity as number | null;
+    }
+    if (Object.hasOwn(value.ticket_offering, "tax_amount")) {
+      const taxAmount = value.ticket_offering.tax_amount;
+      if (taxAmount !== null && (!Number.isSafeInteger(taxAmount) || Number(taxAmount) < 0)) {
+        return fieldError("ticket_offering.tax_amount", "out_of_range", "Tax must be a nonnegative safe integer amount or null. Use zero when no tax applies.");
+      }
+      input.ticket_offering.tax_amount = taxAmount as number | null;
+    }
+    if (Object.hasOwn(value.ticket_offering, "buyer_fees")) {
+      const fees = value.ticket_offering.buyer_fees;
+      if (fees === null) input.ticket_offering.buyer_fees = null;
+      else if (!Array.isArray(fees) || fees.length > 10) {
+        return fieldError("ticket_offering.buyer_fees", "invalid_list", "Provide up to ten fee entries or an empty list when no buyer fees apply.");
+      } else {
+        const parsedFees: Array<{ code: string; label: string; amount: number; currency: string }> = [];
+        let totalFeeAmount = 0;
+        for (const [index, fee] of fees.entries()) {
+          const field = `ticket_offering.buyer_fees[${index}]`;
+          if (!object(fee) || !hasOnlyKeys(fee, ["code", "label", "amount", "currency"])
+            || typeof fee.code !== "string" || !/^[a-z][a-z0-9_]{0,49}$/.test(fee.code)
+            || !validPlainText(fee.label, 100) || !Number.isSafeInteger(fee.amount) || Number(fee.amount) < 0
+            || typeof fee.currency !== "string" || !/^[A-Z]{3}$/.test(fee.currency)) {
+            return fieldError(field, "invalid_fee", "Each fee requires a lowercase code, label, nonnegative safe-integer amount, and uppercase currency.");
+          }
+          const amount = Number(fee.amount);
+          totalFeeAmount += amount;
+          if (!Number.isSafeInteger(totalFeeAmount)) return fieldError("ticket_offering.buyer_fees", "out_of_range", "The combined buyer fees exceed the safe amount range.");
+          parsedFees.push({ code: fee.code, label: fee.label.trim(), amount, currency: fee.currency });
+        }
+        input.ticket_offering.buyer_fees = parsedFees;
+      }
     }
     for (const field of ["sales_opens_at", "sales_closes_at"] as const) {
       if (!Object.hasOwn(value.ticket_offering, field)) continue;
@@ -330,11 +380,10 @@ function safeNumber(value: string | null): number | null {
   return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
-function salesStatus(row: EventRow): string {
-  const now = Date.now();
+export function salesStatus(row: EventSalesState, now = Date.now()): SalesStatus {
   if (row.is_canceled) return "canceled";
   if (row.ends_at && row.ends_at.getTime() <= now) return "closed";
-  if (!row.price_amount || row.capacity === null || !row.sales_opens_at || !row.sales_closes_at) return "not_configured";
+  if (row.price_amount === null || row.tax_amount === null || row.buyer_fees === null || row.capacity === null || !row.sales_opens_at || !row.sales_closes_at) return "not_configured";
   if (row.sales_closes_at.getTime() <= now) return "closed";
   if (row.sales_opens_at.getTime() > now) return "scheduled";
   if (row.sales_paused) return "paused";
@@ -362,7 +411,7 @@ function eventData(row: EventRow, admin: boolean): Record<string, unknown> {
     is_archived: row.is_archived,
     ticket_offering: {
       price: amount === null || !row.currency ? null : { amount, currency: row.currency },
-      max_quantity_per_order: row.visibility === "private" ? 1 : 8,
+      max_quantity_per_order: 1,
     },
   };
   if (!admin) return data;
@@ -379,6 +428,8 @@ function eventData(row: EventRow, admin: boolean): Record<string, unknown> {
     available_quantity: capacity === null ? null : Math.max(0, capacity - reserved),
     sales_opens_at: iso(row.sales_opens_at, row.sales_opens_offset_minutes),
     sales_closes_at: iso(row.sales_closes_at, row.sales_closes_offset_minutes),
+    tax_amount: safeNumber(row.tax_amount),
+    buyer_fees: row.buyer_fees,
     provider_mappings: [],
   });
   return data;
@@ -392,7 +443,7 @@ async function readAdminEvent(client: PoolClient, siteId: string, eventId: strin
        e.check_in_opens_offset_minutes, e.visibility, e.publication_status, e.is_canceled,
        e.is_archived, e.sales_paused, e.version, e.created_at, e.updated_at,
        e.created_actor_type, e.created_actor_reference, e.updated_actor_type,
-       e.updated_actor_reference, o.price_amount, o.currency, o.capacity,
+       e.updated_actor_reference, o.price_amount, o.currency, o.tax_amount, o.buyer_fees, o.capacity,
        o.reserved_quantity, o.sales_opens_at, o.sales_opens_offset_minutes,
        o.sales_closes_at, o.sales_closes_offset_minutes
      from hpos.events e
@@ -436,13 +487,14 @@ async function createDraft(client: PoolClient, site: AuthenticatedSite, input: E
   );
   await client.query(
     `insert into hpos.ticket_offerings (
-       id, event_id, site_id, price_amount, currency, capacity,
+       id, event_id, site_id, price_amount, currency, capacity, tax_amount, buyer_fees,
        sales_opens_at, sales_opens_offset_minutes, sales_closes_at,
        sales_closes_offset_minutes, sales_ever_configured
-     ) values ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8, $9::timestamptz, $10, $11)`,
+     ) values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::timestamptz, $10, $11::timestamptz, $12, $13)`,
     [
       offeringId, eventId, site.siteId, offering.price?.amount ?? null,
       offering.price?.currency ?? null, offering.capacity ?? null,
+      offering.tax_amount ?? null, offering.buyer_fees === undefined ? null : JSON.stringify(offering.buyer_fees),
       offering.sales_opens_at?.iso ?? null, offering.sales_opens_at?.offsetMinutes ?? null,
       offering.sales_closes_at?.iso ?? null, offering.sales_closes_at?.offsetMinutes ?? null,
       salesEverConfigured,
@@ -556,7 +608,7 @@ async function listEvents(request: Request, site: AuthenticatedSite, admin: bool
     e.check_in_opens_offset_minutes, e.visibility, e.publication_status,
     e.is_canceled, e.is_archived, e.sales_paused, e.version, e.created_at,
     e.updated_at, e.created_actor_type, e.created_actor_reference,
-    e.updated_actor_type, e.updated_actor_reference, o.price_amount, o.currency,
+    e.updated_actor_type, e.updated_actor_reference, o.price_amount, o.currency, o.tax_amount, o.buyer_fees,
     o.capacity, o.reserved_quantity, o.sales_opens_at, o.sales_opens_offset_minutes,
     o.sales_closes_at, o.sales_closes_offset_minutes,
     to_char(e.created_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as created_cursor_time,
@@ -582,7 +634,7 @@ async function readEvent(site: AuthenticatedSite, eventId: string, admin: boolea
     e.check_in_opens_offset_minutes, e.visibility, e.publication_status,
     e.is_canceled, e.is_archived, e.sales_paused, e.version, e.created_at,
     e.updated_at, e.created_actor_type, e.created_actor_reference,
-    e.updated_actor_type, e.updated_actor_reference, o.price_amount, o.currency,
+    e.updated_actor_type, e.updated_actor_reference, o.price_amount, o.currency, o.tax_amount, o.buyer_fees,
     o.capacity, o.reserved_quantity, o.sales_opens_at, o.sales_opens_offset_minutes,
     o.sales_closes_at, o.sales_closes_offset_minutes
     from hpos.events e join hpos.ticket_offerings o on o.id=e.ticket_offering_id
@@ -602,6 +654,9 @@ function validatePublish(row: EventRow): void {
   validateEventTimes(row);
   if (row.sales_opens_at && row.sales_closes_at && row.sales_closes_at <= row.sales_opens_at) operationError(422, "validation_failed", "The sales closing time must follow the opening time.", [{ field: "ticket_offering.sales_closes_at", code: "invalid_window", message: "Choose a closing time after sales open." }]);
   if (row.sales_closes_at && row.sales_closes_at > row.ends_at!) operationError(422, "validation_failed", "Sales must close no later than the Event end.", [{ field: "ticket_offering.sales_closes_at", code: "after_event_end", message: "Choose a closing time on or before ends_at." }]);
+  if (row.buyer_fees && row.currency && row.buyer_fees.some((fee) => fee.currency !== row.currency)) {
+    operationError(422, "validation_failed", "Buyer fees must use the Ticket currency.", [{ field: "ticket_offering.buyer_fees", code: "currency_mismatch", message: "Update each buyer fee to use the Ticket offering currency." }]);
+  }
 }
 
 function validateEventTimes(row: EventRow): void {
@@ -638,7 +693,7 @@ async function writeEventPatch(client: PoolClient, site: AuthenticatedSite, even
     e.check_in_opens_offset_minutes, e.visibility, e.publication_status,
     e.is_canceled, e.is_archived, e.sales_paused, e.version, e.created_at,
     e.updated_at, e.created_actor_type, e.created_actor_reference,
-    e.updated_actor_type, e.updated_actor_reference, o.price_amount, o.currency,
+    e.updated_actor_type, e.updated_actor_reference, o.price_amount, o.currency, o.tax_amount, o.buyer_fees,
     o.capacity, o.reserved_quantity, o.sales_opens_at, o.sales_opens_offset_minutes,
     o.sales_closes_at, o.sales_closes_offset_minutes, o.sales_ever_configured
     from hpos.events e join hpos.ticket_offerings o on o.id=e.ticket_offering_id
@@ -649,15 +704,6 @@ async function writeEventPatch(client: PoolClient, site: AuthenticatedSite, even
   if (current.version !== expected) operationError(409, "version_conflict", "The Event changed after you loaded it. Reload it before editing.");
   if (current.publication_status === "published" && Object.hasOwn(input, "visibility") && input.visibility !== current.visibility) operationError(409, "visibility_locked", "Event visibility cannot change after publication.");
   const offer = input.ticket_offering;
-  if (current.sales_ever_configured && offer) {
-    const clearing = [
-      Object.hasOwn(offer, "price") && offer.price === null ? "ticket_offering.price" : null,
-      Object.hasOwn(offer, "capacity") && offer.capacity === null ? "ticket_offering.capacity" : null,
-      Object.hasOwn(offer, "sales_opens_at") && offer.sales_opens_at === null ? "ticket_offering.sales_opens_at" : null,
-      Object.hasOwn(offer, "sales_closes_at") && offer.sales_closes_at === null ? "ticket_offering.sales_closes_at" : null,
-    ].filter((field): field is string => field !== null);
-    if (clearing.length) operationError(409, "sales_configuration_locked", "A complete sales configuration cannot be cleared after it has been saved.", clearing.map((field) => ({ field, code: "cannot_clear", message: "Set a replacement value instead of clearing this field." })));
-  }
   if (offer && Object.hasOwn(offer, "capacity")) {
     const committedQuantity = Number(current.reserved_quantity);
     if (committedQuantity > 0 && (offer.capacity === null || (typeof offer.capacity === "number" && offer.capacity < committedQuantity))) {
@@ -667,6 +713,17 @@ async function writeEventPatch(client: PoolClient, site: AuthenticatedSite, even
         message: "Choose a capacity that covers the current committed quantity.",
       }]);
     }
+  }
+  if (current.sales_ever_configured && offer) {
+    const clearing = [
+      Object.hasOwn(offer, "price") && offer.price === null ? "ticket_offering.price" : null,
+      Object.hasOwn(offer, "capacity") && offer.capacity === null ? "ticket_offering.capacity" : null,
+      Object.hasOwn(offer, "sales_opens_at") && offer.sales_opens_at === null ? "ticket_offering.sales_opens_at" : null,
+      Object.hasOwn(offer, "sales_closes_at") && offer.sales_closes_at === null ? "ticket_offering.sales_closes_at" : null,
+      Object.hasOwn(offer, "tax_amount") && offer.tax_amount === null && current.tax_amount !== null ? "ticket_offering.tax_amount" : null,
+      Object.hasOwn(offer, "buyer_fees") && offer.buyer_fees === null && current.buyer_fees !== null ? "ticket_offering.buyer_fees" : null,
+    ].filter((field): field is string => field !== null);
+    if (clearing.length) operationError(409, "sales_configuration_locked", "A complete sales configuration cannot be cleared after it has been saved.", clearing.map((field) => ({ field, code: "cannot_clear", message: "Set a replacement value instead of clearing this field." })));
   }
   const eventSets: string[] = [];
   const eventArgs: unknown[] = [site.siteId, eventId];
@@ -695,6 +752,8 @@ async function writeEventPatch(client: PoolClient, site: AuthenticatedSite, even
     if (Object.hasOwn(offer, "capacity")) add("capacity", offer.capacity);
     if (Object.hasOwn(offer, "sales_opens_at")) { add("sales_opens_at", offer.sales_opens_at?.iso ?? null); add("sales_opens_offset_minutes", offer.sales_opens_at?.offsetMinutes ?? null); }
     if (Object.hasOwn(offer, "sales_closes_at")) { add("sales_closes_at", offer.sales_closes_at?.iso ?? null); add("sales_closes_offset_minutes", offer.sales_closes_at?.offsetMinutes ?? null); }
+    if (Object.hasOwn(offer, "tax_amount")) add("tax_amount", offer.tax_amount);
+    if (Object.hasOwn(offer, "buyer_fees")) add("buyer_fees", offer.buyer_fees === null ? null : JSON.stringify(offer.buyer_fees));
     if (sets.length) await client.query(`update hpos.ticket_offerings set ${sets.join(", ")} where id=$1 and site_id=$2`, args);
   }
   const mergedResult = await client.query<EventRow>(`select e.id, e.site_id, e.ticket_offering_id, e.title, e.description,
@@ -703,7 +762,7 @@ async function writeEventPatch(client: PoolClient, site: AuthenticatedSite, even
     e.check_in_opens_offset_minutes, e.visibility, e.publication_status,
     e.is_canceled, e.is_archived, e.sales_paused, e.version, e.created_at,
     e.updated_at, e.created_actor_type, e.created_actor_reference,
-    e.updated_actor_type, e.updated_actor_reference, o.price_amount, o.currency,
+    e.updated_actor_type, e.updated_actor_reference, o.price_amount, o.currency, o.tax_amount, o.buyer_fees,
     o.capacity, o.reserved_quantity, o.sales_opens_at, o.sales_opens_offset_minutes,
     o.sales_closes_at, o.sales_closes_offset_minutes
     from hpos.events e join hpos.ticket_offerings o on o.id=e.ticket_offering_id
@@ -731,7 +790,7 @@ async function writeEventAction(client: PoolClient, site: AuthenticatedSite, eve
     e.check_in_opens_offset_minutes, e.visibility, e.publication_status,
     e.is_canceled, e.is_archived, e.sales_paused, e.version, e.created_at,
     e.updated_at, e.created_actor_type, e.created_actor_reference,
-    e.updated_actor_type, e.updated_actor_reference, o.price_amount, o.currency,
+    e.updated_actor_type, e.updated_actor_reference, o.price_amount, o.currency, o.tax_amount, o.buyer_fees,
     o.capacity, o.reserved_quantity, o.sales_opens_at, o.sales_opens_offset_minutes,
     o.sales_closes_at, o.sales_closes_offset_minutes
     from hpos.events e join hpos.ticket_offerings o on o.id=e.ticket_offering_id
@@ -757,6 +816,8 @@ async function writeEventAction(client: PoolClient, site: AuthenticatedSite, eve
   } else if (action === "resume_sales") {
     const configured = current.price_amount !== null
       && current.currency !== null
+      && current.tax_amount !== null
+      && current.buyer_fees !== null
       && current.capacity !== null
       && current.sales_opens_at !== null
       && current.sales_closes_at !== null;
@@ -768,7 +829,7 @@ async function writeEventAction(client: PoolClient, site: AuthenticatedSite, eve
       && Number(current.capacity) > Number(current.reserved_quantity);
     if (current.publication_status !== "published" || current.is_archived || current.is_canceled || !current.ends_at || current.ends_at.getTime() <= now
       || !current.sales_paused || !configured || !withinSalesWindow || !capacityAvailable) {
-      operationError(409, "invalid_state", "Sales can resume only while the published Event is within its configured sales window and has available capacity.");
+      operationError(409, "invalid_state", "Sales can resume only while the published Event has complete pricing, an open sales window, and available capacity.");
     }
     column = "sales_paused"; value = false;
   } else operationError(404, "not_found", "The Event action is unavailable.");

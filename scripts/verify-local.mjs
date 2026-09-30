@@ -213,13 +213,24 @@ async function verifyOperatorProvisioning(pool) {
   try {
     const organization = runOperator(["organization", "create", "--name", `Verification ${randomUUID()}`]);
     organizationIds.push(organization.organization_id);
-    assert(organization.fee_terms_status === "pending_validation", "Organization setup invented or omitted the fee-term validation state.");
+    assert(organization.fee_terms_status === "pending_validation" && organization.platform_fee_basis_points === null, "Organization setup silently configured or invented a platform fee.");
+    const configuredFee = runOperator(["organization", "pilot-fee-set", "--organization", organization.organization_id, "--rate-basis-points", "1000"]);
+    assert(configuredFee.fee_terms_status === "configured" && configuredFee.platform_fee_basis_points === 1000,
+      "The operator could not configure the 10% pilot fee at Organization level.");
+    const savedFee = await pool.query("select fee_terms_status, platform_fee_basis_points from hpos.organizations where id = $1", [organization.organization_id]);
+    assert(savedFee.rows[0]?.fee_terms_status === "configured" && savedFee.rows[0]?.platform_fee_basis_points === 1000,
+      "The configured Organization pilot fee did not persist in PostgreSQL.");
     runOperator(["organization", "fee-terms-pending", "--organization", organization.organization_id]);
+    const pendingFee = await pool.query("select fee_terms_status, platform_fee_basis_points from hpos.organizations where id = $1", [organization.organization_id]);
+    assert(pendingFee.rows[0]?.fee_terms_status === "pending_validation" && pendingFee.rows[0]?.platform_fee_basis_points === null,
+      "Returning fee terms to pending validation did not clear the usable fee rate.");
     const credentialRejected = runOperator(["payment-connection", "create", "--organization", organization.organization_id, "--provider", "square", "--environment", "test", "--account-reference", "sk_live_not_a_reference"], false);
     assert(credentialRejected.includes("non-secret reference alias"), "The operator accepted a provider credential instead of a reference alias.");
 
-    const otherOrganization = runOperator(["organization", "create", "--name", `Other organization ${randomUUID()}`]);
+    const otherOrganization = runOperator(["organization", "create", "--name", `Other organization ${randomUUID()}`, "--pilot-fee-rate-basis-points", "1000"]);
     organizationIds.push(otherOrganization.organization_id);
+    assert(otherOrganization.fee_terms_status === "configured" && otherOrganization.platform_fee_basis_points === 1000,
+      "Organization creation did not accept explicit 10% pilot-fee setup.");
     const site = runOperator(["site", "create", "--organization", organization.organization_id, "--name", "Operator verification Site"]);
     const connection = runOperator(["payment-connection", "create", "--organization", organization.organization_id, "--provider", "square", "--environment", "test", "--account-reference", `ref:test-account-${randomUUID()}`, "--location-reference", `ref:test-location-${randomUUID()}`]);
     const otherConnection = runOperator(["payment-connection", "create", "--organization", otherOrganization.organization_id, "--provider", "stripe", "--environment", "test", "--account-reference", `ref:test-account-${randomUUID()}`]);
