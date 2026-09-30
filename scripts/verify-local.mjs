@@ -246,6 +246,25 @@ async function verifyOperatorProvisioning(pool) {
     }
     assert(databaseRejectedCredential, "The PostgreSQL constraint accepted a credential-shaped account reference.");
     runOperator(["site", "assign-connection", "--site", site.site_id, "--connection", connection.connection_id]);
+    const eligibility = runOperator([
+      "payment-connection", "eligibility-record", "--connection", connection.connection_id,
+      "--account-status", "eligible", "--platform-fee-status", "ineligible",
+      "--evidence-reference", `ref:square-sandbox-check-${randomUUID()}`,
+    ]);
+    assert(eligibility.account_eligibility_status === "eligible"
+      && eligibility.platform_fee_eligibility_status === "ineligible"
+      && eligibility.eligibility_evidence_reference.startsWith("ref:"),
+      "The operator could not record separate account and Sandbox fee eligibility with a non-secret evidence reference.");
+    const eligibilityRow = await pool.query(
+      `select account_eligibility_status, platform_fee_eligibility_status,
+              eligibility_validated_at, eligibility_evidence_reference
+       from hpos.payment_connections where id = $1`,
+      [connection.connection_id],
+    );
+    assert(eligibilityRow.rows[0]?.account_eligibility_status === "eligible"
+      && eligibilityRow.rows[0]?.platform_fee_eligibility_status === "ineligible"
+      && eligibilityRow.rows[0]?.eligibility_validated_at instanceof Date,
+      "The payment connection eligibility record did not persist in PostgreSQL.");
     const invalidAssignment = runOperator(["site", "assign-connection", "--site", site.site_id, "--connection", otherConnection.connection_id], false);
     assert(invalidAssignment.includes("same organization"), "The operator did not explain why a cross-organization connection assignment was rejected.");
     let connectionHistoryProtected = false;
@@ -263,6 +282,9 @@ async function verifyOperatorProvisioning(pool) {
     assert(originalRead.status === 200, "An issued Site key could not read its payment configuration through HTTP.");
     const originalData = await originalRead.json();
     assert(originalData.data?.active_connection?.connection_id === connection.connection_id, "The Site API returned the wrong assigned payment connection.");
+    assert(originalData.data?.active_connection?.platform_fee_eligibility_status === "ineligible"
+      && originalData.data?.active_connection?.eligibility_evidence_reference === eligibility.eligibility_evidence_reference,
+      "The Site API omitted non-secret eligibility details needed for checkout validation.");
 
     const rotated = runOperator(["site-key", "rotate", "--site", site.site_id]);
     assert(rotated.site_api_key !== original.site_api_key, "Key rotation reused the previous secret.");

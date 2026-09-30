@@ -136,6 +136,7 @@ Paths are relative to the base URL. `{...}` identifies a path parameter. All end
 | --- | --- |
 | `GET /v1/admin/payment-configuration` | Read the active connection for new Orders. |
 | `GET /v1/admin/payment-connections/{connection_id}` | Read assigned/historical non-secret connection metadata. |
+| `GET /v1/admin/payment-attempts/{attempt_id}` | Read one Site-owned attempt without caching. |
 | `GET /v1/admin/payment-attempts` | List attempts, including those requiring verification. |
 | `POST /v1/admin/orders/{order_id}/payment-attempts` | Record an attempt before calling the provider. |
 | `POST /v1/admin/payment-attempts/{attempt_id}/checkout-reference` | Register provider checkout before the buyer opens it. |
@@ -561,6 +562,10 @@ PublicTicket uses its public/common fields above. AdminTicket uses admin/common 
 | `Connection.environment` | enum | test or live. |
 | `Connection.account_reference` | string | Non-secret provider account reference. |
 | `Connection.location_reference` | string? | Non-secret location where applicable. |
+| `Connection.account_eligibility_status` | enum | pending_validation, eligible, or ineligible, based on a Site/operator verification record. |
+| `Connection.platform_fee_eligibility_status` | enum | pending_validation, eligible, or ineligible; test connections may omit application fees. |
+| `Connection.eligibility_validated_at` | timestamp? | Time of the last operator-recorded eligibility check. |
+| `Connection.eligibility_evidence_reference` | string? | Non-secret `ref:` evidence alias. |
 | `PaymentAttempt.attempt_id` | string | Attempt ID. |
 | `PaymentAttempt.order_id` | string | Owning Order. |
 | `PaymentAttempt.connection` | Connection | Frozen assigned provider connection. |
@@ -569,8 +574,9 @@ PublicTicket uses its public/common fields above. AdminTicket uses admin/common 
 | `PaymentAttempt.provider_mapping` | ProviderMapping? | Mapping snapshot or null. |
 | `PaymentAttempt.provider_checkout_reference` | string? | Registered checkout reference. |
 | `PaymentAttempt.provider_payment_reference` | string? | Verified provider payment reference. |
-| `PaymentAttempt.last_outcome` | enum? | processing, paid, failed, canceled, unknown; initially null. |
+| `PaymentAttempt.last_outcome` | enum? | not_started, processing, paid, failed, canceled, unknown; initially null. |
 | `PaymentAttempt.provider_can_take_payment` | boolean? | true/false/null; null is unresolved. |
+| `PaymentAttempt.status` | enum | creating, open, closed, or requires_verification. |
 | `PaymentAttempt.version` | integer | Guarded attempt version. |
 | `PaymentAttempt.created_at` | timestamp | Creation instant. |
 | `PaymentAttempt.updated_at` | timestamp | Latest update instant. |

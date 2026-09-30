@@ -90,6 +90,7 @@ const help = `HP-OS operator setup (database changes are direct operator actions
   pnpm operator organization pilot-fee-set --organization <organization-id> --rate-basis-points 1000
   pnpm operator site create --organization <organization-id> --name "LMNL main"
   pnpm operator payment-connection create --organization <organization-id> --provider square --environment test --account-reference ref:venue-square [--location-reference ref:main-hall]
+  pnpm operator payment-connection eligibility-record --connection <connection-id> --account-status eligible --platform-fee-status eligible --evidence-reference ref:square-validation-run
   pnpm operator site assign-connection --site <site-id> --connection <connection-id>
   pnpm operator site request-limit --site <site-id> --per-minute 1200
   pnpm operator organization fee-terms-pending --organization <organization-id>
@@ -141,6 +142,48 @@ try {
       [organizationId, provider, environment, accountReference, locationReference],
     );
     console.log(JSON.stringify({ connection_id: result.rows[0].id, organization_id: organizationId, provider, environment, account_eligibility_status: "pending_validation" }));
+  } else if (group === "payment-connection" && action === "eligibility-record") {
+    const connectionId = uuid(required(options, "connection"), "connection");
+    const accountStatus = required(options, "account-status");
+    const platformFeeStatus = required(options, "platform-fee-status");
+    const allowedStatuses = new Set(["pending_validation", "eligible", "ineligible"]);
+    if (!allowedStatuses.has(accountStatus)) fail("--account-status must be pending_validation, eligible, or ineligible.");
+    if (!allowedStatuses.has(platformFeeStatus)) fail("--platform-fee-status must be pending_validation, eligible, or ineligible.");
+    const pending = accountStatus === "pending_validation" && platformFeeStatus === "pending_validation";
+    if ((accountStatus === "pending_validation") !== (platformFeeStatus === "pending_validation")) {
+      fail("Account and platform-fee status must both be pending_validation or both be a verified result.");
+    }
+    const evidenceReference = pending ? null : referenceAlias(required(options, "evidence-reference"), "evidence-reference");
+    const result = await pool.query<{
+      id: string;
+      provider: string;
+      environment: string;
+      account_eligibility_status: string;
+      platform_fee_eligibility_status: string;
+      eligibility_validated_at: Date | null;
+      eligibility_evidence_reference: string | null;
+    }>(
+      `update hpos.payment_connections
+       set account_eligibility_status = $2,
+           platform_fee_eligibility_status = $3,
+           eligibility_validated_at = case when $2 = 'pending_validation' then null else clock_timestamp() end,
+           eligibility_evidence_reference = $4
+       where id = $1
+       returning id, provider, environment, account_eligibility_status,
+         platform_fee_eligibility_status, eligibility_validated_at, eligibility_evidence_reference`,
+      [connectionId, accountStatus, platformFeeStatus, evidenceReference],
+    );
+    if (result.rowCount !== 1) fail("The payment connection does not exist.");
+    const connection = result.rows[0];
+    console.log(JSON.stringify({
+      connection_id: connection.id,
+      provider: connection.provider,
+      environment: connection.environment,
+      account_eligibility_status: connection.account_eligibility_status,
+      platform_fee_eligibility_status: connection.platform_fee_eligibility_status,
+      eligibility_validated_at: connection.eligibility_validated_at?.toISOString() ?? null,
+      eligibility_evidence_reference: connection.eligibility_evidence_reference,
+    }));
   } else if (group === "site" && action === "assign-connection") {
     const siteId = uuid(required(options, "site"), "site");
     const connectionId = uuid(required(options, "connection"), "connection");

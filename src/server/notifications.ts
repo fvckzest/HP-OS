@@ -701,7 +701,7 @@ export async function runBoundedProcessing(trigger: ProcessingTrigger): Promise<
          and reservation.awaiting_provider_verification = false
          and reservation.expires_at <= clock_timestamp()
          and order_row.checkout_status = 'active'
-         and order_row.payment_status = 'unpaid'
+         and order_row.payment_status in ('unpaid', 'failed')
        order by reservation.expires_at, reservation.id
        limit $1
        for update of reservation, order_row skip locked`,
@@ -740,7 +740,7 @@ export async function runBoundedProcessing(trigger: ProcessingTrigger): Promise<
       await client.query(
         `update hpos.orders
          set checkout_status = 'expired', version = version + 1, updated_at = clock_timestamp()
-         where id = any($1::uuid[]) and checkout_status = 'active' and payment_status = 'unpaid'`,
+         where id = any($1::uuid[]) and checkout_status = 'active' and payment_status in ('unpaid', 'failed')`,
         [orderIds],
       );
       releasedReservations = released.rowCount;
@@ -757,7 +757,7 @@ export async function runBoundedProcessing(trigger: ProcessingTrigger): Promise<
          and reservation.awaiting_provider_verification = false
          and reservation.expires_at <= clock_timestamp()
          and order_row.checkout_status = 'active'
-         and order_row.payment_status = 'unpaid'
+         and order_row.payment_status in ('unpaid', 'failed')
        limit 1`,
     );
     const finishedAt = (await client.query<{ finished_at: Date }>(`select clock_timestamp() as finished_at`)).rows[0].finished_at;

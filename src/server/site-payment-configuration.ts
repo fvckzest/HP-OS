@@ -6,6 +6,10 @@ interface ConnectionRow {
   environment: "test" | "live";
   account_reference: string;
   location_reference: string | null;
+  account_eligibility_status: "pending_validation" | "eligible" | "ineligible";
+  platform_fee_eligibility_status: "pending_validation" | "eligible" | "ineligible";
+  eligibility_validated_at: Date | null;
+  eligibility_evidence_reference: string | null;
 }
 
 export interface PaymentConnectionData {
@@ -14,6 +18,10 @@ export interface PaymentConnectionData {
   environment: "test" | "live";
   account_reference: string;
   location_reference: string | null;
+  account_eligibility_status: "pending_validation" | "eligible" | "ineligible";
+  platform_fee_eligibility_status: "pending_validation" | "eligible" | "ineligible";
+  eligibility_validated_at: string | null;
+  eligibility_evidence_reference: string | null;
 }
 
 function connectionData(row: ConnectionRow): PaymentConnectionData {
@@ -23,12 +31,18 @@ function connectionData(row: ConnectionRow): PaymentConnectionData {
     environment: row.environment,
     account_reference: row.account_reference,
     location_reference: row.location_reference,
+    account_eligibility_status: row.account_eligibility_status,
+    platform_fee_eligibility_status: row.platform_fee_eligibility_status,
+    eligibility_validated_at: row.eligibility_validated_at?.toISOString() ?? null,
+    eligibility_evidence_reference: row.eligibility_evidence_reference,
   };
 }
 
 const paymentConnectionSelect = `
   select connection.id, connection.provider, connection.environment,
-         connection.account_reference, connection.location_reference
+         connection.account_reference, connection.location_reference,
+         connection.account_eligibility_status, connection.platform_fee_eligibility_status,
+         connection.eligibility_validated_at, connection.eligibility_evidence_reference
   from hpos.site_payment_connection_assignments assignment
   join hpos.payment_connections connection on connection.id = assignment.connection_id
   where assignment.site_id = $1
