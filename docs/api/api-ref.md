@@ -282,6 +282,7 @@ Use `error.code` for program logic; use `error.message` for explanation. Retry n
 | `claim_conflict` | Claim expired or does not own the job. |
 | `sales_not_configured` | Required sales settings missing. |
 | `sales_configuration_locked` | A previously complete sales configuration cannot be cleared. |
+| `capacity_below_committed` | Capacity cannot be reduced below held Reservations or issued Tickets. |
 | `sales_not_open` | Sales opening time has not arrived. |
 | `sales_paused` | New checkouts manually stopped. |
 | `sales_closed` | Sales window/Event ended. |
@@ -323,7 +324,7 @@ Use `error.code` for program logic; use `error.message` for explanation. Retry n
 | Approval access | One paid Ticket; new checkout blocked when approval revoked or sales close. |
 | Admission QR | Stable across resends, recovery, and delivery-email corrections. |
 | Notification lease | 5 minutes; renewable. |
-| Public quantity | 1–8 Tickets per Order. |
+| Public quantity | Current checkout supports exactly 1 Ticket per Order; broader product limit remains 1–8. |
 | Private quantity | Exactly 1 Ticket per Order. |
 | List/claim size | Default 50; maximum 100. |
 | JSON body | Maximum 64 KiB. |
@@ -420,7 +421,9 @@ Text limits: name/title 200 characters; description 20,000; venue address 1,000;
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `price` | Money? | Base Ticket price; positive when set. |
-| `max_quantity_per_order` | integer | 8 public / 1 private. |
+| `max_quantity_per_order` | integer | Current checkout limit: 1 Ticket per Order. |
+| `tax_amount` | integer?; admin | Explicit tax per Ticket in minor units; null means unknown, zero means confirmed none. |
+| `buyer_fees` | BuyerFee[]?; admin | Explicit buyer-fee list; null means unknown, [] means confirmed none. |
 | `offering_id` | string; admin | Sale-option ID. |
 | `capacity` | integer?; admin | Configured nonnegative maximum. |
 | `reserved_quantity` | integer; admin | Capacity held by active/unresolved Reservations. |
@@ -445,9 +448,11 @@ Text limits: name/title 200 characters; description 20,000; venue address 1,000;
 | `buyer_fees` | BuyerFee[] | Buyer-facing fees; [] when none. |
 | `tax_total` | Money | Buyer-facing tax total. |
 | `total` | Money | Subtotal plus buyer fees plus tax. |
+| `platform_fee` | Money | Organization-configured platform fee from the pre-tax Ticket subtotal; excluded from buyer total. |
+| `platform_fee_basis_points` | integer | Organization rate; 1,000 basis points is the 10% pilot rate. |
 | `expires_at` | timestamp | Quote expiry; 10 minutes. |
 
-`Pricing` retains unit_price, subtotal, buyer_fees, tax_total, and total from the accepted quote. Processing/platform deductions are reported separately.
+`Pricing` retains unit_price, subtotal, buyer_fees, tax_total, total, platform_fee, and platform_fee_basis_points from the accepted quote. Organization fee terms are explicitly configured by the HP-OS operator during setup; there is no global default. Processing/platform deductions are reported separately from the buyer total.
 
 ### Order
 
@@ -758,7 +763,7 @@ Each row lists operation-specific body fields/result data. Apply common headers 
 | Set mapping | `resource_type, resource_reference, verified_at, expected_version` | `AdminEvent; 200` |
 | Delete mapping | `expected_version` | `AdminEvent; 200` |
 | Quote | `quantity` | `Quote; 201` |
-| Create Order | `quote_id, buyer {name,email}; access_request_token only for private` | `PublicOrder + order_token; 201` |
+| Create Order | Current public path: `quote_id, buyer {name,email}` | One unpaid public Order + Reservation + order_token; 201 |
 | Submit Access Request | `name, email` | `{received:true}; 201` |
 | Edit Access Request | `Changed name/email + expected_version` | `AdminAccessRequest; 200` |
 | Request decision | `expected_version` | `AdminAccessRequest; 200` |

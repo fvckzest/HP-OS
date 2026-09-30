@@ -159,7 +159,7 @@ export async function withApiIdempotency(
     if (error instanceof ApiOperationError) {
       return apiFailure(error.status, error.code, error.message, {
         details: error.details,
-        retryAfter: error.code === "request_in_progress" ? 1 : undefined,
+        retryAfter: error.code === "request_in_progress" || error.status === 503 ? 1 : undefined,
       });
     }
     if (isPgCode(error, "55P03")) {

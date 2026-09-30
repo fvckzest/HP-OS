@@ -41,7 +41,7 @@ while (!stopping.signal.aborted) {
       console.error(`${startedAt.toISOString()} HTTP ${response.status}: ${body.slice(0, 500)}`);
     } else {
       const result = JSON.parse(body).data;
-      console.log(`${startedAt.toISOString()} recovered ${result.recovered_jobs} expired job(s); more=${result.has_more}.`);
+      console.log(`${startedAt.toISOString()} recovered ${result.recovered_jobs} expired job(s) and released ${result.released_reservations} expired Reservation(s); more=${result.has_more}.`);
     }
   } catch (error) {
     if (stopping.signal.aborted) break;
