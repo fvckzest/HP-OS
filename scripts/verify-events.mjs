@@ -380,7 +380,13 @@ async function verifyPublicSingleTicketCheckout(site) {
   const expiredQuote = await api(site, "/v1/public/events/" + changed.event_id + "/quotes", {
     method: "POST", idempotencyKey: randomUUID(), body: quoteBody,
   });
-  await pool.query("update hpos.public_quotes set expires_at = clock_timestamp() - interval '1 second' where id = $1", [expiredQuote.data.data.quote_id]);
+  await pool.query(
+    `update hpos.public_quotes
+     set created_at = clock_timestamp() - interval '11 minutes',
+         expires_at = clock_timestamp() - interval '1 second'
+     where id = $1`,
+    [expiredQuote.data.data.quote_id],
+  );
   const expiredOrder = await api(site, "/v1/public/orders", {
     method: "POST", idempotencyKey: randomUUID(),
     body: { quote_id: expiredQuote.data.data.quote_id, buyer: { name: "Ada Lovelace", email: "ada3@example.test" } },
@@ -476,6 +482,150 @@ async function verifyPublicSingleTicketCheckout(site) {
   assert(expiredHold.rows[0]?.reserved_quantity === "0" && expiredHold.rows[0]?.status === "released"
     && expiredHold.rows[0]?.checkout_status === "expired",
     "Expired prepayment cleanup did not release capacity and expire the Order atomically.");
+}
+
+async function verifyReservationBackedSalesControls(site) {
+  const now = Date.now();
+  const event = await createPublishedEvent(site, {
+    title: "Issue 27 Reservation-Backed Controls",
+    startsAt: new Date(now + 60 * 60_000).toISOString(),
+    endsAt: new Date(now + 2 * 60 * 60_000).toISOString(),
+    timeZone: "UTC",
+    ticketOffering: {
+      price: { amount: 2505, currency: "USD" },
+      capacity: 2,
+      tax_amount: 200,
+      buyer_fees: [{ code: "service", label: "Service fee", amount: 100, currency: "USD" }],
+    },
+  });
+  assert(event.sales_status === "open", "The Reservation-backed control Event did not begin open.");
+
+  async function createHeldOrder(name, email) {
+    const quote = await api(site, "/v1/public/events/" + event.event_id + "/quotes", {
+      method: "POST",
+      idempotencyKey: randomUUID(),
+      body: { quantity: 1 },
+    });
+    assert(quote.status === 201, "A Reservation-backed Event did not produce a quote.");
+    const createdOrder = await api(site, "/v1/public/orders", {
+      method: "POST",
+      idempotencyKey: randomUUID(),
+      body: {
+        quote_id: quote.data.data.quote_id,
+        buyer: { name, email },
+      },
+    });
+    const pricing = createdOrder.data?.data?.pricing;
+    assert(createdOrder.status === 201 && createdOrder.data.data.reservation.status === "held"
+      && pricing?.unit_price?.amount === 2505
+      && pricing?.tax_total?.amount === 200
+      && pricing?.buyer_fees?.[0]?.amount === 100
+      && pricing?.total?.amount === 2805
+      && pricing?.platform_fee?.amount === 251
+      && pricing?.platform_fee_basis_points === 1000,
+      "The checkout did not create a held Reservation with the quoted purchase terms.");
+    return createdOrder.data.data;
+  }
+
+  const firstOrder = await createHeldOrder("Issue 27 Buyer One", "issue27-one@example.test");
+  const secondOrder = await createHeldOrder("Issue 27 Buyer Two", "issue27-two@example.test");
+  const soldOut = await api(site, "/v1/public/events/" + event.event_id);
+  const soldOutAdmin = await api(site, "/v1/admin/events/" + event.event_id);
+  assert(soldOut.status === 200 && soldOut.data.data.sales_status === "sold_out"
+    && soldOutAdmin.status === 200 && soldOutAdmin.data.data.ticket_offering.available_quantity === 0,
+    "Two actual Reservations did not consume the Event's available capacity.");
+
+  const belowReservations = await api(site, "/v1/admin/events/" + event.event_id, {
+    method: "PATCH",
+    idempotencyKey: randomUUID(),
+    body: {
+      actor: { type: "user", reference: "test:issue-27" },
+      expected_version: event.version,
+      ticket_offering: { capacity: 1 },
+    },
+  });
+  assert(belowReservations.status === 422 && belowReservations.data.error.code === "validation_failed"
+    && belowReservations.data.error.details?.[0]?.code === "below_committed_capacity",
+    "The capacity floor did not count actual held Reservations.");
+
+  const priceEdit = await api(site, "/v1/admin/events/" + event.event_id, {
+    method: "PATCH",
+    idempotencyKey: randomUUID(),
+    body: {
+      actor: { type: "user", reference: "test:issue-27" },
+      expected_version: event.version,
+      ticket_offering: { price: { amount: 3000, currency: "USD" } },
+    },
+  });
+  assert(priceEdit.status === 200
+    && priceEdit.data.data.ticket_offering.price.amount === 3000
+    && priceEdit.data.data.ticket_offering.capacity === 2
+    && priceEdit.data.data.ticket_offering.tax_amount === 200
+    && priceEdit.data.data.ticket_offering.buyer_fees[0]?.amount === 100
+    && priceEdit.data.data.ticket_offering.sales_opens_at === event.ticket_offering.sales_opens_at
+    && priceEdit.data.data.ticket_offering.sales_closes_at === event.ticket_offering.sales_closes_at,
+    "A partial price edit changed omitted Event or offering terms.");
+
+  async function assertAcceptedPurchaseTerms(order) {
+    const result = await pool.query(
+      "select accepted_quote from hpos.orders where id = $1",
+      [order.order_id],
+    );
+    const terms = result.rows[0]?.accepted_quote;
+    assert(terms?.quantity === 1
+      && terms?.unit_price?.amount === 2505 && terms?.unit_price?.currency === "USD"
+      && terms?.subtotal?.amount === 2505 && terms?.subtotal?.currency === "USD"
+      && terms?.buyer_fees?.length === 1
+      && terms?.buyer_fees?.[0]?.code === "service"
+      && terms?.buyer_fees?.[0]?.amount === 100
+      && terms?.tax_total?.amount === 200 && terms?.tax_total?.currency === "USD"
+      && terms?.total?.amount === 2805 && terms?.total?.currency === "USD"
+      && terms?.platform_fee?.amount === 251 && terms?.platform_fee?.currency === "USD"
+      && terms?.platform_fee_basis_points === 1000,
+      "A later Event edit changed the stored accepted purchase terms for an existing Order.");
+  }
+
+  await assertAcceptedPurchaseTerms(firstOrder);
+  await assertAcceptedPurchaseTerms(secondOrder);
+
+  await pool.query(
+    "update hpos.reservations set expires_at = clock_timestamp() - interval '1 second' where order_id = $1",
+    [firstOrder.order_id],
+  );
+  await pool.query(
+    "update hpos.orders set checkout_expires_at = clock_timestamp() - interval '1 second' where id = $1",
+    [firstOrder.order_id],
+  );
+  const processing = await api(site, "/api/cron/process");
+  assert(processing.status === 200 && processing.data.data.released_reservations === 1,
+    "The bounded processor did not release the actual expired Reservation.");
+  const availableAgain = await api(site, "/v1/public/events/" + event.event_id);
+  const availableAgainAdmin = await api(site, "/v1/admin/events/" + event.event_id);
+  assert(availableAgain.status === 200 && availableAgain.data.data.sales_status === "open"
+    && availableAgainAdmin.status === 200 && availableAgainAdmin.data.data.ticket_offering.available_quantity === 1,
+    "Releasing an actual Reservation did not restore sales availability.");
+
+  const capacityAtRemainingHold = await api(site, "/v1/admin/events/" + event.event_id, {
+    method: "PATCH",
+    idempotencyKey: randomUUID(),
+    body: {
+      actor: { type: "user", reference: "test:issue-27" },
+      expected_version: priceEdit.data.data.version,
+      ticket_offering: { capacity: 1 },
+    },
+  });
+  assert(capacityAtRemainingHold.status === 200
+    && capacityAtRemainingHold.data.data.ticket_offering.capacity === 1
+    && capacityAtRemainingHold.data.data.ticket_offering.available_quantity === 0,
+    "Capacity could not be reduced to the quantity held by the remaining Reservation.");
+
+  const soldOutAgain = await api(site, "/v1/public/events/" + event.event_id);
+  const soldOutAgainAdmin = await api(site, "/v1/admin/events/" + event.event_id);
+  assert(soldOutAgain.status === 200 && soldOutAgain.data.data.sales_status === "sold_out"
+    && soldOutAgainAdmin.status === 200 && soldOutAgainAdmin.data.data.ticket_offering.available_quantity === 0,
+    "The remaining actual Reservation did not keep the reduced-capacity Event sold out.");
+  await assertAcceptedPurchaseTerms(firstOrder);
+  await assertAcceptedPurchaseTerms(secondOrder);
 }
 
 function isoUtc(offsetMs) {
@@ -874,12 +1024,13 @@ async function main() {
     await verifyEventLifecycleAndDiscovery(site);
     await verifySalesControlsAndCapacity(site);
     await verifyPublicSingleTicketCheckout(site);
+    await verifyReservationBackedSalesControls(site);
   } finally {
     await cleanup();
     await stopApp(app);
     await pool.end();
   }
-  console.log("Local Event and checkout API verification passed: sales controls, Organization pilot fees, explicit pricing, single-Ticket quotes, idempotent unpaid Orders, Reservation expiry, and concurrent last-capacity protection.");
+  console.log("Local Event and checkout API verification passed: sales controls with actual Reservations, preserved purchase terms, capacity release, Organization pilot fees, explicit pricing, single-Ticket quotes, idempotent unpaid Orders, Reservation expiry, and concurrent last-capacity protection.");
 }
 
 main().catch((error) => {
