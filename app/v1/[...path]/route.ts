@@ -4,6 +4,8 @@ import { isPaymentConnectionId, readSitePaymentConfiguration, readSitePaymentCon
 import { handleNotificationGet, handleNotificationPost } from "@/src/server/notifications";
 import { handleCheckoutPost } from "@/src/server/checkout";
 import { handlePaymentAttemptGet, handlePaymentAttemptPost } from "@/src/server/payment-attempts";
+import { handleAdminOrderPaymentStatusGet, handleBuyerOrderGet, handleBuyerTicketGet } from "@/src/server/ticket-issuance";
+import { handlePaymentReportPost } from "@/src/server/payment-reports";
 import { handleEventActionPost, handleEventGet, handleEventPatch, handleEventPost } from "@/src/server/events";
 
 export const dynamic = "force-dynamic";
@@ -18,6 +20,15 @@ export async function GET(request: Request, context: RouteContext) {
   const { path } = await context.params;
 
   try {
+    const buyerOrderResponse = await handleBuyerOrderGet(authentication.site, path);
+    if (buyerOrderResponse) return buyerOrderResponse;
+
+    const buyerTicketResponse = await handleBuyerTicketGet(authentication.site, path);
+    if (buyerTicketResponse) return buyerTicketResponse;
+
+    const orderStatusResponse = await handleAdminOrderPaymentStatusGet(authentication.site, path);
+    if (orderStatusResponse) return orderStatusResponse;
+
     const eventResponse = await handleEventGet(request, authentication.site, path);
     if (eventResponse) return eventResponse;
 
@@ -53,6 +64,9 @@ export async function POST(request: Request, context: RouteContext) {
   const { path } = await context.params;
 
   try {
+    const paymentReportResponse = await handlePaymentReportPost(request, authentication.site, path);
+    if (paymentReportResponse) return paymentReportResponse;
+
     const paymentAttemptResponse = await handlePaymentAttemptPost(request, authentication.site, path);
     if (paymentAttemptResponse) return paymentAttemptResponse;
 
