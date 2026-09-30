@@ -114,6 +114,7 @@ Paths are relative to the base URL. `{...}` identifies a path parameter. All end
 | --- | --- |
 | `GET /v1/admin/events/{event_id}/orders` | List Event Orders. |
 | `GET /v1/admin/orders/{order_id}` | Read one operational Order. |
+| `GET /v1/admin/orders/{order_id}/payment-status` | Read current payment, issuance, delivery, and refund status without access tokens. |
 | `GET /v1/admin/events/{event_id}/tickets` | List Event Tickets without page tokens or QR payloads. |
 | `GET /v1/admin/events/{event_id}/totals` | Read consistent money, fee, and Ticket totals. |
 | `POST /v1/admin/events/{event_id}/ticket-lookup` | Find Orders by reference or current delivery email; read-only. |
@@ -573,7 +574,7 @@ PublicTicket uses its public/common fields above. AdminTicket uses admin/common 
 | `PaymentAttempt.platform_fee` | Money | Expected platform deduction; not actual settlement proof. |
 | `PaymentAttempt.provider_mapping` | ProviderMapping? | Mapping snapshot or null. |
 | `PaymentAttempt.provider_checkout_reference` | string? | Registered checkout reference. |
-| `PaymentAttempt.provider_payment_reference` | string? | Verified provider payment reference. |
+| `PaymentAttempt.provider_payment_reference` | string? | Verified provider payment reference, unique per payment connection. |
 | `PaymentAttempt.last_outcome` | enum? | not_started, processing, paid, failed, canceled, unknown; initially null. |
 | `PaymentAttempt.provider_can_take_payment` | boolean? | true/false/null; null is unresolved. |
 | `PaymentAttempt.status` | enum | creating, open, closed, or requires_verification. |
@@ -589,9 +590,9 @@ Verification list responses also expose Order deadlines and verification-require
 | --- | --- | --- |
 | `attempt_id` | string | Recorded payment attempt; may be supplied in the path. |
 | `connection_id` | string | Connection used for this payment/refund. |
-| `source_reference` | string | Stable identity for a verified provider event/observation. |
+| `source_reference` | string | Stable identity for a verified provider event/observation; reusing it on another attempt is a conflict. |
 | `provider_checkout_reference` | string | Provider checkout identity. |
-| `provider_payment_reference` | string? | Provider payment identity; required for applicable paid/refund evidence. |
+| `provider_payment_reference` | string? | Provider payment identity; unique to one attempt per connection and required for paid evidence. |
 | `provider_refund_reference` | string | Provider refund identity. |
 | `outcome` | enum | Payment: processing/paid/failed/canceled/unknown; refund: processing/completed/failed/unknown. |
 | `observed_at` | timestamp | Provider observation time. |

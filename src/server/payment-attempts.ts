@@ -27,7 +27,7 @@ interface ConnectionRow extends QueryResultRow {
   eligibility_evidence_reference: string | null;
 }
 
-interface AttemptRow extends QueryResultRow {
+export interface AttemptRow extends QueryResultRow {
   id: string;
   site_id: string;
   order_id: string;
@@ -100,7 +100,7 @@ function money(amount: string | number, currency: string) {
   return { amount: Number(amount), currency };
 }
 
-function attemptData(row: AttemptRow) {
+export function paymentAttemptData(row: AttemptRow) {
   return {
     attempt_id: row.id,
     order_id: row.order_id,
@@ -245,7 +245,7 @@ async function createAttempt(client: PoolClient, site: AuthenticatedSite, orderI
   );
   if (updatedOrder.rowCount !== 1) reject(409, "payment_attempt_in_progress", "The Order changed while the payment attempt was being created.");
 
-  return { status: 201, data: attemptData(inserted.rows[0]) };
+  return { status: 201, data: paymentAttemptData(inserted.rows[0]) };
 }
 
 async function lockAttempt(client: PoolClient, siteId: string, attemptId: string): Promise<AttemptRow> {
@@ -334,7 +334,7 @@ async function registerCheckoutReference(
      returning *`,
     [attemptId, site.siteId, checkoutReference],
   );
-  return { status: 200, data: attemptData(updated.rows[0]) };
+  return { status: 200, data: paymentAttemptData(updated.rows[0]) };
 }
 
 async function releaseReservation(client: PoolClient, attempt: AttemptRow): Promise<void> {
@@ -435,7 +435,7 @@ async function reportSetupFailure(
     reject(409, "provider_reference_missing", "A payment outcome requires a recorded provider checkout reference.");
   }
   const updated = await closeAttempt(client, site.siteId, attempt, body.payment_outcome, true, "ended");
-  return { status: 200, data: attemptData(updated) };
+  return { status: 200, data: paymentAttemptData(updated) };
 }
 
 async function reportClosure(
@@ -495,7 +495,7 @@ async function reportClosure(
       || report.payment_outcome !== body.payment_outcome) {
       reject(409, "payment_report_conflict", "This provider observation reference was already used for a different closure report.");
     }
-    return { status: 200, data: attemptData(attempt) };
+    return { status: 200, data: paymentAttemptData(attempt) };
   }
 
   await client.query(
@@ -527,9 +527,9 @@ async function reportClosure(
       `select * from hpos.payment_attempts where id = $1 and site_id = $2`,
       [attempt.id, site.siteId],
     );
-    return { status: 200, data: attemptData(reloaded.rows[0]) };
+    return { status: 200, data: paymentAttemptData(reloaded.rows[0]) };
   }
-  return { status: 200, data: attemptData(updated) };
+  return { status: 200, data: paymentAttemptData(updated) };
 }
 
 export async function handlePaymentAttemptPost(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
@@ -581,7 +581,7 @@ export async function handlePaymentAttemptGet(site: AuthenticatedSite, path: str
   );
   const attempt = result.rows[0];
   if (!attempt) return apiFailure(404, "not_found", "The payment attempt is not available to this Site.");
-  return Response.json({ data: attemptData(attempt), request_id: randomUUID() }, {
+  return Response.json({ data: paymentAttemptData(attempt), request_id: randomUUID() }, {
     headers: { "Cache-Control": "no-store" },
   });
 }

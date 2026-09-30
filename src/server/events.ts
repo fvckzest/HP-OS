@@ -435,6 +435,11 @@ function eventData(row: EventRow, admin: boolean): Record<string, unknown> {
   return data;
 }
 
+/** Public Event details reused by buyer Order and Ticket reads. */
+export function publicEventData(row: EventRow): Record<string, unknown> {
+  return eventData(row, false);
+}
+
 async function readAdminEvent(client: PoolClient, siteId: string, eventId: string): Promise<Record<string, unknown> | null> {
   const result = await client.query<EventRow>(
     `select e.id, e.site_id, e.ticket_offering_id, e.title, e.description,

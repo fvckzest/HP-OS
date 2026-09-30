@@ -153,7 +153,7 @@ export async function withApiIdempotency(
       [site.siteId, key, result.status, JSON.stringify(result.data)],
     );
     await client.query("commit");
-    return apiSuccess(result.data, result.status);
+    return responseFor(result.status, result.data);
   } catch (error) {
     await client.query("rollback").catch(() => undefined);
     if (error instanceof ApiOperationError) {
