@@ -155,7 +155,7 @@ async function verifyPreconfiguredDraftCannotClearSales(site) {
   assert(cleared.status === 409 && cleared.data.error.code === "sales_configuration_locked", "A complete sales configuration was cleared after draft creation.");
 }
 
-async function createPublishedEvent(site, { title, startsAt, endsAt }) {
+async function createPublishedEvent(site, { title, startsAt, endsAt, timeZone = "America/Los_Angeles" }) {
   const created = await api(site, "/v1/admin/events", {
     method: "POST",
     idempotencyKey: randomUUID(),
@@ -174,7 +174,7 @@ async function createPublishedEvent(site, { title, startsAt, endsAt }) {
       venue: { name: "LMNL Space" },
       starts_at: startsAt,
       ends_at: endsAt,
-      time_zone: "America/Los_Angeles",
+      time_zone: timeZone,
       visibility: "public",
     },
   });
@@ -186,6 +186,213 @@ async function createPublishedEvent(site, { title, startsAt, endsAt }) {
   });
   assert(published.status === 200 && published.data.data.publication_status === "published", "A complete Event could not be published.");
   return published.data.data;
+}
+
+function isoUtc(offsetMs) {
+  return new Date(Date.now() + offsetMs).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+async function createSalesConfiguredEvent(site, { title, openOffsetMs, closeOffsetMs, startOffsetMs = 24 * 60 * 60 * 1000, endOffsetMs = 48 * 60 * 60 * 1000, capacity = 20 }) {
+  const created = await api(site, "/v1/admin/events", {
+    method: "POST",
+    idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-27" } },
+  });
+  assert(created.status === 201, "A sales verification draft could not be created.");
+  const eventId = created.data.data.event_id;
+  const saved = await api(site, "/v1/admin/events/" + eventId, {
+    method: "PATCH",
+    idempotencyKey: randomUUID(),
+    body: {
+      actor: { type: "user", reference: "test:issue-27" },
+      expected_version: 1,
+      title,
+      description: "A local sales-control verification Event.",
+      venue: { name: "LMNL Space" },
+      starts_at: isoUtc(startOffsetMs),
+      ends_at: isoUtc(endOffsetMs),
+      time_zone: "UTC",
+      visibility: "public",
+      ticket_offering: {
+        price: { amount: 2500, currency: "USD" },
+        capacity,
+        sales_opens_at: isoUtc(openOffsetMs),
+        sales_closes_at: isoUtc(closeOffsetMs),
+      },
+    },
+  });
+  assert(saved.status === 200, "A configured sales Event could not be saved: " + JSON.stringify(saved.data));
+  const published = await api(site, "/v1/admin/events/" + eventId + "/actions/publish", {
+    method: "POST",
+    idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-27" }, expected_version: saved.data.data.version },
+  });
+  assert(published.status === 200, "A configured sales Event could not be published: " + JSON.stringify(published.data));
+  return published.data.data;
+}
+
+async function verifySalesControlsAndCapacity(site) {
+  const open = await createSalesConfiguredEvent(site, {
+    title: "Issue 27 Open Sales",
+    openOffsetMs: 0,
+    closeOffsetMs: 60_000,
+  });
+  assert(open.sales_status === "open", "Sales within the scheduled window did not report open.");
+  assert(open.check_in_opens_at === open.starts_at && open.check_in_uses_event_start, "The effective check-in opening did not default to Event start.");
+
+  const scheduled = await createSalesConfiguredEvent(site, {
+    title: "Issue 27 Scheduled Sales",
+    openOffsetMs: 60_000,
+    closeOffsetMs: 2 * 60 * 60 * 1000,
+  });
+  assert(scheduled.sales_status === "scheduled", "Sales before the opening time did not report scheduled.");
+  const scheduledStop = await api(site, "/v1/admin/events/" + scheduled.event_id + "/actions/stop_sales", {
+    method: "POST",
+    idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-27" }, expected_version: scheduled.version },
+  });
+  assert(scheduledStop.status === 200 && scheduledStop.data.data.sales_status === "scheduled" && scheduledStop.data.data.sales_paused,
+    "Scheduled status did not take precedence over a manual stop.");
+
+  const incompleteWindow = await createPublishedEvent(site, {
+    title: "Issue 27 Incomplete Sales Configuration",
+    startsAt: isoUtc(24 * 60 * 60 * 1000),
+    endsAt: isoUtc(48 * 60 * 60 * 1000),
+    timeZone: "UTC",
+  });
+  const scheduledButIncomplete = await api(site, "/v1/admin/events/" + incompleteWindow.event_id, {
+    method: "PATCH",
+    idempotencyKey: randomUUID(),
+    body: {
+      actor: { type: "user", reference: "test:issue-27" },
+      expected_version: incompleteWindow.version,
+      ticket_offering: {
+        sales_opens_at: isoUtc(60_000),
+        sales_closes_at: isoUtc(2 * 60 * 60 * 1000),
+      },
+    },
+  });
+  assert(scheduledButIncomplete.status === 200 && scheduledButIncomplete.data.data.sales_status === "not_configured",
+    "Incomplete settings did not take precedence over a future sales opening.");
+
+  const closedWindow = await createSalesConfiguredEvent(site, {
+    title: "Issue 27 Closed Window",
+    openOffsetMs: -2 * 60 * 60 * 1000,
+    closeOffsetMs: -60_000,
+  });
+  assert(closedWindow.sales_status === "closed", "A reached sales-closing time did not report closed.");
+
+  const ended = await createSalesConfiguredEvent(site, {
+    title: "Issue 27 Ended Event",
+    openOffsetMs: -3 * 60 * 60 * 1000,
+    closeOffsetMs: -2 * 60 * 60 * 1000,
+    startOffsetMs: -2 * 60 * 60 * 1000,
+    endOffsetMs: -60_000,
+  });
+  assert(ended.sales_status === "closed", "An ended Event did not report closed.");
+  await pool.query("update hpos.events set sales_paused=true where id=$1", [ended.event_id]);
+  const endedWhilePaused = await api(site, "/v1/public/events/" + ended.event_id);
+  assert(endedWhilePaused.data.data.sales_status === "closed", "Closed status did not take precedence over a manual stop.");
+
+  // Issue #28 adds real Reservation records. Seed the current committed quantity to exercise #27's API capacity guard meanwhile.
+  const seeded = await pool.query("update hpos.ticket_offerings set reserved_quantity=5 where event_id=$1 returning id", [open.event_id]);
+  assert(seeded.rowCount === 1, "The local committed-capacity fixture was not found.");
+  const belowFloor = await api(site, "/v1/admin/events/" + open.event_id, {
+    method: "PATCH",
+    idempotencyKey: randomUUID(),
+    body: {
+      actor: { type: "user", reference: "test:issue-27" },
+      expected_version: open.version,
+      ticket_offering: { capacity: 4 },
+    },
+  });
+  assert(belowFloor.status === 422 && belowFloor.data.error.code === "validation_failed",
+    "Reducing capacity below committed quantity was accepted.");
+  assert(belowFloor.data.error.details?.[0]?.code === "below_committed_capacity",
+    "The capacity-floor error did not identify the committed-capacity rule.");
+  const unchanged = await api(site, "/v1/admin/events/" + open.event_id);
+  assert(unchanged.data.data.ticket_offering.capacity === 20 && unchanged.data.data.ticket_offering.available_quantity === 15,
+    "A rejected capacity edit changed capacity or available quantity.");
+
+  const capacityEdit = await api(site, "/v1/admin/events/" + open.event_id, {
+    method: "PATCH",
+    idempotencyKey: randomUUID(),
+    body: {
+      actor: { type: "user", reference: "test:issue-27" },
+      expected_version: open.version,
+      ticket_offering: { capacity: 25 },
+    },
+  });
+  assert(capacityEdit.status === 200 && capacityEdit.data.data.ticket_offering.available_quantity === 20,
+    "An accepted capacity change did not update available quantity.");
+  assert(capacityEdit.data.data.ticket_offering.price.amount === 2500,
+    "Changing capacity cleared or changed the omitted price.");
+
+  const stopKey = randomUUID();
+  const stopped = await api(site, "/v1/admin/events/" + open.event_id + "/actions/stop_sales", {
+    method: "POST",
+    idempotencyKey: stopKey,
+    body: { actor: { type: "user", reference: "test:issue-27" }, expected_version: capacityEdit.data.data.version },
+  });
+  assert(stopped.status === 200 && stopped.data.data.sales_paused && stopped.data.data.sales_status === "paused",
+    "Stopping sales did not update the authoritative status.");
+  const replayedStop = await api(site, "/v1/admin/events/" + open.event_id + "/actions/stop_sales", {
+    method: "POST",
+    idempotencyKey: stopKey,
+    body: { actor: { type: "user", reference: "test:issue-27" }, expected_version: capacityEdit.data.data.version },
+  });
+  assert(replayedStop.status === 200 && replayedStop.data.data.version === stopped.data.data.version,
+    "Retrying a stopped-sales action repeated its state change.");
+  const repeatedStop = await api(site, "/v1/admin/events/" + open.event_id + "/actions/stop_sales", {
+    method: "POST",
+    idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-27" }, expected_version: stopped.data.data.version },
+  });
+  assert(repeatedStop.status === 409 && repeatedStop.data.error.code === "invalid_state",
+    "A new stop-sales action silently repeated an already active stop.");
+  const staleResume = await api(site, "/v1/admin/events/" + open.event_id + "/actions/resume_sales", {
+    method: "POST",
+    idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-27" }, expected_version: capacityEdit.data.data.version },
+  });
+  assert(staleResume.status === 409 && staleResume.data.error.code === "version_conflict",
+    "Resume sales accepted a stale Event version.");
+  const resumed = await api(site, "/v1/admin/events/" + open.event_id + "/actions/resume_sales", {
+    method: "POST",
+    idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-27" }, expected_version: stopped.data.data.version },
+  });
+  assert(resumed.status === 200 && !resumed.data.data.sales_paused && resumed.data.data.sales_status === "open",
+    "Resuming sales within the window did not restore open status.");
+
+  await pool.query("update hpos.ticket_offerings set reserved_quantity=capacity where event_id=$1", [open.event_id]);
+  const soldOut = await api(site, "/v1/public/events/" + open.event_id);
+  assert(soldOut.data.data.sales_status === "sold_out", "No remaining committed capacity did not report sold out.");
+  const stopAtCapacity = await api(site, "/v1/admin/events/" + open.event_id + "/actions/stop_sales", {
+    method: "POST",
+    idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-27" }, expected_version: resumed.data.data.version },
+  });
+  assert(stopAtCapacity.status === 200 && stopAtCapacity.data.data.sales_status === "paused",
+    "Manual pause did not take precedence over sold-out status.");
+  const resumeSoldOut = await api(site, "/v1/admin/events/" + open.event_id + "/actions/resume_sales", {
+    method: "POST",
+    idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-27" }, expected_version: stopAtCapacity.data.data.version },
+  });
+  assert(resumeSoldOut.status === 409 && resumeSoldOut.data.error.code === "invalid_state",
+    "Sales resumed while no capacity was available.");
+  await pool.query("update hpos.ticket_offerings set reserved_quantity=24 where event_id=$1", [open.event_id]);
+  const resumeWithCapacity = await api(site, "/v1/admin/events/" + open.event_id + "/actions/resume_sales", {
+    method: "POST",
+    idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-27" }, expected_version: stopAtCapacity.data.data.version },
+  });
+  assert(resumeWithCapacity.status === 200 && resumeWithCapacity.data.data.sales_status === "open",
+    "Sales did not resume after capacity became available.");
+  await pool.query("update hpos.events set is_canceled=true, sales_paused=true where id=$1", [open.event_id]);
+  const canceled = await api(site, "/v1/public/events/" + open.event_id);
+  assert(canceled.data.data.sales_status === "canceled", "Canceled status did not take precedence over a manual stop.");
 }
 
 async function verifyEventLifecycleAndDiscovery(site) {
@@ -249,6 +456,8 @@ async function verifyEventLifecycleAndDiscovery(site) {
     },
   });
   assert(saved.status === 200 && saved.data.data.version === 2, "Saving complete Event details failed: " + JSON.stringify(saved.data));
+  assert(saved.data.data.check_in_opens_at === saved.data.data.starts_at && saved.data.data.check_in_uses_event_start,
+    "The effective check-in opening did not default to Event start.");
   const partial = await api(site, "/v1/admin/events/" + draft.event_id, {
     method: "PATCH",
     idempotencyKey: randomUUID(),
@@ -260,6 +469,9 @@ async function verifyEventLifecycleAndDiscovery(site) {
   });
   assert(partial.status === 200 && partial.data.data.ticket_offering.capacity === 25, "A nested partial offering edit failed.");
   assert(partial.data.data.ticket_offering.price.amount === 2500, "A nested partial edit cleared an omitted price.");
+  assert(partial.data.data.ticket_offering.sales_opens_at === saved.data.data.ticket_offering.sales_opens_at
+    && partial.data.data.ticket_offering.sales_closes_at === saved.data.data.ticket_offering.sales_closes_at,
+  "A capacity edit changed omitted sales-window terms.");
 
   const clearKey = randomUUID();
   const clearBody = {
@@ -294,6 +506,7 @@ async function verifyEventLifecycleAndDiscovery(site) {
     startsAt: "2032-02-01T19:00:00-08:00",
     endsAt: "2032-02-01T22:00:00-08:00",
   });
+  assert(second.sales_status === "not_configured", "A published Event without sales configuration did not report not_configured.");
   const firstPage = await api(site, "/v1/public/events?period=current&limit=1");
   assert(firstPage.status === 200 && firstPage.data.data.length === 1 && firstPage.data.pagination.next_cursor, "Current Event pagination did not return a deterministic cursor.");
   const secondPage = await api(site, "/v1/public/events?period=current&limit=1&cursor=" + encodeURIComponent(firstPage.data.pagination.next_cursor));
@@ -330,6 +543,7 @@ async function verifyEventLifecycleAndDiscovery(site) {
     startsAt: "2020-01-01T19:00:00-08:00",
     endsAt: "2020-01-01T22:00:00-08:00",
   });
+  assert(past.sales_status === "closed", "An ended Event did not take precedence over missing sales configuration.");
   const pastList = await api(site, "/v1/public/events?period=past");
   assert(pastList.status === 200 && pastList.data.data.some((event) => event.event_id === past.event_id), "The past Event list did not include an ended published Event.");
   const archived = await api(site, "/v1/admin/events/" + past.event_id + "/actions/archive", {
@@ -364,12 +578,13 @@ async function main() {
     const site = createSiteFixture();
     await verifyPreconfiguredDraftCannotClearSales(site);
     await verifyEventLifecycleAndDiscovery(site);
+    await verifySalesControlsAndCapacity(site);
   } finally {
     await cleanup();
     await stopApp(app);
     await pool.end();
   }
-  console.log("Local Event API verification passed: drafts, retries, partial edits, sales configuration locks, publish rules, current and past discovery, pagination, eligible archiving, and Site isolation.");
+  console.log("Local Event API verification passed: draft and publish rules, sales windows and status precedence, stop/resume controls, guarded partial edits and capacity floor, current and past discovery, pagination, eligible archiving, and Site isolation.");
 }
 
 main().catch((error) => {
