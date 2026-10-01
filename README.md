@@ -19,6 +19,12 @@ Event, quote, unpaid Order, payment-attempt state transitions, verified payment 
 
 Next.js manages `next-env.d.ts` and the `.next/` directory locally; both are excluded from Git so generated development and build changes do not block pulls. `pnpm typecheck` runs `next typegen` before TypeScript checking, which regenerates the required definitions even in a fresh checkout. Keep `next-env.d.ts` in `tsconfig.json` so TypeScript can load those definitions.
 
+## Repository layout
+
+Application code lives in `src/`: `src/app/` contains Next.js pages and routes, and `src/server/` contains HP-OS server logic. The `@/` import alias points to `src/`. Operational commands and verification scripts live in `scripts/`; database configuration and migrations live in `supabase/`; settled guidance lives in `docs/`. `CONTEXT.md` remains at the root as the domain glossary.
+
+Tool configuration, dependency files, `README.md`, and `AGENTS.md` remain at the root. Generated TypeScript cache data lives in `.next/cache/`. The shared `.vscode/settings.json` hides generated files and local runtime directories in compatible editors; the files remain available on disk. macOS `.DS_Store` metadata is excluded from Git.
+
 ## Find the current guidance
 
 | Need | Source |
