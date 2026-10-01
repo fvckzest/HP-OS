@@ -690,6 +690,19 @@ async function verifyPublicPaymentAttemptLifecycle(site) {
     `update hpos.orders set checkout_expires_at = clock_timestamp() - interval '1 second' where id = $1`,
     [lateOrder.data.data.order_id],
   );
+  const lateDeadlineResult = await pool.query(
+    `select checkout_expires_at from hpos.orders where id = $1`,
+    [lateOrder.data.data.order_id],
+  );
+  const lateDeadline = lateDeadlineResult.rows[0]?.checkout_expires_at?.toISOString();
+  const lateFrontier = await api(site, `/v1/admin/payment-attempts?requires_verification=true&event_id=${lateEvent.event_id}`);
+  assert(lateFrontier.status === 200 && lateFrontier.data.data.some((row) => row.attempt_id === lateAttempt.data.data.attempt_id
+    && row.requires_verification === true && row.connection.connection_id === site.connectionId
+    && row.checkout_expires_at === lateDeadline),
+    "The Site verification frontier did not expose the overdue interrupted attempt with its deadline and frozen connection.");
+  const lateProcessing = await api(site, "/api/cron/process");
+  assert(lateProcessing.status === 200 && lateProcessing.data.data.verification_required_attempts >= 1,
+    "The bounded processor did not promote the overdue interrupted payment attempt for verification.");
   const lateRegistration = await api(site, `/v1/admin/payment-attempts/${lateAttempt.data.data.attempt_id}/checkout-reference`, {
     method: "POST", idempotencyKey: randomUUID(), body: {
       ...referenceBody,
@@ -698,15 +711,16 @@ async function verifyPublicPaymentAttemptLifecycle(site) {
   });
   assert(lateRegistration.status === 409 && lateRegistration.data.error.code === "checkout_expired",
     "HP-OS registered provider checkout after its accepted Order deadline.");
-  const lateClosure = await api(site, `/v1/admin/payment-attempts/${lateAttempt.data.data.attempt_id}/closure-reports`, {
+  const lateClosure = await api(site, `/v1/admin/payment-attempts/${lateAttempt.data.data.attempt_id}/setup-failure`, {
     method: "POST", idempotencyKey: randomUUID(), body: {
-      ...closureBody,
-      source_reference: "ref:verify-square-checkout-closed-29-late",
-      provider_checkout_reference: "square-test-link-29-late",
+      actor,
+      reason: "provider_unavailable",
+      provider_checkout_closed: true,
+      payment_outcome: "not_started",
     },
   });
   assert(lateClosure.status === 200 && lateClosure.data.data.status === "closed",
-    "The Site could not report verified closure for a late provider setup.");
+    "The Site could not report verified setup failure for a late interrupted checkout.");
   const lateCapacity = await pool.query(
     `select offering.reserved_quantity, reservation.status, order_row.checkout_status
      from hpos.ticket_offerings offering
@@ -718,6 +732,44 @@ async function verifyPublicPaymentAttemptLifecycle(site) {
   assert(lateCapacity.rows[0]?.reserved_quantity === "0" && lateCapacity.rows[0]?.status === "released"
     && lateCapacity.rows[0]?.checkout_status === "expired",
     "A late provider checkout kept capacity after the Site verified it was closed.");
+
+  const batchEvent = await createPublishedEvent(site, {
+    title: "Issue 34 Bounded Verification Promotion",
+    startsAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+    endsAt: new Date(Date.now() + 2 * 60 * 60_000).toISOString(),
+    timeZone: "UTC",
+    ticketOffering: { price: { amount: 2500, currency: "USD" }, capacity: 51, tax_amount: 0, buyer_fees: [] },
+  });
+  const batchAttempts = [];
+  for (let index = 0; index < 51; index += 1) {
+    batchAttempts.push(await createPendingPaymentAttempt(site, batchEvent, `verification-batch-${index}`));
+  }
+  await pool.query(
+    `update hpos.orders order_row
+     set checkout_expires_at = clock_timestamp() - interval '1 second'
+     where order_row.id in (
+       select attempt.order_id from hpos.payment_attempts attempt where attempt.id = any($1::uuid[])
+     )`,
+    [batchAttempts.map((attempt) => attempt.attempt_id)],
+  );
+  const firstVerificationBatch = await api(site, "/api/cron/process");
+  assert(firstVerificationBatch.status === 200
+    && firstVerificationBatch.data.data.verification_required_attempts === 50
+    && firstVerificationBatch.data.data.has_more === true,
+    "The bounded scheduler did not promote exactly 50 overdue payment attempts or expose the remaining verification work.");
+  const secondVerificationBatch = await api(site, "/api/cron/process");
+  assert(secondVerificationBatch.status === 200
+    && secondVerificationBatch.data.data.verification_required_attempts === 1
+    && secondVerificationBatch.data.data.has_more === false,
+    "The next bounded scheduler run did not promote the one remaining overdue payment attempt.");
+  const promotedBatch = await pool.query(
+    `select count(*)::integer as count
+     from hpos.payment_attempts
+     where id = any($1::uuid[]) and status = 'requires_verification'`,
+    [batchAttempts.map((attempt) => attempt.attempt_id)],
+  );
+  assert(promotedBatch.rows[0]?.count === 51,
+    "Bounded verification promotion did not leave every overdue attempt in the durable verification frontier.");
 }
 
 async function verifySharedCheckoutReferenceIsolation(site) {

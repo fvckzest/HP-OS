@@ -649,6 +649,7 @@ export interface ProcessingResult {
   started_at: string;
   finished_at: string;
   recovered_jobs: number;
+  verification_required_attempts: number;
   released_reservations: number;
   batch_limit: number;
   has_more: boolean;
@@ -690,6 +691,31 @@ export async function runBoundedProcessing(trigger: ProcessingTrigger): Promise<
         [claimIds],
       );
     }
+    const verificationRequired = await client.query<{ id: string }>(
+      `with candidates as (
+         select attempt.id
+         from hpos.payment_attempts attempt
+         join hpos.orders order_row
+           on order_row.id = attempt.order_id and order_row.site_id = attempt.site_id
+         join hpos.reservations reservation
+           on reservation.order_id = order_row.id and reservation.site_id = order_row.site_id
+         where order_row.checkout_status = 'awaiting_payment_result'
+           and order_row.payment_status in ('unpaid', 'failed', 'processing', 'unknown', 'conflicted')
+           and order_row.checkout_expires_at <= clock_timestamp()
+           and reservation.status = 'held'
+           and attempt.status in ('creating', 'open')
+           and attempt.provider_can_take_payment is distinct from false
+         order by attempt.created_at, attempt.id
+         limit $1
+         for update of attempt skip locked
+       )
+       update hpos.payment_attempts attempt
+       set status = 'requires_verification', version = version + 1, updated_at = clock_timestamp()
+       from candidates
+       where attempt.id = candidates.id
+       returning attempt.id`,
+      [MAX_PROCESS_BATCH],
+    );
     const expiredReservations = await client.query<{ id: string; order_id: string; offering_id: string; site_id: string; quantity: number }>(
       `select reservation.id, reservation.order_id, reservation.offering_id,
               reservation.site_id, reservation.quantity
@@ -760,6 +786,19 @@ export async function runBoundedProcessing(trigger: ProcessingTrigger): Promise<
          and order_row.payment_status in ('unpaid', 'failed')
        limit 1`,
     );
+    const moreVerification = await client.query(
+      `select 1
+       from hpos.payment_attempts attempt
+       join hpos.orders order_row on order_row.id = attempt.order_id and order_row.site_id = attempt.site_id
+       join hpos.reservations reservation on reservation.order_id = order_row.id and reservation.site_id = order_row.site_id
+       where order_row.checkout_status = 'awaiting_payment_result'
+         and order_row.payment_status in ('unpaid', 'failed', 'processing', 'unknown', 'conflicted')
+         and order_row.checkout_expires_at <= clock_timestamp()
+         and reservation.status = 'held'
+         and attempt.status in ('creating', 'open')
+         and attempt.provider_can_take_payment is distinct from false
+       limit 1`,
+    );
     const finishedAt = (await client.query<{ finished_at: Date }>(`select clock_timestamp() as finished_at`)).rows[0].finished_at;
     const result: ProcessingResult = {
       run_id: runId,
@@ -767,9 +806,10 @@ export async function runBoundedProcessing(trigger: ProcessingTrigger): Promise<
       started_at: startedAt.toISOString(),
       finished_at: finishedAt.toISOString(),
       recovered_jobs: jobIds.length,
+      verification_required_attempts: verificationRequired.rowCount ?? 0,
       released_reservations: releasedReservations,
       batch_limit: MAX_PROCESS_BATCH,
-      has_more: (more.rowCount ?? 0) > 0 || (moreReservations.rowCount ?? 0) > 0,
+      has_more: (more.rowCount ?? 0) > 0 || (moreReservations.rowCount ?? 0) > 0 || (moreVerification.rowCount ?? 0) > 0,
       site_execution: "separate",
     };
     await client.query("commit");

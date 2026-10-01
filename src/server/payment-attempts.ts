@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import type { PoolClient, QueryResultRow } from "pg";
-import { apiFailure } from "./api-response";
+import { apiFailure, apiSuccess } from "./api-response";
 import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
@@ -54,6 +54,12 @@ export interface AttemptRow extends QueryResultRow {
   checkout_expires_at: Date;
   payment_status: "unpaid" | "processing" | "paid" | "failed" | "unknown" | "conflicted";
   reservation_status: "held" | "consumed" | "released";
+}
+
+interface PaymentAttemptListRow extends AttemptRow {
+  event_id: string;
+  checkout_expired: boolean;
+  requires_verification: boolean;
 }
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -125,6 +131,111 @@ export function paymentAttemptData(row: AttemptRow) {
     created_at: row.created_at.toISOString(),
     updated_at: row.updated_at.toISOString(),
   };
+}
+
+function paymentAttemptListData(row: PaymentAttemptListRow) {
+  return {
+    ...paymentAttemptData(row),
+    event_id: row.event_id,
+    checkout_status: row.checkout_status,
+    checkout_expires_at: row.checkout_expires_at.toISOString(),
+    payment_status: row.payment_status,
+    reservation_status: row.reservation_status,
+    requires_verification: row.requires_verification,
+  };
+}
+
+function listLimit(value: string | null): number | Response {
+  if (value === null) return 50;
+  if (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 100) {
+    return fieldError("limit", "out_of_range", "limit must be an integer from 1 to 100.");
+  }
+  return Number(value);
+}
+
+function listCursor(site: AuthenticatedSite, filters: object, limit: number, row: { created_at: Date; id: string }): string {
+  const payload = Buffer.from(JSON.stringify({
+    route: "admin-payment-attempts",
+    siteId: site.siteId,
+    filters,
+    limit,
+    issuedAt: new Date().toISOString(),
+    createdAt: row.created_at.toISOString(),
+    id: row.id,
+  }), "utf8").toString("base64url");
+  const signature = createHmac("sha256", site.cursorSigningKey).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
+}
+
+function parseListCursor(value: string | null, site: AuthenticatedSite, filters: object, limit: number): { createdAt: string; id: string } | Response | null {
+  if (value === null) return null;
+  try {
+    const match = /^([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/.exec(value);
+    if (!match || value.length > 2048) throw new Error();
+    const expected = createHmac("sha256", site.cursorSigningKey).update(match[1]).digest();
+    const supplied = Buffer.from(match[2], "base64url");
+    if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw new Error();
+    const decoded = JSON.parse(Buffer.from(match[1], "base64url").toString("utf8")) as Record<string, unknown>;
+    if (decoded.route !== "admin-payment-attempts" || decoded.siteId !== site.siteId
+      || decoded.limit !== limit || JSON.stringify(decoded.filters) !== JSON.stringify(filters)
+      || typeof decoded.issuedAt !== "string" || typeof decoded.createdAt !== "string"
+      || typeof decoded.id !== "string" || !UUID_PATTERN.test(decoded.id)
+      || !Number.isFinite(Date.parse(decoded.issuedAt)) || !Number.isFinite(Date.parse(decoded.createdAt))) throw new Error();
+    const issuedAt = Date.parse(decoded.issuedAt);
+    if (issuedAt < Date.now() - 60 * 60 * 1000 || issuedAt > Date.now() + 60_000) throw new Error();
+    return { createdAt: decoded.createdAt, id: decoded.id };
+  } catch {
+    return apiFailure(422, "invalid_cursor", "The payment-attempt cursor does not match this Site, endpoint, filter, or page size.");
+  }
+}
+
+async function listPaymentAttempts(request: Request, site: AuthenticatedSite): Promise<Response> {
+  const url = new URL(request.url);
+  const allowed = new Set(["limit", "cursor", "requires_verification", "event_id"]);
+  for (const name of url.searchParams.keys()) {
+    if (!allowed.has(name)) return fieldError(name, "unknown_filter", "Remove the unsupported payment-attempt list parameter.");
+  }
+  const limit = listLimit(url.searchParams.get("limit"));
+  if (limit instanceof Response) return limit;
+  const requiresText = url.searchParams.get("requires_verification");
+  if (requiresText !== null && requiresText !== "true" && requiresText !== "false") {
+    return fieldError("requires_verification", "invalid_boolean", "requires_verification must be true or false.");
+  }
+  const eventId = url.searchParams.get("event_id");
+  if (eventId !== null && !UUID_PATTERN.test(eventId)) return fieldError("event_id", "invalid_uuid", "event_id must be a UUID.");
+  const filters = { requires_verification: requiresText, event_id: eventId };
+  const cursor = parseListCursor(url.searchParams.get("cursor"), site, filters, limit);
+  if (cursor instanceof Response) return cursor;
+  const requiresVerification = `(
+    attempt.status = 'requires_verification'
+    or (
+      order_row.checkout_expires_at <= clock_timestamp()
+      and attempt.status in ('creating', 'open')
+      and attempt.provider_can_take_payment is distinct from false
+    )
+  )`;
+  const result = await getBusinessPool().query<PaymentAttemptListRow>(
+    `select attempt.*, order_row.event_id,
+            order_row.checkout_status, order_row.checkout_expires_at,
+            order_row.payment_status, reservation.status as reservation_status,
+            ${requiresVerification} as requires_verification,
+            order_row.checkout_expires_at <= clock_timestamp() as checkout_expired
+     from hpos.payment_attempts attempt
+     join hpos.orders order_row on order_row.id = attempt.order_id and order_row.site_id = attempt.site_id
+     join hpos.reservations reservation on reservation.order_id = order_row.id and reservation.site_id = order_row.site_id
+     where attempt.site_id = $1
+       and ($2::boolean is null or ${requiresVerification} = $2)
+       and ($3::uuid is null or order_row.event_id = $3)
+       and ($4::timestamptz is null or (attempt.created_at, attempt.id) < ($4::timestamptz, $5::uuid))
+     order by attempt.created_at desc, attempt.id desc
+     limit $6`,
+    [site.siteId, requiresText === null ? null : requiresText === "true", eventId,
+      cursor?.createdAt ?? null, cursor?.id ?? null, limit + 1],
+  );
+  const rows = result.rows.slice(0, limit);
+  const last = rows.at(-1);
+  const nextCursor = result.rows.length > limit && last ? listCursor(site, filters, limit, last) : null;
+  return apiSuccess(rows.map(paymentAttemptListData), 200, { nextCursor });
 }
 
 function mapPaymentAttemptDatabaseError(error: unknown): Response | null {
@@ -473,7 +584,13 @@ async function reportSetupFailure(
   if (attempt.provider_checkout_reference === null && body.payment_outcome !== "not_started") {
     reject(409, "provider_reference_missing", "A payment outcome requires a recorded provider checkout reference.");
   }
-  const updated = await closeAttempt(client, site.siteId, attempt, body.payment_outcome, true, "ended");
+  const deadline = await client.query<{ expired: boolean }>(
+    `select checkout_expires_at <= clock_timestamp() as expired
+     from hpos.orders where id = $1 and site_id = $2`,
+    [attempt.order_id, site.siteId],
+  );
+  const expired = deadline.rows[0]?.expired || attempt.checkout_status === "expired" || attempt.checkout_status === "ended";
+  const updated = await closeAttempt(client, site.siteId, attempt, body.payment_outcome, true, expired ? "expired" : "ended");
   return { status: 200, data: paymentAttemptData(updated) };
 }
 
@@ -606,7 +723,11 @@ export async function handlePaymentAttemptPost(request: Request, site: Authentic
   return null;
 }
 
-export async function handlePaymentAttemptGet(site: AuthenticatedSite, path: string[]): Promise<Response | null> {
+export async function handlePaymentAttemptGet(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
+  if (request.method !== "GET") return null;
+  if (path.length === 2 && path[0] === "admin" && path[1] === "payment-attempts") {
+    return listPaymentAttempts(request, site);
+  }
   if (path.length !== 3 || path[0] !== "admin" || path[1] !== "payment-attempts"
     || !UUID_PATTERN.test(path[2])) return null;
   const result = await getBusinessPool().query<AttemptRow>(
