@@ -83,7 +83,21 @@ async function paid(a, order, at, reference) {
   a.check('complete issuance', buyer.data.payment_status === 'paid' && buyer.data.issuance_status === 'issued' && buyer.data.tickets.length === 1, 'Paid Order has exactly one fully issued Ticket', { payment: buyer.data.payment_status, issuance: buyer.data.issuance_status, tickets: buyer.data.tickets.length });
   const ticket = buyer.data.tickets[0];
   a.check('distinct access scopes', ticket.ticket_token !== order.order_token && ticket.ticket_token !== ticket.qr_payload && !ticket.qr_payload.includes('@'), 'Order token, Ticket token and QR are distinct; QR has no email', { distinct: true });
-  await a.read('buyer-ticket', `/v1/public/tickets/${id(ticket.ticket_token)}`);
+  const buyerTicket = await a.read('buyer-ticket', `/v1/public/tickets/${id(ticket.ticket_token)}`);
+  a.check(
+    'buyer Ticket page',
+    buyerTicket.data.ticket_id === ticket.ticket_id
+      && buyerTicket.data.qr_payload === ticket.qr_payload
+      && buyerTicket.data.admission_status === 'unused'
+      && buyerTicket.data.can_admit === true,
+    'Buyer Ticket page exposes this Ticket QR and current unused Admission eligibility',
+    {
+      ticket_id: buyerTicket.data.ticket_id,
+      qr_payload: buyerTicket.data.qr_payload,
+      admission_status: buyerTicket.data.admission_status,
+      can_admit: buyerTicket.data.can_admit,
+    },
+  );
   await a.read('staff-payment-status', `/v1/admin/orders/${id(order.order_id)}/payment-status`);
   await a.write('paid-report-duplicate-source', `/v1/admin/payment-attempts/${id(at.attempt_id)}/payment-reports`, body, [200]);
   const duplicate = await a.read('after-payment-replay', `/v1/public/orders/${id(order.order_token)}`, { fresh: true });
@@ -151,7 +165,7 @@ async function admit(a, f, { concurrency = false } = {}) {
   const lookup = await a.write('lookup-reference', p + '/ticket-lookup', { order_reference: f.order.order_reference });
   a.check('lookup no page secrets', !/order_token|ticket_token|qr_payload|qr_token/.test(JSON.stringify(lookup.envelope)), 'Staff lookup contains no access tokens or QR', { orders: lookup.data.length });
   await a.write('lookup-email', p + '/ticket-lookup', { email: a.run.profile === 'sandbox' ? a.config.operatorEmail : 'buyer@fake-lmnl.test' });
-  await a.write('invalid-qr', p + '/admissions', { actor: human, qr_token: 'invalid-qr-token' }, [404], { expectedError: 'not_found' });
+  await a.write('invalid-qr', p + '/admissions', { actor: human, qr_token: 'A'.repeat(32) }, [404], { expectedError: 'not_found' });
   if (concurrency) {
     const wrong = await event(a, 'wrong-event');
     await a.write('wrong-event-qr', `/v1/admin/events/${id(wrong.event_id)}/admissions`, { actor: human, qr_token: f.ticket.qr_payload }, [409], { expectedError: 'ticket_event_mismatch' });
@@ -221,7 +235,18 @@ export async function execute(a) {
     const before = await a.read('before-quote', p), { order, quote } = await reserve(a, e), key = a.run.journal['purchase-order'].key, buyer = { name: 'Fake LMNL Buyer', email: 'buyer@fake-lmnl.test' };
     const replay = await a.write('order-replay', '/v1/public/orders', { quote_id: quote.quote_id, buyer }, [201], { key }); a.check('one replayed Order', replay.data.order_id === order.order_id, 'Original key preserves Order identity', replay.data.order_id);
     if (workflow === 'sales') {
-      await a.call('capacity-floor', p, { method: 'PATCH', body: { actor: human, expected_version: e.version, ticket_offering: { capacity: 0 } }, expected: [409], expectedError: 'below_committed_capacity' });
+      const capacityFloor = await a.call('capacity-floor', p, {
+        method: 'PATCH',
+        body: { actor: human, expected_version: e.version, ticket_offering: { capacity: 0 } },
+        expected: [422],
+        expectedError: 'validation_failed',
+      });
+      a.check(
+        'capacity-floor rule',
+        capacityFloor.error?.details?.some(detail => detail.code === 'below_committed_capacity'),
+        'Validation details include below_committed_capacity',
+        capacityFloor.error?.details,
+      );
       await a.call('price-edit', p, { method: 'PATCH', body: { actor: human, expected_version: e.version, ticket_offering: { price: { amount: 3000, currency: 'USD' } } } });
       const frozen = await a.read('frozen-order', `/v1/public/orders/${id(order.order_token)}`); a.check('immutable accepted price', frozen.data.pricing.total.amount === order.pricing.total.amount, 'Event edit preserves accepted Order total', frozen.data.pricing.total);
     } else {
