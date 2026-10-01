@@ -143,6 +143,16 @@ function mapPaymentAttemptDatabaseError(error: unknown): Response | null {
   return null;
 }
 
+function isCheckoutReferenceUniqueViolation(error: unknown): boolean {
+  return object(error) && error.code === "23505"
+    && error.constraint === "payment_attempts_provider_checkout_reference_idx";
+}
+
+function rejectCheckoutReferenceConflict(sameSite: boolean): never {
+  if (!sameSite) reject(404, "not_found", "The provider checkout reference is not available to this Site.");
+  reject(409, "provider_reference_conflict", "This provider checkout reference is already attached to another payment attempt.");
+}
+
 async function createAttempt(client: PoolClient, site: AuthenticatedSite, orderId: string): Promise<IdempotentResult> {
   const orderResult = await client.query<{
     id: string;
@@ -318,6 +328,16 @@ async function registerCheckoutReference(
     ]);
   }
   const checkoutReference = body.provider_checkout_reference.trim();
+  const existingReference = await client.query<{ same_site: boolean; same_attempt: boolean }>(
+    `select attempt.site_id = $3::uuid as same_site,
+            attempt.id = $4::uuid as same_attempt
+     from hpos.payment_attempts attempt
+     where attempt.connection_id = $1 and attempt.provider_checkout_reference = $2
+     limit 1`,
+    [attempt.connection_id, checkoutReference, site.siteId, attemptId],
+  );
+  const existingOwner = existingReference.rows[0];
+  if (existingOwner && !existingOwner.same_attempt) rejectCheckoutReferenceConflict(existingOwner.same_site);
   if (attempt.provider_checkout_reference && attempt.provider_checkout_reference !== checkoutReference) {
     reject(409, "provider_reference_conflict", "The payment attempt already has a different provider checkout reference.");
   }
@@ -326,15 +346,34 @@ async function registerCheckoutReference(
     reject(409, "payment_attempt_in_progress", "The payment result must be verified before changing checkout references.");
   }
 
-  const updated = await client.query<AttemptRow>(
-    `update hpos.payment_attempts
-     set provider_checkout_reference = $3, provider_can_take_payment = true,
-         status = 'open', version = version + 1, updated_at = clock_timestamp()
-     where id = $1 and site_id = $2
-     returning *`,
-    [attemptId, site.siteId, checkoutReference],
-  );
-  return { status: 200, data: paymentAttemptData(updated.rows[0]) };
+  await client.query("savepoint checkout_reference_registration");
+  try {
+    const updated = await client.query<AttemptRow>(
+      `update hpos.payment_attempts
+       set provider_checkout_reference = $3, provider_can_take_payment = true,
+           status = 'open', version = version + 1, updated_at = clock_timestamp()
+       where id = $1 and site_id = $2
+       returning *`,
+      [attemptId, site.siteId, checkoutReference],
+    );
+    await client.query("release savepoint checkout_reference_registration");
+    return { status: 200, data: paymentAttemptData(updated.rows[0]) };
+  } catch (error) {
+    await client.query("rollback to savepoint checkout_reference_registration");
+    if (isCheckoutReferenceUniqueViolation(error)) {
+      await client.query("release savepoint checkout_reference_registration");
+      const concurrentOwner = await client.query<{ same_site: boolean }>(
+        `select site_id = $3::uuid as same_site
+         from hpos.payment_attempts
+         where connection_id = $1 and provider_checkout_reference = $2
+         limit 1`,
+        [attempt.connection_id, checkoutReference, site.siteId],
+      );
+      const sameSite = concurrentOwner.rows[0]?.same_site;
+      if (sameSite !== undefined) rejectCheckoutReferenceConflict(sameSite);
+    }
+    throw error;
+  }
 }
 
 async function releaseReservation(client: PoolClient, attempt: AttemptRow): Promise<void> {
