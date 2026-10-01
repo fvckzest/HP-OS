@@ -98,7 +98,14 @@ function createSiteFixture(withPilotFee = true) {
   ]);
   runOperator(["site", "assign-connection", "--site", site.site_id, "--connection", connection.connection_id]);
   const key = runOperator(["site-key", "issue", "--site", site.site_id]);
-  return { siteId: site.site_id, apiKey: key.site_api_key, connectionId: connection.connection_id };
+  return { organizationId: organization.organization_id, siteId: site.site_id, apiKey: key.site_api_key, connectionId: connection.connection_id };
+}
+
+function createSharedConnectionSiteFixture(source) {
+  const site = runOperator(["site", "create", "--organization", source.organizationId, "--name", "Issue 80 shared-connection Site"]);
+  runOperator(["site", "assign-connection", "--site", site.site_id, "--connection", source.connectionId]);
+  const key = runOperator(["site-key", "issue", "--site", site.site_id]);
+  return { organizationId: source.organizationId, siteId: site.site_id, apiKey: key.site_api_key, connectionId: source.connectionId };
 }
 
 async function api(site, pathName, { method = "GET", idempotencyKey, body, fetchImpl = fetch } = {}) {
@@ -211,6 +218,23 @@ async function createPublishedEvent(site, { title, startsAt, endsAt, checkInOpen
   });
   assert(published.status === 200 && published.data.data.publication_status === "published", "A complete Event could not be published.");
   return published.data.data;
+}
+
+async function createPendingPaymentAttempt(site, event, reference) {
+  const quote = await api(site, `/v1/public/events/${event.event_id}/quotes`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
+  });
+  assert(quote.status === 201, `The Issue #80 ${reference} Order could not get a quote: ` + JSON.stringify(quote.data));
+  const order = await api(site, "/v1/public/orders", {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { quote_id: quote.data.data.quote_id, buyer: { name: "Reference Test Buyer", email: `${randomUUID()}@example.test` } },
+  });
+  assert(order.status === 201, `The Issue #80 ${reference} Order could not be created: ` + JSON.stringify(order.data));
+  const attempt = await api(site, `/v1/admin/orders/${order.data.data.order_id}/payment-attempts`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "system", reference: "test:issue-80" } },
+  });
+  assert(attempt.status === 201, `The Issue #80 ${reference} payment attempt could not be created: ` + JSON.stringify(attempt.data));
+  return attempt.data.data;
 }
 
 async function verifyPublicSingleTicketCheckout(site) {
@@ -694,6 +718,77 @@ async function verifyPublicPaymentAttemptLifecycle(site) {
   assert(lateCapacity.rows[0]?.reserved_quantity === "0" && lateCapacity.rows[0]?.status === "released"
     && lateCapacity.rows[0]?.checkout_status === "expired",
     "A late provider checkout kept capacity after the Site verified it was closed.");
+}
+
+async function verifySharedCheckoutReferenceIsolation(site) {
+  const other = createSharedConnectionSiteFixture(site);
+  const now = Date.now();
+  const eventOptions = (title) => ({
+    title,
+    startsAt: new Date(now + 60 * 60_000).toISOString(),
+    endsAt: new Date(now + 2 * 60 * 60_000).toISOString(),
+    timeZone: "UTC",
+    ticketOffering: { price: { amount: 2500, currency: "USD" }, capacity: 2, tax_amount: 0, buyer_fees: [] },
+  });
+  const firstEvent = await createPublishedEvent(site, eventOptions("Issue 80 Shared Checkout Reference Site One"));
+  const secondEvent = await createPublishedEvent(other, eventOptions("Issue 80 Shared Checkout Reference Site Two"));
+  const [firstAttempt, secondAttempt] = await Promise.all([
+    createPendingPaymentAttempt(site, firstEvent, "first-site"),
+    createPendingPaymentAttempt(other, secondEvent, "second-site"),
+  ]);
+  const providerCheckoutReference = `shared-connection-checkout-${randomUUID()}`;
+  const referenceBody = {
+    actor: { type: "system", reference: "test:issue-80" },
+    connection_id: site.connectionId,
+    provider_checkout_reference: providerCheckoutReference,
+    provider_can_take_payment: true,
+  };
+  const registrations = await Promise.all([
+    api(site, `/v1/admin/payment-attempts/${firstAttempt.attempt_id}/checkout-reference`, {
+      method: "POST", idempotencyKey: randomUUID(), body: referenceBody,
+    }),
+    api(other, `/v1/admin/payment-attempts/${secondAttempt.attempt_id}/checkout-reference`, {
+      method: "POST", idempotencyKey: randomUUID(), body: referenceBody,
+    }),
+  ]);
+  const winnerIndex = registrations.findIndex((result) => result.status === 200);
+  const loserIndex = winnerIndex === 0 ? 1 : 0;
+  assert(winnerIndex !== -1 && registrations.filter((result) => result.status === 200).length === 1,
+    "Concurrent Sites both registered the same checkout reference, or neither registration succeeded.");
+  assert(registrations[loserIndex].status === 404 && registrations[loserIndex].data?.error?.code === "not_found",
+    "A concurrent cross-Site checkout-reference conflict did not return 404 not_found.");
+
+  const sites = [site, other];
+  const attempts = [firstAttempt, secondAttempt];
+  const events = [firstEvent, secondEvent];
+  const winningSite = sites[winnerIndex];
+  const losingSite = sites[loserIndex];
+  const winningAttempt = attempts[winnerIndex];
+  const losingAttempt = attempts[loserIndex];
+  const foreignFailure = JSON.stringify(registrations[loserIndex].data);
+  assert(!foreignFailure.includes(winningSite.siteId) && !foreignFailure.includes(winningAttempt.attempt_id),
+    "The cross-Site checkout-reference failure exposed foreign Site or attempt identity.");
+
+  const sequentialConflict = await api(losingSite, `/v1/admin/payment-attempts/${losingAttempt.attempt_id}/checkout-reference`, {
+    method: "POST", idempotencyKey: randomUUID(), body: referenceBody,
+  });
+  assert(sequentialConflict.status === 404 && sequentialConflict.data?.error?.code === "not_found",
+    "A sequential cross-Site checkout-reference conflict did not return 404 not_found.");
+
+  const storedReference = await pool.query(
+    `select count(*)::integer as count
+     from hpos.payment_attempts
+     where connection_id = $1 and provider_checkout_reference = $2`,
+    [site.connectionId, providerCheckoutReference],
+  );
+  assert(storedReference.rows[0]?.count === 1, "The shared-connection checkout-reference constraint did not preserve one owner.");
+
+  const sameSiteAttempt = await createPendingPaymentAttempt(winningSite, events[winnerIndex], "same-site");
+  const sameSiteConflict = await api(winningSite, `/v1/admin/payment-attempts/${sameSiteAttempt.attempt_id}/checkout-reference`, {
+    method: "POST", idempotencyKey: randomUUID(), body: referenceBody,
+  });
+  assert(sameSiteConflict.status === 409 && sameSiteConflict.data?.error?.code === "provider_reference_conflict",
+    "Same-Site checkout-reference reuse did not retain 409 provider_reference_conflict.");
 }
 
 async function verifyPaymentReportsAndTicketIssuance(site) {
@@ -1592,6 +1687,7 @@ async function main() {
     await verifySalesControlsAndCapacity(site);
     await verifyPublicSingleTicketCheckout(site);
     await verifyPublicPaymentAttemptLifecycle(site);
+    await verifySharedCheckoutReferenceIsolation(site);
     await verifyPaymentReportsAndTicketIssuance(site);
     await verifyReservationBackedSalesControls(site);
   } finally {
@@ -1599,7 +1695,7 @@ async function main() {
     await stopApp(app);
     await pool.end();
   }
-  console.log("Local Event, checkout, and Admission API verification passed: sales controls with actual Reservations, preserved purchase terms, capacity release, Organization pilot fees, explicit pricing, single-Ticket quotes, payment-attempt idempotency, verified payment reporting, interrupted issuance recovery, duplicate-safe Tickets and email work, separate buyer tokens, manual lookup, Admission rejection precedence, same-key replay, concurrent scans, conflict retention, provider closure safety, Reservation expiry, and concurrent last-capacity protection.");
+  console.log("Local Event, checkout, and Admission API verification passed: sales controls with actual Reservations, preserved purchase terms, capacity release, Organization pilot fees, explicit pricing, single-Ticket quotes, payment-attempt idempotency, shared-connection checkout-reference isolation under concurrent registration, verified payment reporting, interrupted issuance recovery, duplicate-safe Tickets and email work, separate buyer tokens, manual lookup, Admission rejection precedence, same-key replay, concurrent scans, conflict retention, provider closure safety, Reservation expiry, and concurrent last-capacity protection.");
 }
 
 main().catch((error) => {

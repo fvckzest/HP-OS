@@ -300,7 +300,7 @@ Use `error.code` for program logic; use `error.message` for explanation. Retry n
 | `order_already_paid` | Paid Order cannot start another attempt. |
 | `checkout_expired` | Order payment-start window expired. |
 | `checkout_ended` | Checkout permission terminated. |
-| `provider_reference_conflict` | Provider reference reused inconsistently. |
+| `provider_reference_conflict` | Provider reference conflicts with another attempt in the same Site. |
 | `payment_report_conflict` | Payment evidence contradicts the recorded attempt. |
 | `refund_report_conflict` | Refund evidence/amount contradicts the ledger. |
 | `fee_report_conflict` | Fee revision or confirmation contradicts records. |
