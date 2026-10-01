@@ -7,6 +7,7 @@ import { handlePaymentAttemptGet, handlePaymentAttemptPost } from "@/src/server/
 import { handleAdminOrderPaymentStatusGet, handleBuyerOrderGet, handleBuyerTicketGet } from "@/src/server/ticket-issuance";
 import { handlePaymentReportPost } from "@/src/server/payment-reports";
 import { handleEventActionPost, handleEventGet, handleEventPatch, handleEventPost } from "@/src/server/events";
+import { handleAdmissionPost } from "@/src/server/admissions";
 
 export const dynamic = "force-dynamic";
 
@@ -64,6 +65,9 @@ export async function POST(request: Request, context: RouteContext) {
   const { path } = await context.params;
 
   try {
+    const admissionResponse = await handleAdmissionPost(request, authentication.site, path);
+    if (admissionResponse) return admissionResponse;
+
     const paymentReportResponse = await handlePaymentReportPost(request, authentication.site, path);
     if (paymentReportResponse) return paymentReportResponse;
 

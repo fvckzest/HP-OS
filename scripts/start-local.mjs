@@ -51,6 +51,7 @@ const localEnv = {
 try {
   console.log("Starting the private local PostgreSQL service and applying pending HP-OS migrations…");
   await run("pnpm", ["exec", "supabase", "start"], localEnv);
+  await run("pnpm", ["exec", "supabase", "migration", "up", "--local"], localEnv);
   await run("node", ["scripts/check-local-database.mjs"], localEnv);
 } catch (error) {
   fail(error instanceof Error ? error.message : "The local database could not be prepared.");
