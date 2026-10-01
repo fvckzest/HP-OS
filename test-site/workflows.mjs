@@ -286,11 +286,84 @@ export async function execute(a) {
       a.check('last-capacity race', race.filter(r => r.status === 201).length === 1 && race.some(r => r.error?.code === 'sold_out'), 'One Order succeeds and one is sold_out', race.map(r => ({ status: r.status, error: r.error?.code })));
     } return;
   }
-  const f = await fixture(a);
   if (workflow === 'conflict') {
-    await a.write('conflicting-payment', `/v1/admin/payment-attempts/${id(f.at.attempt_id)}/payment-reports`, { ...f.body, amount: f.body.amount + 1 }, [409], { expectedError: 'payment_report_conflict' });
-    const after = await a.read('paid-after-conflict', `/v1/public/orders/${id(f.order.order_token)}`); a.check('paid facts retained', after.data.payment_status === 'paid' && after.data.tickets[0].ticket_id === f.ticket.ticket_id, 'Conflict preserves confirmed payment and Ticket', { payment: after.data.payment_status, tickets: after.data.tickets.length });
+    await configuration(a);
+    const e = await event(a, 'conflict-event');
+    const { order } = await reserve(a, e, 'conflict-purchase');
+    const at = await attempt(a, order, 'conflict-attempt');
+    const reference = await checkout(a, at);
+    const conflicting = {
+      connection_id: at.connection.connection_id,
+      source_reference: `fake-conflict-${a.run.id}`,
+      provider_checkout_reference: reference,
+      provider_payment_reference: `fake-payment-${a.run.id}`,
+      outcome: 'paid',
+      observed_at: iso(a.run.clock + 1000),
+      payment_started_at: iso(a.run.clock + 500),
+      provider_can_take_payment: false,
+      amount: at.total.amount + 1,
+      currency: at.total.currency,
+    };
+    await a.write('conflicting-payment', `/v1/admin/payment-attempts/${id(at.attempt_id)}/payment-reports`, conflicting, [409], { expectedError: 'payment_report_conflict' });
+    const blocked = await a.read('conflicted-order', `/v1/public/orders/${id(order.order_token)}`);
+    a.check('conflict blocks fulfillment', blocked.data.payment_status === 'conflicted' && blocked.data.tickets.length === 0,
+      'A conflicting payment remains unresolved without issuing a Ticket', { payment: blocked.data.payment_status, tickets: blocked.data.tickets.length });
+    const frontier = await a.read('conflict-frontier', '/v1/admin/payment-attempts?requires_verification=true&limit=100');
+    a.check('conflict frontier', frontier.data.some(item => item.attempt_id === at.attempt_id && item.requires_verification),
+      'Staff can find the conflicted attempt in the verification frontier', frontier.data.map(item => item.attempt_id));
+    const detail = await a.read('conflict-investigation', `/v1/admin/payment-attempts/${id(at.attempt_id)}`);
+    a.check('conflict investigation', detail.data.issues.some(issue => issue.status === 'open' && issue.code === 'payment_report_conflict')
+      && detail.data.reports.some(report => report.source_reference === conflicting.source_reference && report.conflict_code === 'payment_report_conflict'),
+    'Attempt detail retains the conflicting report and open issue', { issues: detail.data.issues.length, reports: detail.data.reports.length });
+    const resolutionBase = {
+      actor: human,
+      reason: 'Operator verified the provider payment against the recorded checkout.',
+      verification_reference: `ref:fake-payment-verification-${a.run.id}`,
+      report: {
+        connection_id: at.connection.connection_id,
+        source_reference: `fake-resolution-${a.run.id}`,
+        provider_checkout_reference: reference,
+        provider_payment_reference: `fake-resolved-payment-${a.run.id}`,
+        outcome: 'paid',
+        observed_at: iso(a.run.clock + 2000),
+        payment_started_at: iso(a.run.clock + 500),
+        provider_can_take_payment: false,
+        amount: at.total.amount,
+        currency: at.total.currency,
+      },
+    };
+    await a.write('stale-resolution', `/v1/admin/payment-attempts/${id(at.attempt_id)}/actions/resolve`,
+      { ...resolutionBase, expected_version: detail.data.version - 1 }, [409], { expectedError: 'version_conflict' });
+    await a.write('invalid-resolution', `/v1/admin/payment-attempts/${id(at.attempt_id)}/actions/resolve`,
+      { ...resolutionBase, expected_version: detail.data.version, report: { ...resolutionBase.report, source_reference: `fake-invalid-resolution-${a.run.id}`, amount: at.total.amount + 2 } },
+      [409], { expectedError: 'payment_report_conflict' });
+    const afterInvalid = await a.read('after-invalid-resolution', `/v1/admin/payment-attempts/${id(at.attempt_id)}`);
+    const resolved = await a.write('resolve-payment', `/v1/admin/payment-attempts/${id(at.attempt_id)}/actions/resolve`,
+      { ...resolutionBase, expected_version: afterInvalid.data.version }, [200]);
+    a.check('guarded resolution', resolved.data.applied === true && resolved.data.resolved_issue_ids.length >= 1,
+      'A valid verified report resolves the retained conflict', resolved.data.resolved_issue_ids);
+    await a.write('resolve-payment-replay', `/v1/admin/payment-attempts/${id(at.attempt_id)}/actions/resolve`,
+      { ...resolutionBase, expected_version: afterInvalid.data.version }, [200], { key: a.run.journal['resolve-payment'].key });
+    const issued = await a.read('resolved-order', `/v1/public/orders/${id(order.order_token)}`, { fresh: true });
+    a.check('resolved issuance', issued.data.payment_status === 'paid' && issued.data.issuance_status === 'issued' && issued.data.tickets.length === 1,
+      'Guarded resolution permits one complete Ticket issuance', { payment: issued.data.payment_status, issuance: issued.data.issuance_status, tickets: issued.data.tickets.length });
+    const delayed = await a.write('delayed-failed-report', `/v1/admin/payment-attempts/${id(at.attempt_id)}/payment-reports`, {
+      connection_id: at.connection.connection_id,
+      source_reference: `fake-delayed-failed-${a.run.id}`,
+      provider_checkout_reference: reference,
+      provider_payment_reference: null,
+      outcome: 'failed',
+      observed_at: iso(a.run.clock + 1500),
+      payment_started_at: null,
+      provider_can_take_payment: false,
+    }, [201]);
+    a.check('delayed evidence is stale', delayed.data.applied === false, 'Older failed evidence is retained without regressing paid state', delayed.data.applied);
+    const final = await a.read('after-delayed-evidence', `/v1/public/orders/${id(order.order_token)}`, { fresh: true });
+    a.check('paid state remains authoritative', final.data.payment_status === 'paid' && final.data.tickets.length === 1,
+      'Delayed evidence does not create a second Ticket or undo payment', { payment: final.data.payment_status, tickets: final.data.tickets.length });
+    return;
   }
+  const f = await fixture(a);
   if (['delivery', 'durable-jobs', 'unknown-email', 'journey'].includes(workflow)) await deliver(a, f, { unknown: workflow === 'unknown-email', overlap: workflow === 'durable-jobs' });
   if (workflow === 'durable-jobs') await a.scheduler('bounded-scheduler');
   if (['admission', 'journey'].includes(workflow)) await admit(a, f, { concurrency: workflow === 'admission' });
