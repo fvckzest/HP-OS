@@ -851,7 +851,7 @@ async function verifyPaymentReportsAndTicketIssuance(site) {
     endsAt: new Date(now + 60 * 60_000).toISOString(),
     checkInOpensAt: new Date(now - 30 * 60_000).toISOString(),
     timeZone: "UTC",
-    ticketOffering: { price: { amount: 2500, currency: "USD" }, capacity: 2, tax_amount: 0, buyer_fees: [] },
+    ticketOffering: { price: { amount: 2500, currency: "USD" }, capacity: 3, tax_amount: 0, buyer_fees: [] },
   });
   const quote = await api(site, `/v1/public/events/${event.event_id}/quotes`, {
     method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
@@ -893,21 +893,22 @@ async function verifyPaymentReportsAndTicketIssuance(site) {
     await pool.query(`create trigger ${triggerName} before insert on hpos.notification_jobs
       for each row execute function ${functionName}()`);
     const paidObservedAt = new Date().toISOString();
+    const paidBody = {
+      connection_id: site.connectionId,
+      source_reference: `square-event-${label}-${randomUUID()}`,
+      provider_checkout_reference: targetCheckoutReference,
+      provider_payment_reference: `square-payment-${label}-${randomUUID()}`,
+      outcome: "paid",
+      observed_at: paidObservedAt,
+      payment_started_at: paidObservedAt,
+      provider_can_take_payment: false,
+      amount: 2500,
+      currency: "USD",
+    };
     let paid;
     try {
       paid = await api(site, `/v1/admin/payment-attempts/${targetAttemptId}/payment-reports`, {
-        method: "POST", idempotencyKey: randomUUID(), body: {
-          connection_id: site.connectionId,
-          source_reference: `square-event-${label}-${randomUUID()}`,
-          provider_checkout_reference: targetCheckoutReference,
-          provider_payment_reference: `square-payment-${label}-${randomUUID()}`,
-          outcome: "paid",
-          observed_at: paidObservedAt,
-          payment_started_at: paidObservedAt,
-          provider_can_take_payment: false,
-          amount: 2500,
-          currency: "USD",
-        },
+        method: "POST", idempotencyKey: randomUUID(), body: paidBody,
       });
     } finally {
       await pool.query(`drop trigger ${triggerName} on hpos.notification_jobs`);
@@ -930,10 +931,12 @@ async function verifyPaymentReportsAndTicketIssuance(site) {
       && admin.data.data.tickets.length === 0
       && admin.data.data.issues.some((issue) => issue.code === "ticket_issuance_failed" && issue.status === "open"),
       "The failed paid Order did not retain paid/awaiting state and open durable Ticket-issuance evidence.");
-    return { version: row.version, admin };
+    return { version: row.version, admin, paidBody, paidObservedAt };
   }
 
   const automaticFailure = await forcePaidIssuanceFailure(orderId, attemptId, checkoutReference, "automatic");
+  const paidBody = automaticFailure.paidBody;
+  const paidObservedAt = automaticFailure.paidObservedAt;
   const interruptedVersion = automaticFailure.version;
   assert(!JSON.stringify(automaticFailure.admin.data).includes(order.data.data.order_token),
     "The staff Order recovery view exposed the buyer's raw Order token.");
@@ -1242,7 +1245,8 @@ async function verifyPaymentReportsAndTicketIssuance(site) {
     "A provider amount mismatch was not retained as a payment conflict.");
   const retainedConflict = await pool.query(
     `select count(*)::integer as reports,
-            (select count(*)::integer from hpos.payment_report_issues where order_id = $1) as issues
+            (select count(*)::integer from hpos.payment_report_issues
+             where order_id = $1 and code = 'payment_report_conflict') as issues
      from hpos.payment_attempt_reports where attempt_id = $2 and conflict_code = 'payment_report_conflict'`,
     [orderId, attemptId],
   );
