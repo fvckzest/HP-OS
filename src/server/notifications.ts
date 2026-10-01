@@ -692,19 +692,29 @@ export async function runBoundedProcessing(trigger: ProcessingTrigger): Promise<
       );
     }
     const verificationRequired = await client.query<{ id: string }>(
-      `update hpos.payment_attempts attempt
+      `with candidates as (
+         select attempt.id
+         from hpos.payment_attempts attempt
+         join hpos.orders order_row
+           on order_row.id = attempt.order_id and order_row.site_id = attempt.site_id
+         join hpos.reservations reservation
+           on reservation.order_id = order_row.id and reservation.site_id = order_row.site_id
+         where order_row.checkout_status = 'awaiting_payment_result'
+           and order_row.payment_status in ('unpaid', 'failed', 'processing', 'unknown', 'conflicted')
+           and order_row.checkout_expires_at <= clock_timestamp()
+           and reservation.status = 'held'
+           and attempt.status in ('creating', 'open')
+           and attempt.provider_can_take_payment is distinct from false
+         order by attempt.created_at, attempt.id
+         limit $1
+         for update of attempt skip locked
+       )
+       update hpos.payment_attempts attempt
        set status = 'requires_verification', version = version + 1, updated_at = clock_timestamp()
-       from hpos.orders order_row
-       join hpos.reservations reservation
-         on reservation.order_id = order_row.id and reservation.site_id = order_row.site_id
-       where attempt.order_id = order_row.id and attempt.site_id = order_row.site_id
-         and order_row.checkout_status = 'awaiting_payment_result'
-         and order_row.payment_status in ('unpaid', 'failed', 'processing', 'unknown', 'conflicted')
-         and order_row.checkout_expires_at <= clock_timestamp()
-         and reservation.status = 'held'
-         and attempt.status in ('creating', 'open')
-         and attempt.provider_can_take_payment is distinct from false
+       from candidates
+       where attempt.id = candidates.id
        returning attempt.id`,
+      [MAX_PROCESS_BATCH],
     );
     const expiredReservations = await client.query<{ id: string; order_id: string; offering_id: string; site_id: string; quantity: number }>(
       `select reservation.id, reservation.order_id, reservation.offering_id,

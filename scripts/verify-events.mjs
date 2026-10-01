@@ -727,6 +727,44 @@ async function verifyPublicPaymentAttemptLifecycle(site) {
   assert(lateCapacity.rows[0]?.reserved_quantity === "0" && lateCapacity.rows[0]?.status === "released"
     && lateCapacity.rows[0]?.checkout_status === "expired",
     "A late provider checkout kept capacity after the Site verified it was closed.");
+
+  const batchEvent = await createPublishedEvent(site, {
+    title: "Issue 34 Bounded Verification Promotion",
+    startsAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+    endsAt: new Date(Date.now() + 2 * 60 * 60_000).toISOString(),
+    timeZone: "UTC",
+    ticketOffering: { price: { amount: 2500, currency: "USD" }, capacity: 51, tax_amount: 0, buyer_fees: [] },
+  });
+  const batchAttempts = [];
+  for (let index = 0; index < 51; index += 1) {
+    batchAttempts.push(await createPendingPaymentAttempt(site, batchEvent, `verification-batch-${index}`));
+  }
+  await pool.query(
+    `update hpos.orders order_row
+     set checkout_expires_at = clock_timestamp() - interval '1 second'
+     where order_row.id in (
+       select attempt.order_id from hpos.payment_attempts attempt where attempt.id = any($1::uuid[])
+     )`,
+    [batchAttempts.map((attempt) => attempt.attempt_id)],
+  );
+  const firstVerificationBatch = await api(site, "/api/cron/process");
+  assert(firstVerificationBatch.status === 200
+    && firstVerificationBatch.data.data.verification_required_attempts === 50
+    && firstVerificationBatch.data.data.has_more === true,
+    "The bounded scheduler did not promote exactly 50 overdue payment attempts or expose the remaining verification work.");
+  const secondVerificationBatch = await api(site, "/api/cron/process");
+  assert(secondVerificationBatch.status === 200
+    && secondVerificationBatch.data.data.verification_required_attempts === 1
+    && secondVerificationBatch.data.data.has_more === false,
+    "The next bounded scheduler run did not promote the one remaining overdue payment attempt.");
+  const promotedBatch = await pool.query(
+    `select count(*)::integer as count
+     from hpos.payment_attempts
+     where id = any($1::uuid[]) and status = 'requires_verification'`,
+    [batchAttempts.map((attempt) => attempt.attempt_id)],
+  );
+  assert(promotedBatch.rows[0]?.count === 51,
+    "Bounded verification promotion did not leave every overdue attempt in the durable verification frontier.");
 }
 
 async function verifySharedCheckoutReferenceIsolation(site) {
