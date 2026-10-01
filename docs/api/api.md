@@ -278,7 +278,7 @@ Wallet templates and artwork are managed entirely by the Site, including default
 
 ## Admission operations
 
-`POST /v1/admin/events/{event_id}/admissions` handles both QR scans and manual check-in. Its request supplies exactly one of `qr_token` for a scanned Ticket or `ticket_id` for a Ticket selected through Site-authorized manual lookup. Both modes require `Idempotency-Key` and apply the same [Admission rules](../features/ticketing.md#admission-and-wallet). HP-OS checks current eligibility and records entry atomically so simultaneous attempts produce exactly one successful Admission. This operation does not require `expected_version`; eligibility is checked against current state when it executes. A retry of the same successful request returns its original result within the replay period rather than recording another Admission. This endpoint was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+`POST /v1/admin/events/{event_id}/admissions` handles QR scans and manual check-in. Before calling HP-OS, the Site backend authorizes the door user for the selected Event. The request supplies exactly one of `qr_token` for a scanned Ticket or `ticket_id` for a Ticket selected through manual lookup. Both modes require `Idempotency-Key` and apply the same [Admission rules](../features/ticketing.md#admission-and-wallet). HP-OS authenticates the Site API key, enforces Site/Event/Ticket scope, and checks current eligibility atomically so simultaneous attempts produce exactly one successful Admission. This operation does not require `expected_version`; eligibility is checked against current state when it executes. Retrying the original successful request with the same key returns its result within the replay period; a new scan uses a new key and reports `already_admitted`. The request and response contract was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10) and implemented for [ticket #32](https://github.com/fvckzest/HP-OS/issues/32).
 
 ### Admission outcomes
 
@@ -291,11 +291,11 @@ Wallet templates and artwork are managed entirely by the Site, including default
 | `409` | `ticket_event_mismatch`, for a Ticket from another Event on the same Site. |
 | `404` | `not_found`, for an invalid admission token, nonexistent Ticket, or Ticket outside the authenticated Site. |
 
-Rejected attempts create no Admission. Within the replay period, retrying the original successful request with the same key returns its original `201` result; a new scan with a new key returns `already_admitted`. These outcomes were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+Rejected attempts create no Admission. Rejection precedence is Site-safe `not_found`, wrong Event on the same Site, Event cancellation, full refund, existing Admission, before opening, then after closing. Within the replay period, retrying the original successful request with the same key returns its original `201` result; a new scan with a new key returns `already_admitted`. These outcomes were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10) and implemented for [ticket #32](https://github.com/fvckzest/HP-OS/issues/32).
 
 ### Manual Ticket lookup
 
-`POST /v1/admin/events/{event_id}/ticket-lookup` accepts either `order_reference` or `email`, plus pagination parameters. It returns matching Orders for that Event with buyer identification, Order status, and individual Ticket IDs and admission eligibility. It does not return buyer access tokens. After a verified delivery-email correction, lookup uses the corrected delivery email. Lookup never creates an Admission: the Site lets the authorized door user select an unused Ticket and explicitly confirm entry through the Admission endpoint. This operation supports the [manual check-in journey](../features/ticketing.md#admission-and-wallet), as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+`POST /v1/admin/events/{event_id}/ticket-lookup` accepts exactly one of `order_reference` or `email`, plus `limit` and `cursor` pagination parameters. Reference and email matching are exact; email uses the current delivery address after verified correction. It returns matching Orders for that Event with buyer identification, Order status, and individual Ticket IDs and admission eligibility, without buyer page-access tokens. Lookup never creates an Admission. The Site lets the authorized door user review results, select one Ticket, and explicitly confirm entry through the Admission endpoint; HP-OS rechecks eligibility at that point. The contract was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10) and implemented for [ticket #32](https://github.com/fvckzest/HP-OS/issues/32).
 
 ## Admin Orders, Tickets, and totals
 
@@ -667,7 +667,7 @@ Totals use the field names agreed above. Money rows cover the union of payment, 
 
 ### Admission details
 
-Admission input is `{ "qr_token": "..." }` or `{ "ticket_id": "..." }`, never both, plus actor. Success data is `{ admission_id, ticket_id, event_id, admitted_at }`. No expected version is required. Check-in uses HP-OS time, including the opening instant and exact end instant; before opening uses `check_in_not_open`, after end uses `check_in_closed`.
+Admission input is `{ "qr_token": "..." }` or `{ "ticket_id": "..." }`, never both, plus actor. Success data is `{ admission_id, ticket_id, event_id, admitted_at }`. No expected version is required. Check-in uses HP-OS time, including the opening instant and exact end instant; before opening uses `check_in_not_open`, after end uses `check_in_closed`. Site authorization, exact lookup selection, atomic eligibility checks, and replay behavior are specified for [ticket #32](https://github.com/fvckzest/HP-OS/issues/32).
 
 Rejection precedence is Site-safe not-found first, wrong Event on the same Site second, then canceled, fully refunded, already admitted, early, and late. Ticket `admission_blockers` returns every applicable blocker in that same business order. A blocked request creates no Admission. Replayed successful admission retains its original Admission ID/time. Lost connectivity never creates offline entry state; an ambiguous timeout is resolved by retrying the same key before treating another scan as a new action.
 
