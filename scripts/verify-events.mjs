@@ -690,6 +690,14 @@ async function verifyPublicPaymentAttemptLifecycle(site) {
     `update hpos.orders set checkout_expires_at = clock_timestamp() - interval '1 second' where id = $1`,
     [lateOrder.data.data.order_id],
   );
+  const lateFrontier = await api(site, `/v1/admin/payment-attempts?requires_verification=true&event_id=${lateEvent.event_id}`);
+  assert(lateFrontier.status === 200 && lateFrontier.data.data.some((row) => row.attempt_id === lateAttempt.data.data.attempt_id
+    && row.requires_verification === true && row.connection.connection_id === site.connectionId
+    && row.checkout_expires_at === lateOrder.data.data.checkout_expires_at),
+    "The Site verification frontier did not expose the overdue interrupted attempt with its deadline and frozen connection.");
+  const lateProcessing = await api(site, "/api/cron/process");
+  assert(lateProcessing.status === 200 && lateProcessing.data.data.verification_required_attempts >= 1,
+    "The bounded processor did not promote the overdue interrupted payment attempt for verification.");
   const lateRegistration = await api(site, `/v1/admin/payment-attempts/${lateAttempt.data.data.attempt_id}/checkout-reference`, {
     method: "POST", idempotencyKey: randomUUID(), body: {
       ...referenceBody,
@@ -698,15 +706,16 @@ async function verifyPublicPaymentAttemptLifecycle(site) {
   });
   assert(lateRegistration.status === 409 && lateRegistration.data.error.code === "checkout_expired",
     "HP-OS registered provider checkout after its accepted Order deadline.");
-  const lateClosure = await api(site, `/v1/admin/payment-attempts/${lateAttempt.data.data.attempt_id}/closure-reports`, {
+  const lateClosure = await api(site, `/v1/admin/payment-attempts/${lateAttempt.data.data.attempt_id}/setup-failure`, {
     method: "POST", idempotencyKey: randomUUID(), body: {
-      ...closureBody,
-      source_reference: "ref:verify-square-checkout-closed-29-late",
-      provider_checkout_reference: "square-test-link-29-late",
+      actor,
+      reason: "provider_unavailable",
+      provider_checkout_closed: true,
+      payment_outcome: "not_started",
     },
   });
   assert(lateClosure.status === 200 && lateClosure.data.data.status === "closed",
-    "The Site could not report verified closure for a late provider setup.");
+    "The Site could not report verified setup failure for a late interrupted checkout.");
   const lateCapacity = await pool.query(
     `select offering.reserved_quantity, reservation.status, order_row.checkout_status
      from hpos.ticket_offerings offering

@@ -194,10 +194,38 @@ async function closure(a) {
   const after = await a.read('capacity-after-setup-failure', `/v1/admin/events/${id(e.event_id)}`);
   a.check('Reservation released', after.data.ticket_offering.available_quantity === e.ticket_offering.available_quantity, 'Safe setup failure restores availability', after.data.ticket_offering.available_quantity);
 }
+async function recoveryFrontier(a) {
+  await configuration(a);
+  const e = await event(a, 'recovery-frontier');
+  const { order } = await reserve(a, e, 'recovery-frontier');
+  const at = await attempt(a, order, 'recovery-frontier');
+  const reference = await checkout(a, at);
+  await a.write('unknown-payment', `/v1/admin/payment-attempts/${id(at.attempt_id)}/payment-reports`, {
+    connection_id: at.connection.connection_id,
+    source_reference: `fake-unknown-${a.run.id}`,
+    provider_checkout_reference: reference,
+    provider_payment_reference: null,
+    outcome: 'unknown',
+    observed_at: iso(a.run.clock + 1000),
+    payment_started_at: null,
+    provider_can_take_payment: null,
+  });
+  const frontier = await a.read('verification-frontier', '/v1/admin/payment-attempts?requires_verification=true&limit=100');
+  const discovered = frontier.data.find(row => row.attempt_id === at.attempt_id);
+  a.check('verification frontier', discovered?.requires_verification === true
+    && discovered.provider_checkout_reference === reference
+    && discovered.connection?.connection_id === at.connection.connection_id
+    && Date.parse(discovered.checkout_expires_at) === Date.parse(order.checkout_expires_at),
+  'The Site can discover the unresolved attempt with its frozen connection and deadline', discovered);
+  await a.write('replacement-blocked', `/v1/admin/orders/${id(order.order_id)}/payment-attempts`, { actor: system }, [409], { expectedError: 'payment_attempt_in_progress' });
+  const scheduled = await a.scheduler('verification-frontier-scheduler');
+  a.check('scheduler verification count', Number.isInteger(scheduled.data.verification_required_attempts), 'The bounded scheduler reports payment attempts promoted for verification', scheduled.data.verification_required_attempts);
+}
 export async function execute(a) {
   const workflow = a.run.workflow;
   if (workflow === 'service') { await configuration(a); return; }
   if (workflow === 'checkout' || workflow === 'closure') { await closure(a); return; }
+  if (workflow === 'recovery-frontier') { await recoveryFrontier(a); return; }
   if (workflow === 'configuration') {
     await configuration(a); await a.read('missing-key', '/v1/admin/payment-configuration', { auth: 'none', expected: [401], expectedError: 'unauthorized' });
     const otherConfig = await a.read('other-Site-configuration', '/v1/admin/payment-configuration', { auth: 'other' });

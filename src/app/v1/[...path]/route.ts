@@ -36,7 +36,7 @@ export async function GET(request: Request, context: RouteContext) {
     const notificationResponse = await handleNotificationGet(request, authentication.site, path);
     if (notificationResponse) return notificationResponse;
 
-    const paymentAttemptResponse = await handlePaymentAttemptGet(authentication.site, path);
+    const paymentAttemptResponse = await handlePaymentAttemptGet(request, authentication.site, path);
     if (paymentAttemptResponse) return paymentAttemptResponse;
 
     if (path.length === 2 && path[0] === "admin" && path[1] === "payment-configuration") {
