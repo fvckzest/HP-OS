@@ -191,7 +191,7 @@ test('isolation scenario checks private records and provider references while bo
   };
   await execute(adapter);
   assert.equal(calls.find(c => c.name === 'other-Site-shared-connection').expectedError, undefined);
-  for (const name of ['event', 'public-event', 'related-orders', 'related-tickets', 'order', 'attempt', 'order-token', 'ticket-token', 'provider-reference']) {
+  for (const name of ['event', 'public-event', 'payment-status', 'attempt', 'order-token', 'ticket-token', 'provider-reference']) {
     const call = calls.find(c => c.name === 'other-Site-' + name);
     assert.equal(call.auth, 'other'); assert.deepEqual(call.expected, [404]); assert.equal(call.expectedError, 'not_found');
   }
@@ -200,4 +200,17 @@ test('isolation scenario checks private records and provider references while bo
   assert.equal(reuse.body.provider_checkout_reference, calls.find(c => c.name === 'checkout-register').body.provider_checkout_reference);
   assert.equal(saved.privateContext.order.order_id, 'purchase-order');
   assert.equal(saved.privateContext.attempt.attempt_id, 'attempt-create');
+  for (const call of calls) {
+    const route = routes.find(r => new RegExp('^' + r.route.split(' ').slice(1).join(' ').replace(/\{[^}]+\}/g, '[^/]+') + '$').test(call.path));
+    if (route) assert.equal(route.implemented, true, call.path);
+  }
+});
+test('cross-Site reference conflicts fail contract checks instead of being accepted as isolation proof', async t => {
+  const store = await tempStore(t), saved = run();
+  const adapter = new Adapter(config(), saved, store, new AbortController().signal, async () => response(409, { error: { code: 'provider_reference_conflict', message: 'Already attached to another attempt.' } }));
+  await assert.rejects(adapter.write('other-Site-provider-reference', '/v1/admin/payment-attempts/secondary-attempt/checkout-reference', {
+    connection_id: 'dedicated-connection', provider_checkout_reference: 'primary-reference', provider_can_take_payment: true,
+  }, [404], { auth: 'other', expectedError: 'not_found' }), /HTTP 404 with not_found/);
+  assert.equal(saved.checks[0].passed, false);
+  assert.equal(saved.steps[0].actual.status, 409);
 });

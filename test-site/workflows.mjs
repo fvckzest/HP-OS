@@ -192,8 +192,7 @@ export async function execute(a) {
     const f = await fixture(a);
     const denied = {
       event: `/v1/admin/events/${id(f.e.event_id)}`, 'public-event': `/v1/public/events/${id(f.e.event_id)}`,
-      'related-orders': `/v1/admin/events/${id(f.e.event_id)}/orders`, 'related-tickets': `/v1/admin/events/${id(f.e.event_id)}/tickets`,
-      order: `/v1/admin/orders/${id(f.order.order_id)}`, attempt: `/v1/admin/payment-attempts/${id(f.at.attempt_id)}`,
+      'payment-status': `/v1/admin/orders/${id(f.order.order_id)}/payment-status`, attempt: `/v1/admin/payment-attempts/${id(f.at.attempt_id)}`,
       'order-token': `/v1/public/orders/${id(f.order.order_token)}`, 'ticket-token': `/v1/public/tickets/${id(f.ticket.ticket_token)}`,
     };
     for (const [name, path] of Object.entries(denied)) await a.read('other-Site-' + name, path, { auth: 'other', expected: [404], expectedError: 'not_found' });
