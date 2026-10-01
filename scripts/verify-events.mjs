@@ -690,10 +690,15 @@ async function verifyPublicPaymentAttemptLifecycle(site) {
     `update hpos.orders set checkout_expires_at = clock_timestamp() - interval '1 second' where id = $1`,
     [lateOrder.data.data.order_id],
   );
+  const lateDeadlineResult = await pool.query(
+    `select checkout_expires_at from hpos.orders where id = $1`,
+    [lateOrder.data.data.order_id],
+  );
+  const lateDeadline = lateDeadlineResult.rows[0]?.checkout_expires_at?.toISOString();
   const lateFrontier = await api(site, `/v1/admin/payment-attempts?requires_verification=true&event_id=${lateEvent.event_id}`);
   assert(lateFrontier.status === 200 && lateFrontier.data.data.some((row) => row.attempt_id === lateAttempt.data.data.attempt_id
     && row.requires_verification === true && row.connection.connection_id === site.connectionId
-    && row.checkout_expires_at === lateOrder.data.data.checkout_expires_at),
+    && row.checkout_expires_at === lateDeadline),
     "The Site verification frontier did not expose the overdue interrupted attempt with its deadline and frozen connection.");
   const lateProcessing = await api(site, "/api/cron/process");
   assert(lateProcessing.status === 200 && lateProcessing.data.data.verification_required_attempts >= 1,

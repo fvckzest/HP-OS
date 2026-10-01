@@ -806,7 +806,7 @@ export async function runBoundedProcessing(trigger: ProcessingTrigger): Promise<
       started_at: startedAt.toISOString(),
       finished_at: finishedAt.toISOString(),
       recovered_jobs: jobIds.length,
-      verification_required_attempts: verificationRequired.rowCount,
+      verification_required_attempts: verificationRequired.rowCount ?? 0,
       released_reservations: releasedReservations,
       batch_limit: MAX_PROCESS_BATCH,
       has_more: (more.rowCount ?? 0) > 0 || (moreReservations.rowCount ?? 0) > 0 || (moreVerification.rowCount ?? 0) > 0,
