@@ -370,6 +370,33 @@ export async function execute(a) {
     return;
   }
   const f = await fixture(a);
+  if (workflow === 'issuance-recovery') {
+    const staff = await a.read('staff-order-recovery', `/v1/admin/orders/${id(f.order.order_id)}`, { fresh: true });
+    a.check('staff Order recovery view', staff.data.payment_status === 'paid'
+      && staff.data.issuance_status === 'issued'
+      && staff.data.tickets.length === 1
+      && staff.data.notification_jobs.filter(job => job.kind === 'tickets_ready').length === 1,
+    'Staff Order view retains one Ticket and one initial delivery job', {
+      payment: staff.data.payment_status,
+      issuance: staff.data.issuance_status,
+      tickets: staff.data.tickets.length,
+      jobs: staff.data.notification_jobs.length,
+    });
+    const scheduled = await a.scheduler('issuance-recovery-scheduler');
+    a.check('scheduler recovery boundary', scheduled.data.ticket_issuance?.checked >= 0 && scheduled.data.has_more === false,
+      'The bounded scheduler can run without visitor traffic and reports no remaining issuance backlog', scheduled.data.ticket_issuance);
+    await a.write('retry-issued-order', `/v1/admin/orders/${id(f.order.order_id)}/actions/retry_ticket_issuance`, {
+      actor: human, expected_version: staff.data.version,
+    }, [409], { expectedError: 'invalid_state' });
+    const after = await a.read('staff-order-after-retry', `/v1/admin/orders/${id(f.order.order_id)}`, { fresh: true });
+    a.check('retry remains idempotent', after.data.tickets.length === 1
+      && after.data.notification_jobs.filter(job => job.kind === 'tickets_ready').length === 1,
+    'A guarded retry cannot duplicate Ticket identities or initial delivery work', {
+      tickets: after.data.tickets.length,
+      jobs: after.data.notification_jobs.length,
+    });
+    return;
+  }
   if (['delivery', 'durable-jobs', 'unknown-email', 'journey'].includes(workflow)) await deliver(a, f, { unknown: workflow === 'unknown-email', overlap: workflow === 'durable-jobs' });
   if (workflow === 'durable-jobs') await a.scheduler('bounded-scheduler');
   if (['admission', 'journey'].includes(workflow)) await admit(a, f, { concurrency: workflow === 'admission' });

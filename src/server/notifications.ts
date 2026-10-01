@@ -831,7 +831,7 @@ export async function handleScheduledProcessing(request: Request): Promise<Respo
   try {
     const processing = await runBoundedProcessing(production ? "vercel_cron" : "local_scheduler");
     const issuance = await (await import("./ticket-issuance")).processPendingTicketIssuance();
-    return apiSuccess({ ...processing, ticket_issuance: issuance });
+    return apiSuccess({ ...processing, has_more: processing.has_more || issuance.has_more, ticket_issuance: issuance });
   }
   catch { return apiFailure(503, "service_unavailable", "The bounded HP-OS processing cycle failed.", { retryAfter: 30 }); }
 }
