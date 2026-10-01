@@ -759,6 +759,8 @@ All members shown are required. `venue.address` may be `null`; `changed_fields` 
 | `expected_version` | integer; guarded input | Version the client loaded; reject stale changes. |
 | `actor` | Actor; admin writes | Site-asserted user/system attribution, not a credential. |
 
+For `tickets_ready` jobs, an Order's current delivery state is derived from the newest applicable job: `pending` while dispatch is pending or requires verification, `sent` after confirmed dispatch without a delivery report, `delivered` after a successful delivery report, and `failed` after a failed dispatch or delivery report. An unknown result never authorizes a blind resend. `recovery_actions` records `reason` and `verification_reference` for delivery-email corrections.
+
 Audit history retains actor, operation, timestamp, prior/new versions, and non-secret evidence references. Exact audit-history wire fields are not enumerated in the contract; use its detailed rules rather than assuming a schema.
 
 ## Request and response bodies
@@ -783,7 +785,7 @@ Each row lists operation-specific body fields/result data. Apply common headers 
 | Manual lookup | `Exactly one of order_reference/email; optional limit/cursor` | `Paginated OrderSummary[]; 200` |
 | Admission | `Exactly one of qr_token/ticket_id` | `Admission; 201` |
 | Retry issuance / resend | `expected_version` | `AdminOrder; 202` |
-| Correct delivery email | `email, reason, verification_reference, expected_version` | `AdminOrder; 200` |
+| Correct delivery email | `email, reason, verification_reference, expected_version` | `AdminOrder; 202` |
 | Create payment attempt | `No operation fields` | `PaymentAttempt; 201` |
 | Register checkout | `connection_id, provider_checkout_reference, provider_can_take_payment:true` | `PaymentAttempt; 200` |
 | Payment report | `connection_id, source_reference, provider_checkout_reference, provider_payment_reference, outcome, observed_at, payment_started_at, provider_can_take_payment; amount/currency required for paid` | `{report_id,applied,attempt,order_id}; new 201 / repeat 200` |

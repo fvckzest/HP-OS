@@ -5,7 +5,7 @@ import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
 import { publicEventData } from "./events";
-import { enqueueNotificationJob } from "./notifications";
+import { enqueueNotificationJob, supersedeUnsentNotificationJobs } from "./notifications";
 import type { AuthenticatedSite } from "./site-auth";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -123,6 +123,20 @@ function actor(value: unknown): { type: "user" | "system"; reference: string } |
 
 function expectedVersion(value: unknown): number | null {
   return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : null;
+}
+
+function recoveryEmail(value: unknown): { email: string; normalizedEmail: string } | null {
+  if (typeof value !== "string") return null;
+  const email = value.trim();
+  if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return null;
+  return { email, normalizedEmail: email.toLowerCase() };
+}
+
+function recoveryText(value: unknown, maximum = 500): value is string {
+  return typeof value === "string"
+    && value.trim().length > 0
+    && value.length <= maximum
+    && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
 async function readJsonBody(request: Request): Promise<Record<string, unknown> | Response> {
@@ -424,6 +438,26 @@ interface ReadOrderRow extends IssuanceRow {
   tickets_delivery_outcome: "delivered" | "failed" | null;
 }
 
+interface RecoveryJobRow {
+  id: string;
+  status: "pending" | "failed" | "completed";
+  is_superseded: boolean;
+  attempt_count: number;
+  requires_verification: boolean;
+  provider_message_reference: string | null;
+  delivery_status: "delivered" | "failed" | null;
+  created_at: Date;
+}
+
+function recoveryDeliveryState(job: RecoveryJobRow | null): "pending" | "sent" | "delivered" | "failed" | null {
+  if (!job) return null;
+  if (job.requires_verification || job.status === "pending") return "pending";
+  if (job.delivery_status === "delivered") return "delivered";
+  if (job.delivery_status === "failed" || job.status === "failed") return "failed";
+  if (job.status === "completed") return "sent";
+  return null;
+}
+
 function currentDeliveryStatus(row: ReadOrderRow): string {
   if (row.tickets_delivery_outcome === "delivered") return "delivered";
   if (row.tickets_delivery_outcome === "failed" || row.tickets_delivery_job_status === "failed") return "failed";
@@ -672,12 +706,17 @@ async function readAdminOrder(site: AuthenticatedSite, orderId: string, existing
       [site.siteId, orderId],
     );
     const jobsResult = await client.query<{
-      id: string; kind: string; status: string; event_id: string | null; order_id: string | null;
+      id: string; kind: string; status: "pending" | "failed" | "completed"; event_id: string | null; order_id: string | null;
       is_superseded: boolean; attempt_count: number; available_at: Date; created_at: Date; updated_at: Date;
       requires_verification: boolean; provider_message_reference: string | null;
+      delivery_status: "delivered" | "failed" | null;
     }>(
       `select id, kind, status, event_id, order_id, is_superseded, attempt_count,
-              available_at, created_at, updated_at, requires_verification, provider_message_reference
+              available_at, created_at, updated_at, requires_verification, provider_message_reference,
+              (select d.outcome
+               from hpos.notification_delivery_events d
+               where d.site_id = notification_jobs.site_id and d.job_id = notification_jobs.id
+               order by d.observed_at desc, d.id desc limit 1) as delivery_status
        from hpos.notification_jobs
        where site_id = $1 and order_id = $2
        order by created_at asc, id asc`,
@@ -702,8 +741,10 @@ async function readAdminOrder(site: AuthenticatedSite, orderId: string, existing
     const recoveryActionsResult = await client.query<{
       id: string; action: string; actor_type: string; actor_reference: string;
       previous_version: number; new_version: number; created_at: Date;
+      reason: string | null; verification_reference: string | null;
     }>(
       `select id, action, actor_type, actor_reference, previous_version, new_version, created_at
+              , reason, verification_reference
        from hpos.order_recovery_actions
        where site_id = $1 and order_id = $2
        order by created_at asc, id asc`,
@@ -728,7 +769,9 @@ async function readAdminOrder(site: AuthenticatedSite, orderId: string, existing
       checkout_status: row.checkout_status,
       payment_status: row.payment_status,
       issuance_status: row.issuance_status,
-      delivery_status: row.delivery_status,
+      delivery_status: recoveryDeliveryState(jobsResult.rows
+        .filter((job) => job.kind === "tickets_ready")
+        .at(-1) ?? null) ?? row.delivery_status,
       refund_status: row.refund_status,
       event,
       reservation: {
@@ -772,6 +815,7 @@ async function readAdminOrder(site: AuthenticatedSite, orderId: string, existing
         updated_at: job.updated_at.toISOString(),
         requires_verification: job.requires_verification,
         provider_message_reference: job.provider_message_reference,
+        delivery_status: job.delivery_status,
       })),
       issues: issuesResult.rows.map((issue) => ({
         issue_id: issue.id,
@@ -796,6 +840,8 @@ async function readAdminOrder(site: AuthenticatedSite, orderId: string, existing
         previous_version: action.previous_version,
         new_version: action.new_version,
         created_at: action.created_at.toISOString(),
+        reason: action.reason,
+        verification_reference: action.verification_reference,
       })),
       tickets: ticketsResult.rows.map((ticket) => adminTicketData(ticket, event)),
     }));
@@ -849,6 +895,159 @@ async function retryTicketIssuance(client: PoolClient, site: AuthenticatedSite, 
   return { status: 202, data: data.data };
 }
 
+async function latestTicketEmailJob(client: PoolClient, siteId: string, orderId: string): Promise<RecoveryJobRow | null> {
+  const result = await client.query<RecoveryJobRow>(
+    `select job.id, job.status, job.is_superseded, job.attempt_count,
+            job.requires_verification, job.provider_message_reference, job.created_at,
+            (select delivery.outcome
+             from hpos.notification_delivery_events delivery
+             where delivery.site_id = job.site_id and delivery.job_id = job.id
+             order by delivery.observed_at desc, delivery.id desc limit 1) as delivery_status
+     from hpos.notification_jobs job
+     where job.site_id = $1 and job.order_id = $2 and job.kind = 'tickets_ready'
+     order by job.created_at desc, job.id desc
+     limit 1`,
+    [siteId, orderId],
+  );
+  return result.rows[0] ?? null;
+}
+
+function ticketEmailPayload(row: IssuanceRow) {
+  if (!row.order_token) throw new ApiOperationError(409, "invalid_state", "The Order has no current buyer access token.");
+  const event = publicEventData(row);
+  return {
+    recipient_email: row.delivery_email,
+    buyer_name: row.buyer_name,
+    event: eventNotificationDetails(event, row.event_id),
+    order: { order_id: row.order_id, order_reference: row.order_reference, order_token: row.order_token },
+  };
+}
+
+function assertRecoveryActorAndVersion(body: Record<string, unknown>, allowed: string[]): { actor: { type: "user" | "system"; reference: string }; version: number } {
+  if (!hasOnlyKeys(body, allowed)) throw new ApiOperationError(422, "validation_failed", "The recovery action contains an unsupported field.");
+  const parsedActor = actor(body.actor);
+  if (!parsedActor) throw new ApiOperationError(422, "validation_failed", "Provide a valid Site-local actor reference.", [{ field: "actor", code: "invalid_actor", message: "Use {type, reference} with a non-secret reference." }]);
+  const version = expectedVersion(body.expected_version);
+  if (!version) throw new ApiOperationError(422, "validation_failed", "expected_version must be a positive integer.", [{ field: "expected_version", code: "required", message: "Use the current Order version." }]);
+  return { actor: parsedActor, version };
+}
+
+async function recordRecoveryAction(
+  client: PoolClient,
+  site: AuthenticatedSite,
+  orderId: string,
+  action: string,
+  actorValue: { type: "user" | "system"; reference: string },
+  previousVersion: number,
+  newVersion: number,
+  reason: string | null = null,
+  verificationReference: string | null = null,
+): Promise<void> {
+  await client.query(
+    `insert into hpos.order_recovery_actions
+       (id, site_id, order_id, action, actor_type, actor_reference, previous_version, new_version, reason, verification_reference)
+     values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    [randomUUID(), site.siteId, orderId, action, actorValue.type, actorValue.reference, previousVersion, newVersion, reason, verificationReference],
+  );
+}
+
+async function readRecoveryResponse(client: PoolClient, site: AuthenticatedSite, orderId: string): Promise<IdempotentResult> {
+  const response = await readAdminOrder(site, orderId, client);
+  const data = await response.json() as { data?: unknown; error?: { code?: string; message?: string } };
+  if (response.status >= 400 || data.data === undefined) throw new ApiOperationError(503, "service_unavailable", "The recovered Order could not be read after the action completed.");
+  return { status: 202, data: data.data };
+}
+
+async function resendTicketEmail(client: PoolClient, site: AuthenticatedSite, orderId: string, body: Record<string, unknown>): Promise<IdempotentResult> {
+  const parsed = assertRecoveryActorAndVersion(body, ["actor", "expected_version"]);
+  if (!UUID_PATTERN.test(orderId)) throw new ApiOperationError(404, "not_found", "The Order is not available to this Site.");
+  const row = await readIssuanceRow(client, site.siteId, orderId);
+  if (!row) throw new ApiOperationError(404, "not_found", "The Order is not available to this Site.");
+  if (row.order_version !== parsed.version) throw new ApiOperationError(409, "version_conflict", "The Order changed after you loaded it. Reload it before resending the Ticket email.");
+  if (row.payment_status !== "paid" || row.issuance_status !== "issued") throw new ApiOperationError(409, "invalid_state", "A Ticket email can only be resent for a paid Order with issued Tickets.");
+  if (row.refund_status === "full") throw new ApiOperationError(409, "invalid_state", "A fully refunded Order cannot receive a Ticket email resend.");
+  const ticketCount = await client.query<{ count: number }>(
+    `select count(*)::integer as count from hpos.tickets where site_id = $1 and order_id = $2`,
+    [site.siteId, orderId],
+  );
+  if ((ticketCount.rows[0]?.count ?? 0) === 0) throw new ApiOperationError(409, "invalid_state", "The paid Order has no issued Tickets to resend.");
+  const latest = await latestTicketEmailJob(client, site.siteId, orderId);
+  if (!latest) throw new ApiOperationError(409, "invalid_state", "The Order has no Ticket email history to recover.");
+  if (latest.requires_verification) throw new ApiOperationError(409, "delivery_verification_required", "The latest Ticket email outcome is unknown. Verify the provider or durable Site log before requesting another send.");
+  const state = recoveryDeliveryState(latest);
+  if (state === "pending") throw new ApiOperationError(409, "delivery_in_progress", "The latest Ticket email is still in progress.");
+  if (state === "sent") throw new ApiOperationError(409, "delivery_verification_required", "The latest Ticket email was sent, but its delivery outcome is not known. Verify it before requesting another send.");
+  if (state === "delivered") throw new ApiOperationError(409, "already_delivered", "The latest Ticket email has confirmed delivery.");
+  if (state !== "failed") throw new ApiOperationError(409, "invalid_state", "The latest Ticket email is not in a resendable failure state.");
+
+  const updated = await client.query<{ version: number }>(
+    `update hpos.orders
+     set delivery_status = 'pending', version = version + 1, updated_at = clock_timestamp()
+     where id = $1 and site_id = $2 and version = $3 and payment_status = 'paid' and issuance_status = 'issued'
+     returning version`,
+    [orderId, site.siteId, parsed.version],
+  );
+  if (updated.rowCount !== 1) throw new ApiOperationError(409, "version_conflict", "The Order changed after you loaded it. Reload it before resending the Ticket email.");
+  await enqueueNotificationJob(client, { siteId: site.siteId, kind: "tickets_ready", eventId: row.event_id, orderId, payload: ticketEmailPayload(row) });
+  await recordRecoveryAction(client, site, orderId, "resend_ticket_email", parsed.actor, parsed.version, updated.rows[0].version);
+  return readRecoveryResponse(client, site, orderId);
+}
+
+async function correctDeliveryEmail(client: PoolClient, site: AuthenticatedSite, orderId: string, body: Record<string, unknown>): Promise<IdempotentResult> {
+  const parsed = assertRecoveryActorAndVersion(body, ["actor", "expected_version", "email", "reason", "verification_reference"]);
+  const corrected = recoveryEmail(body.email);
+  if (!corrected) throw new ApiOperationError(422, "validation_failed", "Provide a valid delivery email address.", [{ field: "email", code: "invalid_email", message: "Use a valid email address of at most 254 characters." }]);
+  if (!recoveryText(body.reason, 500)) throw new ApiOperationError(422, "validation_failed", "reason is required for a verified delivery-email correction.", [{ field: "reason", code: "required", message: "Record why the address was corrected." }]);
+  if (!recoveryText(body.verification_reference, 500)) throw new ApiOperationError(422, "validation_failed", "verification_reference is required for a verified delivery-email correction.", [{ field: "verification_reference", code: "required", message: "Record a non-secret verification reference." }]);
+  if (!UUID_PATTERN.test(orderId)) throw new ApiOperationError(404, "not_found", "The Order is not available to this Site.");
+  const row = await readIssuanceRow(client, site.siteId, orderId);
+  if (!row) throw new ApiOperationError(404, "not_found", "The Order is not available to this Site.");
+  if (row.order_version !== parsed.version) throw new ApiOperationError(409, "version_conflict", "The Order changed after you loaded it. Reload it before correcting the delivery email.");
+  if (row.payment_status !== "paid" || row.issuance_status !== "issued") throw new ApiOperationError(409, "invalid_state", "Delivery email correction requires a paid Order with issued Tickets.");
+  if (row.refund_status === "full") throw new ApiOperationError(409, "invalid_state", "A fully refunded Order cannot receive corrected Ticket access.");
+  const latest = await latestTicketEmailJob(client, site.siteId, orderId);
+  if (latest?.requires_verification) throw new ApiOperationError(409, "delivery_verification_required", "The latest Ticket email outcome is unknown. Verify it before replacing access links and sending to another address.");
+  if (recoveryDeliveryState(latest) === "pending") throw new ApiOperationError(409, "delivery_in_progress", "The latest Ticket email is still in progress. Wait for its outcome before correcting the delivery email.");
+  const ticketRows = await client.query<{ id: string }>(
+    `select id from hpos.tickets where site_id = $1 and order_id = $2 order by ordinal asc for update`,
+    [site.siteId, orderId],
+  );
+  if (ticketRows.rowCount === 0) throw new ApiOperationError(409, "invalid_state", "The paid Order has no issued Tickets to correct.");
+  const buyer = await client.query<{ id: string }>(
+    `insert into hpos.buyers (site_id, normalized_email, name)
+     values ($1, $2, $3)
+     on conflict (site_id, normalized_email)
+     do update set name = excluded.name, updated_at = clock_timestamp()
+     returning id`,
+    [site.siteId, corrected.normalizedEmail, row.buyer_name],
+  );
+  const orderToken = randomBytes(32).toString("base64url");
+  const updated = await client.query<{ version: number }>(
+    `update hpos.orders
+     set buyer_id = $4, delivery_email = $5, order_token = $6,
+         order_token_hash = $7, delivery_status = 'pending', version = version + 1,
+         updated_at = clock_timestamp()
+     where id = $1 and site_id = $2 and version = $3 and payment_status = 'paid' and issuance_status = 'issued'
+     returning version`,
+    [orderId, site.siteId, parsed.version, buyer.rows[0].id, corrected.email, orderToken, hashToken(orderToken)],
+  );
+  if (updated.rowCount !== 1) throw new ApiOperationError(409, "version_conflict", "The Order changed after you loaded it. Reload it before correcting the delivery email.");
+  for (const ticket of ticketRows.rows) {
+    const token = randomBytes(32).toString("base64url");
+    await client.query(
+      `update hpos.tickets
+       set ticket_token = $3, ticket_token_hash = $4, version = version + 1, updated_at = clock_timestamp()
+       where id = $1 and site_id = $2`,
+      [ticket.id, site.siteId, token, hashToken(token)],
+    );
+  }
+  await supersedeUnsentNotificationJobs(client, { siteId: site.siteId, orderId, kinds: ["tickets_ready"] });
+  const correctedRow = { ...row, delivery_email: corrected.email, order_token: orderToken } as IssuanceRow;
+  await enqueueNotificationJob(client, { siteId: site.siteId, kind: "tickets_ready", eventId: row.event_id, orderId, payload: ticketEmailPayload(correctedRow) });
+  await recordRecoveryAction(client, site, orderId, "correct_delivery_email", parsed.actor, parsed.version, updated.rows[0].version, body.reason.trim(), body.verification_reference.trim());
+  return readRecoveryResponse(client, site, orderId);
+}
+
 export async function handleAdminOrderGet(site: AuthenticatedSite, path: string[]): Promise<Response | null> {
   if (path.length !== 3 || path[0] !== "admin" || path[1] !== "orders") return null;
   return readAdminOrder(site, path[2]);
@@ -856,10 +1055,12 @@ export async function handleAdminOrderGet(site: AuthenticatedSite, path: string[
 
 export async function handleAdminOrderActionPost(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
   if (path.length !== 5 || path[0] !== "admin" || path[1] !== "orders" || path[3] !== "actions") return null;
-  if (path[4] !== "retry_ticket_issuance") return apiFailure(404, "not_found", "The requested Order action is unavailable.");
+  if (!["retry_ticket_issuance", "resend_ticket_email", "correct_delivery_email"].includes(path[4])) return apiFailure(404, "not_found", "The requested Order action is unavailable.");
   const body = await readJsonBody(request);
   if (body instanceof Response) return body;
-  return withApiIdempotency(request, site, body, (client) => retryTicketIssuance(client, site, path[2], body), undefined, body);
+  const action = path[4] === "retry_ticket_issuance" ? retryTicketIssuance
+    : path[4] === "resend_ticket_email" ? resendTicketEmail : correctDeliveryEmail;
+  return withApiIdempotency(request, site, body, (client) => action(client, site, path[2], body), undefined, body);
 }
 
 export async function handleAdminOrderPaymentStatusGet(site: AuthenticatedSite, path: string[]): Promise<Response | null> {
