@@ -4,7 +4,7 @@ import { isPaymentConnectionId, readSitePaymentConfiguration, readSitePaymentCon
 import { handleNotificationGet, handleNotificationPost } from "@/server/notifications";
 import { handleCheckoutPost } from "@/server/checkout";
 import { handlePaymentAttemptGet, handlePaymentAttemptPost } from "@/server/payment-attempts";
-import { handleAdminOrderPaymentStatusGet, handleBuyerOrderGet, handleBuyerTicketGet } from "@/server/ticket-issuance";
+import { handleAdminOrderActionPost, handleAdminOrderGet, handleAdminOrderPaymentStatusGet, handleBuyerOrderGet, handleBuyerTicketGet } from "@/server/ticket-issuance";
 import { handlePaymentInvestigationGet, handlePaymentReportPost, handlePaymentResolutionPost } from "@/server/payment-reports";
 import { handleEventActionPost, handleEventGet, handleEventPatch, handleEventPost } from "@/server/events";
 import { handleAdmissionPost } from "@/server/admissions";
@@ -29,6 +29,9 @@ export async function GET(request: Request, context: RouteContext) {
 
     const orderStatusResponse = await handleAdminOrderPaymentStatusGet(authentication.site, path);
     if (orderStatusResponse) return orderStatusResponse;
+
+    const adminOrderResponse = await handleAdminOrderGet(authentication.site, path);
+    if (adminOrderResponse) return adminOrderResponse;
 
     const eventResponse = await handleEventGet(request, authentication.site, path);
     if (eventResponse) return eventResponse;
@@ -73,6 +76,9 @@ export async function POST(request: Request, context: RouteContext) {
 
     const paymentResolutionResponse = await handlePaymentResolutionPost(request, authentication.site, path);
     if (paymentResolutionResponse) return paymentResolutionResponse;
+
+    const adminOrderActionResponse = await handleAdminOrderActionPost(request, authentication.site, path);
+    if (adminOrderActionResponse) return adminOrderActionResponse;
 
     const paymentReportResponse = await handlePaymentReportPost(request, authentication.site, path);
     if (paymentReportResponse) return paymentReportResponse;

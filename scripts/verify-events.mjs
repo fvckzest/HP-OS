@@ -851,7 +851,7 @@ async function verifyPaymentReportsAndTicketIssuance(site) {
     endsAt: new Date(now + 60 * 60_000).toISOString(),
     checkInOpensAt: new Date(now - 30 * 60_000).toISOString(),
     timeZone: "UTC",
-    ticketOffering: { price: { amount: 2500, currency: "USD" }, capacity: 2, tax_amount: 0, buyer_fees: [] },
+    ticketOffering: { price: { amount: 2500, currency: "USD" }, capacity: 3, tax_amount: 0, buyer_fees: [] },
   });
   const quote = await api(site, `/v1/public/events/${event.event_id}/quotes`, {
     method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
@@ -878,62 +878,180 @@ async function verifyPaymentReportsAndTicketIssuance(site) {
   });
   assert(registered.status === 200, "The Issue #30 fixture could not register the provider checkout: " + JSON.stringify(registered.data));
 
-  const suffix = randomUUID().replaceAll("-", "");
-  const functionName = `hpos.test_issue30_reject_job_${suffix}`;
-  const triggerName = `issue30_reject_job_${suffix}`;
   const orderId = order.data.data.order_id;
-  await pool.query(`create function ${functionName}() returns trigger language plpgsql as $$
-    begin
-      if new.kind = 'tickets_ready' and new.order_id = '${orderId}'::uuid then
-        raise exception 'injected interruption after confirmed payment';
-      end if;
-      return new;
-    end;
-  $$`);
-  await pool.query(`create trigger ${triggerName} before insert on hpos.notification_jobs
-    for each row execute function ${functionName}()`);
-  const paidObservedAt = new Date().toISOString();
-  const paidBody = {
-    connection_id: site.connectionId,
-    source_reference: "square-event-30-" + randomUUID(),
-    provider_checkout_reference: checkoutReference,
-    provider_payment_reference: "square-payment-30-" + randomUUID(),
-    outcome: "paid",
-    observed_at: paidObservedAt,
-    payment_started_at: paidObservedAt,
-    provider_can_take_payment: false,
-    amount: 2500,
-    currency: "USD",
-  };
-  let paid;
-  try {
-    paid = await api(site, `/v1/admin/payment-attempts/${attemptId}/payment-reports`, {
-      method: "POST", idempotencyKey: randomUUID(), body: paidBody,
-    });
-  } finally {
-    await pool.query(`drop trigger ${triggerName} on hpos.notification_jobs`);
-    await pool.query(`drop function ${functionName}()`);
+  async function forcePaidIssuanceFailure(targetOrderId, targetAttemptId, targetCheckoutReference, label) {
+    const functionName = `hpos.test_issue36_reject_job_${randomUUID().replaceAll("-", "")}`;
+    const triggerName = `issue36_reject_job_${randomUUID().replaceAll("-", "")}`;
+    await pool.query(`create function ${functionName}() returns trigger language plpgsql as $$
+      begin
+        if new.kind = 'tickets_ready' and new.order_id = '${targetOrderId}'::uuid then
+          raise exception 'injected interruption after confirmed payment';
+        end if;
+        return new;
+      end;
+    $$`);
+    await pool.query(`create trigger ${triggerName} before insert on hpos.notification_jobs
+      for each row execute function ${functionName}()`);
+    const paidObservedAt = new Date().toISOString();
+    const paidBody = {
+      connection_id: site.connectionId,
+      source_reference: `square-event-${label}-${randomUUID()}`,
+      provider_checkout_reference: targetCheckoutReference,
+      provider_payment_reference: `square-payment-${label}-${randomUUID()}`,
+      outcome: "paid",
+      observed_at: paidObservedAt,
+      payment_started_at: paidObservedAt,
+      provider_can_take_payment: false,
+      amount: 2500,
+      currency: "USD",
+    };
+    let paid;
+    try {
+      paid = await api(site, `/v1/admin/payment-attempts/${targetAttemptId}/payment-reports`, {
+        method: "POST", idempotencyKey: randomUUID(), body: paidBody,
+      });
+    } finally {
+      await pool.query(`drop trigger ${triggerName} on hpos.notification_jobs`);
+      await pool.query(`drop function ${functionName}()`);
+    }
+    assert(paid.status === 201 && paid.data.data.attempt.last_outcome === "paid",
+      "HP-OS did not persist the provider-confirmed payment before attempting issuance.");
+    const interrupted = await pool.query(
+      `select payment_status, issuance_status, version,
+              (select count(*)::integer from hpos.tickets where order_id = orders.id) as tickets
+       from hpos.orders where id = $1`,
+      [targetOrderId],
+    );
+    const row = interrupted.rows[0];
+    assert(row?.payment_status === "paid" && row?.issuance_status === "failed" && row?.tickets === 0,
+      "An interrupted issuance erased payment or left a partial Ticket set.");
+    const admin = await api(site, `/v1/admin/orders/${targetOrderId}`);
+    assert(admin.status === 200 && admin.data.data.payment_status === "paid"
+      && admin.data.data.issuance_status === "failed" && admin.data.data.version === row.version
+      && admin.data.data.tickets.length === 0
+      && admin.data.data.issues.some((issue) => issue.code === "ticket_issuance_failed" && issue.status === "open"),
+      "The failed paid Order did not retain paid/awaiting state and open durable Ticket-issuance evidence.");
+    return { version: row.version, admin, paidBody, paidObservedAt };
   }
-  assert(paid.status === 201 && paid.data.data.attempt.last_outcome === "paid",
-    "HP-OS did not persist the provider-confirmed payment before attempting issuance.");
-  const interrupted = await pool.query(
+
+  const automaticFailure = await forcePaidIssuanceFailure(orderId, attemptId, checkoutReference, "automatic");
+  const paidBody = automaticFailure.paidBody;
+  const paidObservedAt = automaticFailure.paidObservedAt;
+  const interruptedVersion = automaticFailure.version;
+  assert(!JSON.stringify(automaticFailure.admin.data).includes(order.data.data.order_token),
+    "The staff Order recovery view exposed the buyer's raw Order token.");
+
+  const recoveredRuns = await Promise.all([api(site, "/api/cron/process"), api(site, "/api/cron/process")]);
+  assert(recoveredRuns.every((run) => run.status === 200)
+    && recoveredRuns.some((run) => run.data.data.ticket_issuance?.issued >= 1),
+    "Overlapping bounded scheduler runs did not recover the paid Order directly from failed issuance.");
+  const automaticState = await pool.query(
     `select payment_status, issuance_status,
             (select count(*)::integer from hpos.tickets where order_id = orders.id) as tickets
      from hpos.orders where id = $1`,
     [orderId],
   );
-  assert(interrupted.rows[0]?.payment_status === "paid" && interrupted.rows[0]?.issuance_status === "failed"
-    && interrupted.rows[0]?.tickets === 0,
-    "An interrupted issuance erased payment or left a partial Ticket set.");
-
-  const recovered = await api(site, "/api/cron/process");
-  assert(recovered.status === 200 && recovered.data.data.ticket_issuance?.issued >= 1,
-    "The bounded scheduler did not recover the paid Order's failed issuance.");
-  const deliveredJobCount = await pool.query(
+  assert(automaticState.rows[0]?.payment_status === "paid" && automaticState.rows[0]?.issuance_status === "issued"
+    && automaticState.rows[0]?.tickets === 1,
+    "Automatic recovery did not leave the original paid Order issued with exactly one Ticket.");
+  const automaticJobCount = await pool.query(
     `select count(*)::integer as count from hpos.notification_jobs where order_id = $1 and kind = 'tickets_ready'`,
     [orderId],
   );
-  assert(deliveredJobCount.rows[0]?.count === 1, "Issuance recovery did not create exactly one initial Ticket email job.");
+  assert(automaticJobCount.rows[0]?.count === 1, "Automatic recovery created a duplicate initial Ticket email job.");
+  const automaticAdmin = await api(site, `/v1/admin/orders/${orderId}`);
+  assert(automaticAdmin.status === 200 && automaticAdmin.data.data.tickets.length === 1
+    && automaticAdmin.data.data.issues.some((issue) => issue.code === "ticket_issuance_failed" && issue.status === "resolved")
+    && automaticAdmin.data.data.recovery_actions.length === 0,
+    "Automatic recovery did not retain resolved failure evidence without a staff action.");
+  const automaticOrderRead = await api(site, `/v1/public/orders/${order.data.data.order_token}`);
+  assert(automaticOrderRead.status === 200 && automaticOrderRead.data.data.payment_status === "paid"
+    && automaticOrderRead.data.data.issuance_status === "issued" && automaticOrderRead.data.data.tickets.length === 1,
+    "The automatic recovery Order did not expose its eventual Ticket access.");
+
+  const guardedQuote = await api(site, `/v1/public/events/${event.event_id}/quotes`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
+  });
+  assert(guardedQuote.status === 201, "The guarded Issue #36 fixture could not create a quote.");
+  const guardedOrder = await api(site, "/v1/public/orders", {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { quote_id: guardedQuote.data.data.quote_id, buyer: { name: "Guarded Ticket Buyer", email: "guarded-ticket@example.test" } },
+  });
+  assert(guardedOrder.status === 201, "The guarded Issue #36 fixture could not create an Order.");
+  const guardedAttempt = await api(site, `/v1/admin/orders/${guardedOrder.data.data.order_id}/payment-attempts`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "system", reference: "test:issue-36" } },
+  });
+  assert(guardedAttempt.status === 201, "The guarded Issue #36 fixture could not create a payment attempt.");
+  const guardedCheckoutReference = "square-test-link-36-" + randomUUID();
+  const guardedRegistered = await api(site, `/v1/admin/payment-attempts/${guardedAttempt.data.data.attempt_id}/checkout-reference`, {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "system", reference: "test:issue-36" },
+      connection_id: site.connectionId,
+      provider_checkout_reference: guardedCheckoutReference,
+      provider_can_take_payment: true,
+    },
+  });
+  assert(guardedRegistered.status === 200, "The guarded Issue #36 fixture could not register the provider checkout: " + JSON.stringify(guardedRegistered.data));
+  const guardedOrderId = guardedOrder.data.data.order_id;
+  const guardedFailure = await forcePaidIssuanceFailure(
+    guardedOrderId, guardedAttempt.data.data.attempt_id, guardedCheckoutReference, "guarded",
+  );
+  const guardedVersion = guardedFailure.version;
+  await pool.query(`update hpos.orders set refund_status = 'full' where site_id = $1 and id = $2`, [site.siteId, guardedOrderId]);
+  const refundedRetry = await api(site, `/v1/admin/orders/${guardedOrderId}/actions/retry_ticket_issuance`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "user", reference: "test:issue-36" }, expected_version: guardedVersion },
+  });
+  assert(refundedRetry.status === 409 && refundedRetry.data?.error?.code === "invalid_state",
+    "A fully refunded paid Order accepted a Ticket-issuance retry.");
+  await pool.query(`update hpos.orders set refund_status = 'none' where site_id = $1 and id = $2`, [site.siteId, guardedOrderId]);
+
+  await pool.query(`update hpos.events set is_canceled = true where site_id = $1 and id = (select event_id from hpos.orders where id = $2)`, [site.siteId, guardedOrderId]);
+  const canceledRetry = await api(site, `/v1/admin/orders/${guardedOrderId}/actions/retry_ticket_issuance`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "user", reference: "test:issue-36" }, expected_version: guardedVersion },
+  });
+  assert(canceledRetry.status === 409 && canceledRetry.data?.error?.code === "invalid_state",
+    "A canceled Event accepted a Ticket-issuance retry.");
+  await pool.query(`update hpos.events set is_canceled = false where site_id = $1 and id = (select event_id from hpos.orders where id = $2)`, [site.siteId, guardedOrderId]);
+
+  const guardedRetry = await api(site, `/v1/admin/orders/${guardedOrderId}/actions/retry_ticket_issuance`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "user", reference: "test:issue-36" }, expected_version: guardedVersion },
+  });
+  assert(guardedRetry.status === 202 && guardedRetry.data.data.issuance_status === "pending"
+    && guardedRetry.data.data.version === guardedVersion + 1,
+    "The guarded retry did not queue the failed paid Order with a new version.");
+  const staleRetry = await api(site, `/v1/admin/orders/${guardedOrderId}/actions/retry_ticket_issuance`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "user", reference: "test:issue-36" }, expected_version: guardedVersion },
+  });
+  assert(staleRetry.status === 409 && staleRetry.data?.error?.code === "version_conflict",
+    "A stale guarded retry did not return version_conflict.");
+
+  const guardedRuns = await Promise.all([api(site, "/api/cron/process"), api(site, "/api/cron/process")]);
+  assert(guardedRuns.every((run) => run.status === 200)
+    && guardedRuns.some((run) => run.data.data.ticket_issuance?.issued >= 1),
+    "Overlapping bounded scheduler runs did not finish the guarded Ticket-issuance retry.");
+  const guardedState = await pool.query(
+    `select payment_status, issuance_status,
+            (select count(*)::integer from hpos.tickets where order_id = orders.id) as tickets
+     from hpos.orders where id = $1`,
+    [guardedOrderId],
+  );
+  assert(guardedState.rows[0]?.payment_status === "paid" && guardedState.rows[0]?.issuance_status === "issued"
+    && guardedState.rows[0]?.tickets === 1,
+    "Guarded recovery did not leave the paid Order issued with exactly one Ticket.");
+  const guardedJobCount = await pool.query(
+    `select count(*)::integer as count from hpos.notification_jobs where order_id = $1 and kind = 'tickets_ready'`,
+    [guardedOrderId],
+  );
+  assert(guardedJobCount.rows[0]?.count === 1, "Guarded recovery created a duplicate initial Ticket email job.");
+  const guardedAdmin = await api(site, `/v1/admin/orders/${guardedOrderId}`);
+  assert(guardedAdmin.status === 200 && guardedAdmin.data.data.tickets.length === 1
+    && guardedAdmin.data.data.issues.some((issue) => issue.code === "ticket_issuance_failed" && issue.status === "resolved")
+    && guardedAdmin.data.data.recovery_actions.length === 1,
+    "Guarded recovery did not retain resolved failure evidence and one action audit record.");
+  const guardedOrderRead = await api(site, `/v1/public/orders/${guardedOrder.data.data.order_token}`);
+  assert(guardedOrderRead.status === 200 && guardedOrderRead.data.data.payment_status === "paid"
+    && guardedOrderRead.data.data.issuance_status === "issued" && guardedOrderRead.data.data.tickets.length === 1,
+    "The guarded recovery Order did not expose its eventual Ticket access.");
 
   const orderRead = await api(site, `/v1/public/orders/${order.data.data.order_token}`);
   assert(orderRead.status === 200 && orderRead.headers.get("cache-control") === "no-store"
@@ -1127,7 +1245,8 @@ async function verifyPaymentReportsAndTicketIssuance(site) {
     "A provider amount mismatch was not retained as a payment conflict.");
   const retainedConflict = await pool.query(
     `select count(*)::integer as reports,
-            (select count(*)::integer from hpos.payment_report_issues where order_id = $1) as issues
+            (select count(*)::integer from hpos.payment_report_issues
+             where order_id = $1 and code = 'payment_report_conflict') as issues
      from hpos.payment_attempt_reports where attempt_id = $2 and conflict_code = 'payment_report_conflict'`,
     [orderId, attemptId],
   );
