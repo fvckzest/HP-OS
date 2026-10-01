@@ -961,6 +961,10 @@ async function verifyPaymentReportsAndTicketIssuance(site) {
     && automaticAdmin.data.data.issues.some((issue) => issue.code === "ticket_issuance_failed" && issue.status === "resolved")
     && automaticAdmin.data.data.recovery_actions.length === 0,
     "Automatic recovery did not retain resolved failure evidence without a staff action.");
+  const automaticOrderRead = await api(site, `/v1/public/orders/${order.data.data.order_token}`);
+  assert(automaticOrderRead.status === 200 && automaticOrderRead.data.data.payment_status === "paid"
+    && automaticOrderRead.data.data.issuance_status === "issued" && automaticOrderRead.data.data.tickets.length === 1,
+    "The automatic recovery Order did not expose its eventual Ticket access.");
 
   const guardedQuote = await api(site, `/v1/public/events/${event.event_id}/quotes`, {
     method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
