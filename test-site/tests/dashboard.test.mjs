@@ -68,7 +68,12 @@ test('Issue #33 journey runs its connected single-ticket checkpoints in order', 
       else if (name === 'attempt-create') data = { attempt_id: 'attempt-one', total: order.pricing.total, connection };
       else if (name === 'checkout-register') data = { provider_checkout_reference: options.body.provider_checkout_reference };
       else if (name === 'buyer-pending') data = order;
-      else if (name === 'buyer-ticket') data = { ticket_id: ticket.ticket_id };
+      else if (name === 'buyer-ticket') data = {
+        ticket_id: ticket.ticket_id,
+        qr_payload: ticket.qr_payload,
+        admission_status: 'unused',
+        can_admit: true,
+      };
       else if (name === 'staff-payment-status') data = { payment_status: 'paid' };
       else if (name === 'email-list') data = [job];
       else if (name === 'email-frontier') data = [];
@@ -104,6 +109,7 @@ test('Issue #33 journey runs its connected single-ticket checkpoints in order', 
   assert.equal(calls.find(call => call.name === 'invalid-qr').options.body.qr_token.length, 32);
   assert.equal(calls.find(call => call.name === 'email-dispatch').options.body.outcome, 'completed');
   assert.equal(calls.find(call => call.name === 'email-delivered').options.body.outcome, 'delivered');
+  assert.ok(checks.some(check => check.name === 'buyer Ticket page' && check.passed));
   assert.equal(checks.filter(check => check.passed).length, checks.length);
 });
 test('local configuration rejects remote, credential-bearing and alternate-target origins', () => {
@@ -264,6 +270,12 @@ test('isolation scenario checks private records and provider references while bo
       else if (name.endsWith('-create')) data = { attempt_id: name, total: order.pricing.total, connection };
       else if (name === 'checkout-register') data = { provider_checkout_reference: options.body.provider_checkout_reference };
       else if (name === 'buyer-pending') data = order;
+      else if (name === 'buyer-ticket') data = {
+        ticket_id: ticket.ticket_id,
+        qr_payload: ticket.qr_payload,
+        admission_status: 'unused',
+        can_admit: true,
+      };
       else data = { event_id: 'event-' + (options.auth ?? 'primary'), version: 1, ticket_offering: { available_quantity: 8 } };
       return { status: options.expected?.[0] ?? 200, data, envelope: { data } };
     },

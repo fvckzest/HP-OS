@@ -83,7 +83,21 @@ async function paid(a, order, at, reference) {
   a.check('complete issuance', buyer.data.payment_status === 'paid' && buyer.data.issuance_status === 'issued' && buyer.data.tickets.length === 1, 'Paid Order has exactly one fully issued Ticket', { payment: buyer.data.payment_status, issuance: buyer.data.issuance_status, tickets: buyer.data.tickets.length });
   const ticket = buyer.data.tickets[0];
   a.check('distinct access scopes', ticket.ticket_token !== order.order_token && ticket.ticket_token !== ticket.qr_payload && !ticket.qr_payload.includes('@'), 'Order token, Ticket token and QR are distinct; QR has no email', { distinct: true });
-  await a.read('buyer-ticket', `/v1/public/tickets/${id(ticket.ticket_token)}`);
+  const buyerTicket = await a.read('buyer-ticket', `/v1/public/tickets/${id(ticket.ticket_token)}`);
+  a.check(
+    'buyer Ticket page',
+    buyerTicket.data.ticket_id === ticket.ticket_id
+      && buyerTicket.data.qr_payload === ticket.qr_payload
+      && buyerTicket.data.admission_status === 'unused'
+      && buyerTicket.data.can_admit === true,
+    'Buyer Ticket page exposes this Ticket QR and current unused Admission eligibility',
+    {
+      ticket_id: buyerTicket.data.ticket_id,
+      qr_payload: buyerTicket.data.qr_payload,
+      admission_status: buyerTicket.data.admission_status,
+      can_admit: buyerTicket.data.can_admit,
+    },
+  );
   await a.read('staff-payment-status', `/v1/admin/orders/${id(order.order_id)}/payment-status`);
   await a.write('paid-report-duplicate-source', `/v1/admin/payment-attempts/${id(at.attempt_id)}/payment-reports`, body, [200]);
   const duplicate = await a.read('after-payment-replay', `/v1/public/orders/${id(order.order_token)}`, { fresh: true });
