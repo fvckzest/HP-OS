@@ -376,6 +376,7 @@ async function createPaymentReport(
   site: AuthenticatedSite,
   attemptId: string,
   input: ReportInput,
+  options: { allowOpenConflict?: boolean } = {},
 ): Promise<IdempotentResult> {
   const attempt = await lockAttempt(client, site.siteId, attemptId);
   if (!attempt) throw new ApiOperationError(404, "not_found", "The payment attempt is not available to this Site.");
@@ -434,6 +435,21 @@ async function createPaymentReport(
     }
   }
   if (conflict) return retainReport(client, attempt, input, inputFingerprint, conflict);
+
+  if (!options.allowOpenConflict) {
+    const openConflict = await client.query<{ id: string }>(
+      `select id
+       from hpos.payment_report_issues
+       where site_id = $1 and attempt_id = $2
+         and code = 'payment_report_conflict' and status = 'open'
+       limit 1`,
+      [site.siteId, attempt.id],
+    );
+    if (openConflict.rowCount !== 0) {
+      return retainReport(client, attempt, input, inputFingerprint,
+        "A payment conflict is already open for this attempt. Resolve it with the guarded staff action before applying another observation.");
+    }
+  }
 
   const reportId = randomUUID();
   await client.query(
@@ -546,7 +562,7 @@ async function resolvePaymentConflict(
     throw new ApiOperationError(409, "payment_report_conflict", "A guarded resolution must use a new provider source reference.");
   }
 
-  const result = await createPaymentReport(client, site, attempt.id, input.report);
+  const result = await createPaymentReport(client, site, attempt.id, input.report, { allowOpenConflict: true });
   if (result.status !== 201 || !object(result.data)) return result;
   const reportId = result.data.report_id;
   if (typeof reportId !== "string" || result.data.applied !== true) return result;

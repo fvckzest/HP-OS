@@ -1254,8 +1254,26 @@ async function verifyPaymentConflictResolution(site) {
     && blocked.data.data.tickets.length === 0,
     "A pre-issuance conflict did not block fulfillment.");
 
+  const matchingWhileOpen = await api(site, `/v1/admin/payment-attempts/${attemptId}/payment-reports`, {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      ...conflictBody,
+      source_reference: "square-matching-while-open-35-" + randomUUID(),
+      provider_payment_reference: "square-payment-matching-while-open-35-" + randomUUID(),
+      amount: 2500,
+    },
+  });
+  assert(matchingWhileOpen.status === 409 && matchingWhileOpen.data.error.code === "payment_report_conflict",
+    "A matching report was applied while the payment conflict was still open.");
+  const blockedByOpenConflict = await api(site, `/v1/public/orders/${order.data.data.order_token}`);
+  assert(blockedByOpenConflict.status === 200
+    && blockedByOpenConflict.data.data.payment_status === "conflicted"
+    && blockedByOpenConflict.data.data.issuance_status !== "issued"
+    && blockedByOpenConflict.data.data.tickets.length === 0,
+    "A matching report during an open conflict triggered payment or Ticket issuance.");
+
   const detail = await api(site, `/v1/admin/payment-attempts/${attemptId}`);
   assert(detail.status === 200 && detail.data.data.reports.some((report) => report.conflict_code === "payment_report_conflict")
+    && detail.data.data.reports.some((report) => report.source_reference.startsWith("square-matching-while-open-35-") && report.applied === false)
     && detail.data.data.issues.some((issue) => issue.status === "open" && issue.code === "payment_report_conflict"),
     "Payment-attempt detail did not retain the conflicting report and open issue.");
   const resolutionBase = {
