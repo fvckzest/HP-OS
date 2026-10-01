@@ -138,7 +138,7 @@ Paths are relative to the base URL. `{...}` identifies a path parameter. All end
 | `GET /v1/admin/payment-configuration` | Read the active connection for new Orders. |
 | `GET /v1/admin/payment-connections/{connection_id}` | Read assigned/historical non-secret connection metadata. |
 | `GET /v1/admin/payment-attempts/{attempt_id}` | Read one Site-owned attempt without caching. |
-| `GET /v1/admin/payment-attempts` | List attempts, including those requiring verification. |
+| `GET /v1/admin/payment-attempts` | List attempts, including `requires_verification=true` recovery work and `requires_report_work=true` unapplied-report work. |
 | `POST /v1/admin/orders/{order_id}/payment-attempts` | Record an attempt before calling the provider. |
 | `POST /v1/admin/payment-attempts/{attempt_id}/checkout-reference` | Register provider checkout before the buyer opens it. |
 | `POST /v1/admin/payment-attempts/{attempt_id}/payment-reports` | Report a Site-verified payment outcome. |
@@ -581,6 +581,8 @@ PublicTicket uses its public/common fields above. AdminTicket uses admin/common 
 | `PaymentAttempt.version` | integer | Guarded attempt version. |
 | `PaymentAttempt.created_at` | timestamp | Creation instant. |
 | `PaymentAttempt.updated_at` | timestamp | Latest update instant. |
+
+Payment-attempt list rows also include `requires_report_work`. The list accepts `requires_verification=true|false`, `requires_report_work=true|false`, and `event_id`, together with the signed `cursor` and `limit`. `requires_report_work=true` selects unapplied reports that are still actionable for the Site, including stale non-paid reports retained after a paid or processing observation. Resolved payment-conflict history is excluded. The filter does not change payment state or authorize fulfillment.
 
 Verification list responses also expose Order deadlines and verification-required state; see [provider verification](api.md#checkout-expiry-and-provider-verification). Provider credentials and checkout URLs stay on the Site backend.
 

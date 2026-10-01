@@ -1339,6 +1339,11 @@ async function verifyPaymentConflictResolution(site) {
   assert(audit.rows[0]?.resolutions >= 2 && audit.rows[0]?.resolved_issues >= 2 && audit.rows[0]?.actor_records >= 2,
     "The guarded resolution audit did not retain issue status and staff evidence.");
 
+  const resolvedReportFrontier = await api(site, "/v1/admin/payment-attempts?requires_report_work=true&limit=100");
+  assert(resolvedReportFrontier.status === 200
+    && !resolvedReportFrontier.data.data.some((item) => item.attempt_id === attemptId),
+    "A valid paid resolution requeued its resolved historical conflict.");
+
   const delayed = await api(site, `/v1/admin/payment-attempts/${attemptId}/payment-reports`, {
     method: "POST", idempotencyKey: randomUUID(), body: {
       connection_id: site.connectionId,
@@ -1353,6 +1358,10 @@ async function verifyPaymentConflictResolution(site) {
   });
   assert(delayed.status === 201 && delayed.data.data.applied === false,
     "Delayed failed evidence regressed the resolved paid attempt.");
+  const delayedReportFrontier = await api(site, "/v1/admin/payment-attempts?requires_report_work=true&limit=100");
+  assert(delayedReportFrontier.status === 200
+    && delayedReportFrontier.data.data.some((item) => item.attempt_id === attemptId && item.requires_report_work === true),
+    "An unapplied delayed report was not discoverable through the report-work frontier.");
   const final = await api(site, `/v1/public/orders/${order.data.data.order_token}`);
   assert(final.status === 200 && final.data.data.payment_status === "paid"
     && final.data.data.issuance_status === "issued" && final.data.data.tickets.length === 1,

@@ -60,6 +60,7 @@ interface PaymentAttemptListRow extends AttemptRow {
   event_id: string;
   checkout_expired: boolean;
   requires_verification: boolean;
+  requires_report_work: boolean;
 }
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -142,6 +143,7 @@ function paymentAttemptListData(row: PaymentAttemptListRow) {
     payment_status: row.payment_status,
     reservation_status: row.reservation_status,
     requires_verification: row.requires_verification,
+    requires_report_work: row.requires_report_work,
   };
 }
 
@@ -191,7 +193,7 @@ function parseListCursor(value: string | null, site: AuthenticatedSite, filters:
 
 async function listPaymentAttempts(request: Request, site: AuthenticatedSite): Promise<Response> {
   const url = new URL(request.url);
-  const allowed = new Set(["limit", "cursor", "requires_verification", "event_id"]);
+  const allowed = new Set(["limit", "cursor", "requires_verification", "requires_report_work", "event_id"]);
   for (const name of url.searchParams.keys()) {
     if (!allowed.has(name)) return fieldError(name, "unknown_filter", "Remove the unsupported payment-attempt list parameter.");
   }
@@ -201,9 +203,13 @@ async function listPaymentAttempts(request: Request, site: AuthenticatedSite): P
   if (requiresText !== null && requiresText !== "true" && requiresText !== "false") {
     return fieldError("requires_verification", "invalid_boolean", "requires_verification must be true or false.");
   }
+  const reportWorkText = url.searchParams.get("requires_report_work");
+  if (reportWorkText !== null && reportWorkText !== "true" && reportWorkText !== "false") {
+    return fieldError("requires_report_work", "invalid_boolean", "requires_report_work must be true or false.");
+  }
   const eventId = url.searchParams.get("event_id");
   if (eventId !== null && !UUID_PATTERN.test(eventId)) return fieldError("event_id", "invalid_uuid", "event_id must be a UUID.");
-  const filters = { requires_verification: requiresText, event_id: eventId };
+  const filters = { requires_verification: requiresText, requires_report_work: reportWorkText, event_id: eventId };
   const cursor = parseListCursor(url.searchParams.get("cursor"), site, filters, limit);
   if (cursor instanceof Response) return cursor;
   const requiresVerification = `(
@@ -214,22 +220,44 @@ async function listPaymentAttempts(request: Request, site: AuthenticatedSite): P
       and attempt.provider_can_take_payment is distinct from false
     )
   )`;
+  const requiresReportWork = `exists (
+    select 1
+    from hpos.payment_attempt_reports report
+    where report.site_id = attempt.site_id
+      and report.attempt_id = attempt.id
+      and report.applied = false
+      and (
+        report.conflict_code is null
+        or exists (
+          select 1
+          from hpos.payment_report_issues issue
+          where issue.site_id = report.site_id
+            and issue.attempt_id = report.attempt_id
+            and issue.report_id = report.id
+            and issue.code = 'payment_report_conflict'
+            and issue.status = 'open'
+        )
+      )
+  )`;
   const result = await getBusinessPool().query<PaymentAttemptListRow>(
     `select attempt.*, order_row.event_id,
             order_row.checkout_status, order_row.checkout_expires_at,
             order_row.payment_status, reservation.status as reservation_status,
             ${requiresVerification} as requires_verification,
+            ${requiresReportWork} as requires_report_work,
             order_row.checkout_expires_at <= clock_timestamp() as checkout_expired
      from hpos.payment_attempts attempt
      join hpos.orders order_row on order_row.id = attempt.order_id and order_row.site_id = attempt.site_id
      join hpos.reservations reservation on reservation.order_id = order_row.id and reservation.site_id = order_row.site_id
      where attempt.site_id = $1
        and ($2::boolean is null or ${requiresVerification} = $2)
-       and ($3::uuid is null or order_row.event_id = $3)
-       and ($4::timestamptz is null or (attempt.created_at, attempt.id) < ($4::timestamptz, $5::uuid))
-     order by attempt.created_at desc, attempt.id desc
-     limit $6`,
-    [site.siteId, requiresText === null ? null : requiresText === "true", eventId,
+       and ($3::boolean is null or ${requiresReportWork} = $3)
+       and ($4::uuid is null or order_row.event_id = $4)
+       and ($5::timestamptz is null or (attempt.created_at, attempt.id) < ($5::timestamptz, $6::uuid))
+       order by attempt.created_at desc, attempt.id desc
+       limit $7`,
+    [site.siteId, requiresText === null ? null : requiresText === "true",
+      reportWorkText === null ? null : reportWorkText === "true", eventId,
       cursor?.createdAt ?? null, cursor?.id ?? null, limit + 1],
   );
   const rows = result.rows.slice(0, limit);

@@ -347,6 +347,9 @@ export async function execute(a) {
     const issued = await a.read('resolved-order', `/v1/public/orders/${id(order.order_token)}`, { fresh: true });
     a.check('resolved issuance', issued.data.payment_status === 'paid' && issued.data.issuance_status === 'issued' && issued.data.tickets.length === 1,
       'Guarded resolution permits one complete Ticket issuance', { payment: issued.data.payment_status, issuance: issued.data.issuance_status, tickets: issued.data.tickets.length });
+    const resolvedReportFrontier = await a.read('resolved-report-frontier', '/v1/admin/payment-attempts?requires_report_work=true&limit=100');
+    a.check('resolved conflict is not requeued', !resolvedReportFrontier.data.some(item => item.attempt_id === at.attempt_id),
+      'A valid paid resolution excludes resolved historical conflicts from report work', resolvedReportFrontier.data.map(item => item.attempt_id));
     const delayed = await a.write('delayed-failed-report', `/v1/admin/payment-attempts/${id(at.attempt_id)}/payment-reports`, {
       connection_id: at.connection.connection_id,
       source_reference: `fake-delayed-failed-${a.run.id}`,
@@ -358,6 +361,9 @@ export async function execute(a) {
       provider_can_take_payment: false,
     }, [201]);
     a.check('delayed evidence is stale', delayed.data.applied === false, 'Older failed evidence is retained without regressing paid state', delayed.data.applied);
+    const delayedReportFrontier = await a.read('delayed-report-frontier', '/v1/admin/payment-attempts?requires_report_work=true&limit=100');
+    a.check('delayed report is discoverable', delayedReportFrontier.data.some(item => item.attempt_id === at.attempt_id && item.requires_report_work === true),
+      'An unapplied delayed report is visible through the report-work frontier', delayedReportFrontier.data.map(item => item.attempt_id));
     const final = await a.read('after-delayed-evidence', `/v1/public/orders/${id(order.order_token)}`, { fresh: true });
     a.check('paid state remains authoritative', final.data.payment_status === 'paid' && final.data.tickets.length === 1,
       'Delayed evidence does not create a second Ticket or undo payment', { payment: final.data.payment_status, tickets: final.data.tickets.length });
