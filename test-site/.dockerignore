@@ -1,0 +1,8 @@
+*
+!Dockerfile
+!package.json
+!*.mjs
+!tickets.json
+!source-snapshot.json
+!public/
+!public/**

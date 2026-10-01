@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Fake LMNL · HP-OS workflow dashboard</title><link rel="stylesheet" href="/style.css"><script type="module" src="/app.js"></script></head>
+<body><main>
+<h1>Fake LMNL</h1><p>A local Site backend for preparing HP-OS workflow checks.</p>
+<p class="notice">Opening this page and refreshing status do not run workflows. A passing simulation is scenario evidence only. Hosted checks, physical devices, fee settlement, cutover, and sales approval remain separate.</p>
+<div class="controls"><label>Profile <select id="profile"><option value="simulation">Local simulation (default)</option><option value="sandbox">Square Sandbox + actual Resend email</option></select></label><button id="refresh">Refresh saved status</button><button id="export">Export redacted evidence</button></div>
+<p id="environment"></p><p id="message" role="status"></p><div id="progress" aria-live="polite"></div>
+<details><summary>Terms and boundaries</summary><dl><dt>Unavailable</dt><dd>The required API capability is not implemented.</dd><dt>Blocked</dt><dd>Required configuration, implementation, environment or approval is missing.</dd><dt>Not run</dt><dd>A runnable scenario has not been explicitly started in this profile.</dd><dt>Passed / failed</dt><dd>The scenario's stated checks passed or failed. This does not complete a ticket or release gate.</dd><dt>Interrupted</dt><dd>The run stopped or awaits a buyer/operator step.</dd><dt>Unknown outcome</dt><dd>A request may have committed without a readable response. Resume the saved run to retain its original action identities.</dd><dt>Reservation</dt><dd>A temporary capacity hold while an Order is unpaid or payment is unresolved.</dd><dt>Dispatch / delivery</dt><dd>A provider accepting an email send and independently confirming delivery are separate facts.</dd></dl></details>
+<section id="checklist" aria-label="Workflow checklist"></section>
+<details><summary id="route-count">API route mapping</summary><div id="routes"></div></details>
+<h2>Saved run evidence</h2><p>Evidence records source revisions, profiles, expected and actual outcomes, HTTP steps, and observable state. Provider credentials and access tokens are omitted. Private replay data stays in the Docker volume.</p><div id="runs"></div>
+</main></body></html>
