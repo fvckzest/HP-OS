@@ -1,0 +1,6 @@
+.env
+.env.*
+!.env.example
+data/
+provisioning.json
+source-snapshot.json

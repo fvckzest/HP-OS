@@ -21,6 +21,8 @@ Next.js manages `next-env.d.ts` and the `.next/` directory locally; both are exc
 
 ## Repository layout
 
+The [Fake LMNL workflow dashboard](test-site/README.md), built for [issue #78](https://github.com/fvckzest/HP-OS/issues/78), runs in a separate local Docker container on port 3100. It maps the documented API routes and tickets #23–55, sends explicitly started workflows through a server-side Site adapter, and saves redacted scenario evidence. Its local `.env`, provisioning records, generated source snapshot, and evidence remain excluded from Git. Creating or opening the dashboard does not execute workflows, and scenario results do not establish provider, hosted, device, cutover, or release proof.
+
 Application code lives in `src/`: `src/app/` contains Next.js pages and routes, and `src/server/` contains HP-OS server logic. The `@/` import alias points to `src/`. Operational commands and verification scripts live in `scripts/`; database configuration and migrations live in `supabase/`; settled guidance lives in `docs/`. `CONTEXT.md` remains at the root as the domain glossary.
 
 Tool configuration, dependency files, `README.md`, and `AGENTS.md` remain at the root. Generated TypeScript cache data lives in `.next/cache/`. macOS `.DS_Store` metadata is excluded from Git.
@@ -40,6 +42,7 @@ Tool configuration, dependency files, `README.md`, and `AGENTS.md` remain at the
 | Current questions and work | [First-release Wayfinder issue](https://github.com/fvckzest/HP-OS/issues/1) and its linked tickets |
 | Dated source evidence | [Research](docs/research/) |
 | Planned API and workflow test coverage | [API workflow testing coverage research](docs/research/local-api-workflow-testing-coverage.md) |
+| Local Docker Site workflow tool, configuration, and evidence | [Fake LMNL dashboard](test-site/README.md) |
 
 Repository documents state settled guidance. GitHub issues hold open questions and current work; resolution comments preserve the full decision discussion. Research records evidence and does not establish HP-OS behavior by itself.
 
