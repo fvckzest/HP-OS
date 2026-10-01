@@ -101,11 +101,11 @@ function createSiteFixture(withPilotFee = true) {
   return { siteId: site.site_id, apiKey: key.site_api_key, connectionId: connection.connection_id };
 }
 
-async function api(site, pathName, { method = "GET", idempotencyKey, body } = {}) {
+async function api(site, pathName, { method = "GET", idempotencyKey, body, fetchImpl = fetch } = {}) {
   const headers = { Authorization: "Bearer " + site.apiKey };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
-  const response = await fetch(origin + pathName, {
+  const response = await fetchImpl(origin + pathName, {
     method,
     headers,
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
@@ -170,7 +170,7 @@ async function verifyPreconfiguredDraftCannotClearSales(site) {
   assert(cleared.status === 409 && cleared.data.error.code === "sales_configuration_locked", "A complete sales configuration was cleared after draft creation.");
 }
 
-async function createPublishedEvent(site, { title, startsAt, endsAt, timeZone = "America/Los_Angeles", ticketOffering }) {
+async function createPublishedEvent(site, { title, startsAt, endsAt, checkInOpensAt, timeZone = "America/Los_Angeles", ticketOffering }) {
   const created = await api(site, "/v1/admin/events", {
     method: "POST",
     idempotencyKey: randomUUID(),
@@ -189,6 +189,7 @@ async function createPublishedEvent(site, { title, startsAt, endsAt, timeZone = 
       venue: { name: "LMNL Space" },
       starts_at: startsAt,
       ends_at: endsAt,
+      ...(checkInOpensAt ? { check_in_opens_at: checkInOpensAt } : {}),
       time_zone: timeZone,
       visibility: "public",
       ...(ticketOffering ? {
@@ -696,10 +697,12 @@ async function verifyPublicPaymentAttemptLifecycle(site) {
 }
 
 async function verifyPaymentReportsAndTicketIssuance(site) {
+  const now = Date.now();
   const event = await createPublishedEvent(site, {
     title: "Issue 30 Verified Payment and Ticket Recovery",
-    startsAt: new Date(Date.now() + 60 * 60_000).toISOString(),
-    endsAt: new Date(Date.now() + 2 * 60 * 60_000).toISOString(),
+    startsAt: new Date(now - 60 * 60_000).toISOString(),
+    endsAt: new Date(now + 60 * 60_000).toISOString(),
+    checkInOpensAt: new Date(now - 30 * 60_000).toISOString(),
     timeZone: "UTC",
     ticketOffering: { price: { amount: 2500, currency: "USD" }, capacity: 2, tax_amount: 0, buyer_fees: [] },
   });
@@ -807,9 +810,147 @@ async function verifyPaymentReportsAndTicketIssuance(site) {
   assert(ticketRead.status === 200 && ticketRead.headers.get("cache-control") === "no-store"
     && ticketRead.data.data.ticket_id === ticket.ticket_id && ticketRead.data.data.qr_payload === ticket.qr_payload,
     "The Ticket page did not return its stable Ticket and QR access data.");
+
+  const lookupByReference = await api(site, `/v1/admin/events/${event.event_id}/ticket-lookup`, {
+    method: "POST", body: { order_reference: order.data.data.order_reference },
+  });
+  assert(lookupByReference.status === 200 && lookupByReference.headers.get("cache-control") === "no-store"
+    && lookupByReference.data.data.length === 1
+    && lookupByReference.data.data[0].tickets[0].ticket_id === ticket.ticket_id
+    && lookupByReference.data.data[0].tickets[0].admission_status === "unused"
+    && lookupByReference.data.data[0].tickets[0].can_admit === true,
+    "Manual lookup did not return the matching unused Ticket with current eligibility.");
+  const lookupByEmail = await api(site, `/v1/admin/events/${event.event_id}/ticket-lookup`, {
+    method: "POST", body: { email: " TICKET@example.test " },
+  });
+  assert(lookupByEmail.status === 200 && lookupByEmail.data.data.length === 1
+    && lookupByEmail.data.data[0].order_reference === order.data.data.order_reference,
+    "Manual lookup did not find the Order by its current delivery email.");
+  assert(!/ticket_token|order_token|qr_payload|qr_token/i.test(JSON.stringify(lookupByReference.data)),
+    "Manual lookup exposed a buyer access token or admission QR token.");
+  const ambiguousLookup = await api(site, `/v1/admin/events/${event.event_id}/ticket-lookup`, {
+    method: "POST", body: { order_reference: order.data.data.order_reference, email: "ticket@example.test" },
+  });
+  assert(ambiguousLookup.status === 422, "Manual lookup accepted both lookup methods in one request.");
+
+  const invalidToken = await api(site, `/v1/admin/events/${event.event_id}/admissions`, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-32" }, qr_token: "A".repeat(32) },
+  });
+  assert(invalidToken.status === 404 && invalidToken.data.error.code === "not_found",
+    "An unknown QR token was not rejected as Site-safe not-found.");
+
+  const otherEvent = await createPublishedEvent(site, {
+    title: "Issue 32 Wrong Event Scope",
+    startsAt: new Date(now - 60 * 60_000).toISOString(),
+    endsAt: new Date(now + 60 * 60_000).toISOString(),
+    checkInOpensAt: new Date(now - 30 * 60_000).toISOString(),
+    timeZone: "UTC",
+  });
+  const wrongEvent = await api(site, `/v1/admin/events/${otherEvent.event_id}/admissions`, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-32" }, qr_token: ticket.qr_payload },
+  });
+  assert(wrongEvent.status === 409 && wrongEvent.data.error.code === "ticket_event_mismatch",
+    "A Ticket from another Event on the same Site was not rejected as an Event mismatch.");
+
+  await pool.query("update hpos.events set check_in_opens_at = clock_timestamp() + interval '10 minutes', check_in_opens_offset_minutes = 0 where id = $1", [event.event_id]);
+  const tooEarlyKey = randomUUID();
+  const tooEarlyBody = { actor: { type: "user", reference: "test:issue-32" }, qr_token: ticket.qr_payload };
+  const tooEarly = await api(site, `/v1/admin/events/${event.event_id}/admissions`, {
+    method: "POST", idempotencyKey: tooEarlyKey, body: tooEarlyBody,
+  });
+  const tooEarlyReplay = await api(site, `/v1/admin/events/${event.event_id}/admissions`, {
+    method: "POST", idempotencyKey: tooEarlyKey, body: tooEarlyBody,
+  });
+  assert(tooEarly.status === 409 && tooEarly.data.error.code === "check_in_not_open"
+    && tooEarlyReplay.status === 409 && tooEarlyReplay.data.error.code === "check_in_not_open",
+    "An early Admission was not rejected or replayed consistently.");
+
+  await pool.query("update hpos.events set check_in_opens_at = clock_timestamp() - interval '30 minutes', check_in_opens_offset_minutes = 0, is_canceled = true where id = $1", [event.event_id]);
+  await pool.query("update hpos.orders set refund_status = 'full' where id = $1", [orderId]);
+  const canceled = await api(site, `/v1/admin/events/${event.event_id}/admissions`, {
+    method: "POST", idempotencyKey: randomUUID(), body: tooEarlyBody,
+  });
+  await pool.query("update hpos.events set is_canceled = false where id = $1", [event.event_id]);
+  const refunded = await api(site, `/v1/admin/events/${event.event_id}/admissions`, {
+    method: "POST", idempotencyKey: randomUUID(), body: tooEarlyBody,
+  });
+  await pool.query("update hpos.orders set refund_status = 'none' where id = $1", [orderId]);
+  assert(canceled.status === 409 && canceled.data.error.code === "event_canceled"
+    && refunded.status === 409 && refunded.data.error.code === "ticket_refunded",
+    "Canceled and fully refunded Tickets did not follow Admission rejection precedence.");
+
+  await pool.query("update hpos.events set ends_at = clock_timestamp() - interval '1 second', ends_at_offset_minutes = 0 where id = $1", [event.event_id]);
+  const tooLate = await api(site, `/v1/admin/events/${event.event_id}/admissions`, {
+    method: "POST", idempotencyKey: randomUUID(), body: tooEarlyBody,
+  });
+  await pool.query("update hpos.events set ends_at = clock_timestamp() + interval '1 hour', ends_at_offset_minutes = 0 where id = $1", [event.event_id]);
+  assert(tooLate.status === 409 && tooLate.data.error.code === "check_in_closed",
+    "A late Admission was not rejected.");
+
+  const admissionKeys = [randomUUID(), randomUUID()];
+  const concurrent = await Promise.all(admissionKeys.map((idempotencyKey) => api(site, `/v1/admin/events/${event.event_id}/admissions`, {
+    method: "POST", idempotencyKey, body: tooEarlyBody,
+  })));
+  const createdAdmission = concurrent.find((response) => response.status === 201);
+  const rejectedAdmission = concurrent.find((response) => response.status === 409);
+  assert(createdAdmission?.data?.data?.admission_id && rejectedAdmission?.data?.error?.code === "already_admitted",
+    "Two concurrent device submissions did not produce one Admission and one already-admitted result.");
+  const winnerKey = admissionKeys[concurrent.indexOf(createdAdmission)];
+  let clientLostAdmissionResponse = false;
+  try {
+    await api(site, `/v1/admin/events/${event.event_id}/admissions`, {
+      method: "POST", idempotencyKey: winnerKey, body: tooEarlyBody,
+      fetchImpl: async (...args) => {
+        const response = await fetch(...args);
+        await response.arrayBuffer();
+        throw new TypeError("simulated client connection loss after the server committed the Admission");
+      },
+    });
+  } catch (error) {
+    clientLostAdmissionResponse = error instanceof TypeError;
+  }
+  assert(clientLostAdmissionResponse,
+    "The verifier did not simulate a client losing the Admission response after the server committed it.");
+  const ambiguousTimeoutReplay = await api(site, `/v1/admin/events/${event.event_id}/admissions`, {
+    method: "POST", idempotencyKey: winnerKey, body: tooEarlyBody,
+  });
+  assert(ambiguousTimeoutReplay.status === 201
+    && ambiguousTimeoutReplay.data.data.admission_id === createdAdmission.data.data.admission_id
+    && ambiguousTimeoutReplay.data.data.admitted_at === createdAdmission.data.data.admitted_at,
+    "Retrying the Admission after the simulated lost response did not replay the original entry.");
+  const newQrScan = await api(site, `/v1/admin/events/${event.event_id}/admissions`, {
+    method: "POST", idempotencyKey: randomUUID(), body: tooEarlyBody,
+  });
+  const manualAdmission = await api(site, `/v1/admin/events/${event.event_id}/admissions`, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-32" }, ticket_id: ticket.ticket_id },
+  });
+  assert(newQrScan.status === 409 && newQrScan.data.error.code === "already_admitted"
+    && manualAdmission.status === 409 && manualAdmission.data.error.code === "already_admitted",
+    "A new QR scan or manual confirmation did not report the one-time Admission as already used.");
+  const admittedTicketRead = await api(site, `/v1/public/tickets/${ticket.ticket_token}`);
+  assert(admittedTicketRead.status === 200 && admittedTicketRead.data.data.admission_status === "admitted"
+    && admittedTicketRead.data.data.can_admit === false
+    && admittedTicketRead.data.data.admission_blockers.includes("already_admitted"),
+    "The Ticket page did not report the recorded Admission status.");
+  const afterAdmissionLookup = await api(site, `/v1/admin/events/${event.event_id}/ticket-lookup`, {
+    method: "POST", body: { order_reference: order.data.data.order_reference },
+  });
+  assert(afterAdmissionLookup.data.data[0].tickets[0].admission_status === "admitted"
+    && afterAdmissionLookup.data.data[0].tickets[0].can_admit === false,
+    "Manual lookup did not report the Ticket's recorded Admission.");
+
   const otherSite = createSiteFixture();
   const crossSiteTicket = await api(otherSite, `/v1/public/tickets/${ticket.ticket_token}`);
   assert(crossSiteTicket.status === 404, "Another Site could read this Ticket.");
+  const crossSiteAdmission = await api(otherSite, `/v1/admin/events/${event.event_id}/admissions`, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-32" }, qr_token: ticket.qr_payload },
+  });
+  assert(crossSiteAdmission.status === 404 && crossSiteAdmission.data.error.code === "not_found",
+    "Another Site could resolve or admit a Ticket using its QR token.");
 
   const replay = await api(site, `/v1/admin/payment-attempts/${attemptId}/payment-reports`, {
     method: "POST", idempotencyKey: randomUUID(), body: paidBody,
@@ -1458,7 +1599,7 @@ async function main() {
     await stopApp(app);
     await pool.end();
   }
-  console.log("Local Event and checkout API verification passed: sales controls with actual Reservations, preserved purchase terms, capacity release, Organization pilot fees, explicit pricing, single-Ticket quotes, payment-attempt idempotency, verified payment reporting, interrupted issuance recovery, duplicate-safe Tickets and email work, separate buyer tokens, conflict retention, provider closure safety, Reservation expiry, and concurrent last-capacity protection.");
+  console.log("Local Event, checkout, and Admission API verification passed: sales controls with actual Reservations, preserved purchase terms, capacity release, Organization pilot fees, explicit pricing, single-Ticket quotes, payment-attempt idempotency, verified payment reporting, interrupted issuance recovery, duplicate-safe Tickets and email work, separate buyer tokens, manual lookup, Admission rejection precedence, same-key replay, concurrent scans, conflict retention, provider closure safety, Reservation expiry, and concurrent last-capacity protection.");
 }
 
 main().catch((error) => {

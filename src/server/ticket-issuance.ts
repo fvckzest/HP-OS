@@ -81,6 +81,9 @@ interface TicketRow extends QueryResultRow {
   issued_at: Date;
   qr_payload: string;
   attendee_name: string | null;
+  admission_id: string | null;
+  admitted_at: Date | null;
+  version: number;
 }
 
 function hashToken(value: string): string {
@@ -378,8 +381,14 @@ async function readBuyerOrder(site: AuthenticatedSite, token: string): Promise<R
     const event = publicEventData(order);
     const ticketsResult = order.issuance_status === "issued"
       ? await client.query<TicketRow>(
-        `select id as ticket_id, ticket_token, ordinal, issued_at, qr_payload, attendee_name
-         from hpos.tickets where site_id = $1 and order_id = $2 order by ordinal asc`,
+        `select ticket.id as ticket_id, ticket.ticket_token, ticket.ordinal, ticket.issued_at,
+                ticket.qr_payload, ticket.attendee_name, ticket.version,
+                admission.id as admission_id, admission.admitted_at
+         from hpos.tickets ticket
+         left join hpos.admissions admission
+           on admission.site_id = ticket.site_id and admission.ticket_id = ticket.id
+         where ticket.site_id = $1 and ticket.order_id = $2
+         order by ticket.ordinal asc`,
         [site.siteId, order.order_id],
       )
       : { rows: [] as TicketRow[] };
@@ -414,6 +423,7 @@ function publicTicketData(ticket: TicketRow, event: Record<string, unknown>, ref
   const endsAt = Date.parse(String(event.ends_at));
   if (event.is_canceled) blockers.push("event_canceled");
   if (refundStatus === "full") blockers.push("ticket_refunded");
+  if (ticket.admission_id !== null) blockers.push("already_admitted");
   if (Number.isFinite(opensAt) && now < opensAt) blockers.push("check_in_not_open");
   if (Number.isFinite(endsAt) && now > endsAt) blockers.push("check_in_closed");
   return {
@@ -424,8 +434,8 @@ function publicTicketData(ticket: TicketRow, event: Record<string, unknown>, ref
     event,
     qr_payload: ticket.qr_payload,
     attendee_name: ticket.attendee_name,
-    admission_status: "unused",
-    admitted_at: null,
+    admission_status: ticket.admission_id === null ? "unused" : "admitted",
+    admitted_at: ticket.admitted_at?.toISOString() ?? null,
     can_admit: blockers.length === 0,
     admission_blockers: blockers,
   };
@@ -442,7 +452,9 @@ export async function handleBuyerTicketGet(site: AuthenticatedSite, path: string
   if (!TOKEN_PATTERN.test(token)) return apiFailure(404, "not_found", "The Ticket is not available to this Site.");
   const result = await getBusinessPool().query<TicketRow & EventRow & { site_id: string; refund_status: string }>(
     `select ticket.id as ticket_id, event_row.id, ticket.site_id, ticket.ticket_token, ticket.ordinal, ticket.issued_at,
-            ticket.qr_payload, ticket.attendee_name, order_row.refund_status, event_row.is_canceled,
+            ticket.qr_payload, ticket.attendee_name, ticket.version,
+            admission.id as admission_id, admission.admitted_at,
+            order_row.refund_status, event_row.is_canceled,
             event_row.title, event_row.description, event_row.venue_name, event_row.venue_address,
             event_row.starts_at, event_row.starts_at_offset_minutes, event_row.ends_at,
             event_row.ends_at_offset_minutes, event_row.time_zone, event_row.check_in_opens_at,
@@ -460,6 +472,8 @@ export async function handleBuyerTicketGet(site: AuthenticatedSite, path: string
      join hpos.events event_row on event_row.id = ticket.event_id and event_row.site_id = ticket.site_id
      join hpos.ticket_offerings offering
        on offering.id = ticket.offering_id and offering.event_id = ticket.event_id and offering.site_id = ticket.site_id
+     left join hpos.admissions admission
+       on admission.site_id = ticket.site_id and admission.ticket_id = ticket.id
      where ticket.site_id = $1 and ticket.ticket_token_hash = $2`,
     [site.siteId, hashToken(token)],
   );
