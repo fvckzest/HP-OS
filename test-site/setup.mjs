@@ -19,6 +19,7 @@ const other = operator('site', 'create', '--organization', org.organization_id, 
 const connection = operator('payment-connection', 'create', '--organization', org.organization_id, '--provider', 'square', '--environment', 'test', '--account-reference', 'ref:fake-lmnl-square', '--location-reference', 'ref:fake-lmnl-location');
 operator('payment-connection', 'eligibility-record', '--connection', connection.connection_id, '--account-status', 'eligible', '--platform-fee-status', 'ineligible', '--evidence-reference', 'ref:fake-lmnl-simulation-only');
 operator('site', 'assign-connection', '--site', site.site_id, '--connection', connection.connection_id);
+operator('site', 'assign-connection', '--site', other.site_id, '--connection', connection.connection_id);
 const key = operator('site-key', 'issue', '--site', site.site_id);
 const otherKey = operator('site-key', 'issue', '--site', other.site_id);
 const values = { HPOS_ORIGIN: 'http://127.0.0.1:3000', HPOS_SITE_API_KEY: key.site_api_key, HPOS_OTHER_SITE_API_KEY: otherKey.site_api_key, HPOS_SITE_ID: site.site_id, HPOS_CONNECTION_ID: connection.connection_id, SQUARE_ACCOUNT_ALIAS: 'ref:fake-lmnl-square', SQUARE_LOCATION_ALIAS: 'ref:fake-lmnl-location' };

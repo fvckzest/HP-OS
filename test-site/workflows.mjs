@@ -21,30 +21,30 @@ async function configuration(a) {
   await a.read('historical-connection', `/v1/admin/payment-connections/${id(c.connection_id)}`);
   return c;
 }
-async function event(a, prefix = 'event', { ended = false, capacity = 8, futureCheckIn = false } = {}) {
+async function event(a, prefix = 'event', { ended = false, capacity = 8, futureCheckIn = false, auth = 'primary' } = {}) {
   const t = a.run.clock, start = ended ? t - 7_200_000 : t + 300_000, end = ended ? t - 3_600_000 : t + 86_400_000;
-  const draft = await a.write(prefix + '-draft', '/v1/admin/events', { actor: human }, [201]);
+  const draft = await a.write(prefix + '-draft', '/v1/admin/events', { actor: human }, [201], { auth });
   const p = `/v1/admin/events/${id(draft.data.event_id)}`;
-  const saved = await a.call(prefix + '-save', p, { method: 'PATCH', body: {
+  const saved = await a.call(prefix + '-save', p, { method: 'PATCH', auth, body: {
     actor: human, expected_version: draft.data.version, title: `Fake LMNL ${a.run.id.slice(0, 8)} ${prefix}`, description: 'Dedicated local synthetic workflow Event.', visibility: 'public',
     venue: { name: 'Fake LMNL local venue', address: null }, starts_at: iso(start), ends_at: iso(end), time_zone: 'UTC', check_in_opens_at: futureCheckIn ? iso(start) : iso(start - 600_000),
     ticket_offering: { price: { amount: 2500, currency: 'USD' }, tax_amount: 0, buyer_fees: [], capacity, sales_opens_at: iso(start - 600_000), sales_closes_at: iso(end) },
   } });
-  const published = await a.write(prefix + '-publish', p + '/actions/publish', { actor: human, expected_version: saved.data.version });
-  a.run.privateContext.event = published.data;
+  const published = await a.write(prefix + '-publish', p + '/actions/publish', { actor: human, expected_version: saved.data.version }, [200], { auth });
+  if (auth === 'primary') a.run.privateContext.event = published.data;
   await a.save(); return published.data;
 }
-async function reserve(a, e, prefix = 'purchase') {
-  const quote = await a.write(prefix + '-quote', `/v1/public/events/${id(e.event_id)}/quotes`, { quantity: 1 }, [201]);
-  const order = await a.write(prefix + '-order', '/v1/public/orders', { quote_id: quote.data.quote_id, buyer: { name: 'Fake LMNL Buyer', email: a.run.profile === 'sandbox' ? a.config.operatorEmail : 'buyer@fake-lmnl.test' } }, [201]);
+async function reserve(a, e, prefix = 'purchase', auth = 'primary') {
+  const quote = await a.write(prefix + '-quote', `/v1/public/events/${id(e.event_id)}/quotes`, { quantity: 1 }, [201], { auth });
+  const order = await a.write(prefix + '-order', '/v1/public/orders', { quote_id: quote.data.quote_id, buyer: { name: 'Fake LMNL Buyer', email: a.run.profile === 'sandbox' ? a.config.operatorEmail : 'buyer@fake-lmnl.test' } }, [201], { auth });
   a.check(prefix + ': unpaid Order', order.data.payment_status === 'unpaid' && order.data.tickets.length === 0, 'Unpaid Order with no Tickets', { payment: order.data.payment_status, tickets: order.data.tickets.length });
-  a.run.privateContext.order = order.data;
+  if (auth === 'primary') a.run.privateContext.order = order.data;
   await a.save(); return { quote: quote.data, order: order.data };
 }
-async function attempt(a, order, prefix = 'attempt') {
-  const res = await a.write(prefix + '-create', `/v1/admin/orders/${id(order.order_id)}/payment-attempts`, { actor: system }, [201]);
+async function attempt(a, order, prefix = 'attempt', auth = 'primary') {
+  const res = await a.write(prefix + '-create', `/v1/admin/orders/${id(order.order_id)}/payment-attempts`, { actor: system }, [201], { auth });
   a.check(prefix + ': frozen total', res.data.total.amount === order.pricing.total.amount && res.data.total.currency === order.pricing.total.currency && res.data.connection.environment === 'test', 'Attempt matches the accepted Order total and test connection', res.data.total);
-  a.run.privateContext.attempt = res.data; await a.save(); return res.data;
+  if (auth === 'primary') a.run.privateContext.attempt = res.data; await a.save(); return res.data;
 }
 async function checkout(a, at) {
   let reference = `fake-checkout-${a.run.id}`;
@@ -185,9 +185,21 @@ export async function execute(a) {
   if (workflow === 'service') { await configuration(a); return; }
   if (workflow === 'checkout' || workflow === 'closure') { await closure(a); return; }
   if (workflow === 'configuration') {
-    await configuration(a); await a.read('missing-key', '/v1/admin/payment-configuration', { auth: 'none', expected: [401], expectedError: 'unauthorized' }); const e = await event(a);
-    await a.read('other-Site-event', `/v1/admin/events/${id(e.event_id)}`, { auth: 'other', expected: [404], expectedError: 'not_found' });
-    await a.read('other-Site-connection', `/v1/admin/payment-connections/${id(a.config.connectionId)}`, { auth: 'other', expected: [404], expectedError: 'not_found' }); return;
+    await configuration(a); await a.read('missing-key', '/v1/admin/payment-configuration', { auth: 'none', expected: [401], expectedError: 'unauthorized' });
+    const otherConfig = await a.read('other-Site-configuration', '/v1/admin/payment-configuration', { auth: 'other' });
+    a.check('shared test connection', otherConfig.data?.active_connection?.connection_id === a.config.connectionId, 'Both dedicated Sites must share the test connection; assign it to the secondary Site with the operator CLI', otherConfig.data?.active_connection?.connection_id);
+    await a.read('other-Site-shared-connection', `/v1/admin/payment-connections/${id(a.config.connectionId)}`, { auth: 'other' });
+    const f = await fixture(a);
+    const denied = {
+      event: `/v1/admin/events/${id(f.e.event_id)}`, 'public-event': `/v1/public/events/${id(f.e.event_id)}`,
+      'related-orders': `/v1/admin/events/${id(f.e.event_id)}/orders`, 'related-tickets': `/v1/admin/events/${id(f.e.event_id)}/tickets`,
+      order: `/v1/admin/orders/${id(f.order.order_id)}`, attempt: `/v1/admin/payment-attempts/${id(f.at.attempt_id)}`,
+      'order-token': `/v1/public/orders/${id(f.order.order_token)}`, 'ticket-token': `/v1/public/tickets/${id(f.ticket.ticket_token)}`,
+    };
+    for (const [name, path] of Object.entries(denied)) await a.read('other-Site-' + name, path, { auth: 'other', expected: [404], expectedError: 'not_found' });
+    const otherEvent = await event(a, 'other-event', { auth: 'other' }), { order } = await reserve(a, otherEvent, 'other-purchase', 'other'), at = await attempt(a, order, 'other-attempt', 'other');
+    await a.write('other-Site-provider-reference', `/v1/admin/payment-attempts/${id(at.attempt_id)}/checkout-reference`, { actor: system, connection_id: a.config.connectionId, provider_checkout_reference: f.reference, provider_can_take_payment: true }, [404], { auth: 'other', expectedError: 'not_found' });
+    return;
   }
   if (workflow === 'events') {
     await configuration(a);

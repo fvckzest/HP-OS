@@ -9,7 +9,7 @@ import { routes, documentedRoutes, tickets, workflows } from '../catalog.mjs';
 import { publicRun, RunStore } from '../evidence.mjs';
 import { Adapter, Unknown, Blocked } from '../adapter.mjs';
 import { createDashboard } from '../server.mjs';
-import { settleRequests } from '../workflows.mjs';
+import { settleRequests, execute } from '../workflows.mjs';
 
 const config = () => loadConfig({ HPOS_SITE_API_KEY: 'private-site-key', HPOS_OTHER_SITE_API_KEY: 'private-other-key', HPOS_SITE_ID: 'dedicated-site', HPOS_CONNECTION_ID: 'dedicated-connection', TEST_SITE_PORT: '3198' });
 const run = () => ({ id: '12345678-1234-1234-1234-123456789012', clock: Date.now(), profile: 'simulation', status: 'not run', steps: [], checks: [], journal: {}, privateContext: {}, startedAt: new Date().toISOString() });
@@ -147,4 +147,57 @@ test('previous service-only read failure is corrected without starting requests 
   const store = await tempStore(t), saved = run(); saved.workflow = 'service'; saved.status = 'unknown outcome'; saved.steps = [{ method: 'GET', path: '/v1/admin/payment-configuration', actual: { outcome: 'interrupted read' } }]; await store.save(saved);
   let outbound = 0; await createDashboard({ config: config(), directory: store.directory, fetchImpl: async () => { outbound++; } });
   const corrected = await store.read(saved.id); assert.equal(corrected.status, 'blocked'); assert.equal(corrected.steps.length, 1); assert.equal(outbound, 0);
+});
+test('Sandbox delivery resume accepts the original payment ID and rejects replacement after reporting', async t => {
+  const store = await tempStore(t), c = config();
+  const { server, active } = await createDashboard({ config: c, directory: store.directory, fetchImpl: async () => { throw new Error('offline'); } });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); c.port = server.address().port;
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const origin = `http://127.0.0.1:${c.port}`, status = await (await fetch(origin + '/api/status')).json();
+  const saved = { ...run(), workflow: 'service', profile: 'sandbox', status: 'interrupted', fingerprint: c.fingerprint, dashboardHash: status.dashboardHash, source: status.source };
+  saved.privateContext.paymentId = 'original-payment'; saved.journal['paid-report'] = { state: 'done' }; await store.save(saved);
+  const resume = paymentId => fetch(origin + '/api/resume', { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json', 'X-Test-Site-Token': status.csrf }, body: JSON.stringify({ runId: saved.id, paymentId }) });
+  assert.equal((await resume('different-payment')).status, 409);
+  assert.equal((await resume('original-payment')).status, 202);
+  while (active.size) await new Promise(resolve => setImmediate(resolve));
+  assert.equal((await store.read(saved.id)).privateContext.paymentId, 'original-payment');
+  assert.equal((await resume('')).status, 202);
+  while (active.size) await new Promise(resolve => setImmediate(resolve));
+});
+test('isolation scenario checks private records and provider references while both Sites share a connection', async () => {
+  const saved = { ...run(), workflow: 'configuration' }, calls = [], connection = { connection_id: 'dedicated-connection', environment: 'test' };
+  const ticket = { ticket_id: 'ticket-one', ticket_token: 'ticket-token', qr_payload: 'qr-one' };
+  const order = { order_id: 'order-one', order_token: 'order-token', pricing: { total: { amount: 2500, currency: 'USD' } }, payment_status: 'unpaid', tickets: [] };
+  const issued = { ...order, payment_status: 'paid', issuance_status: 'issued', tickets: [ticket] };
+  const adapter = {
+    run: saved, config: config(), save: async () => {}, check: (name, condition) => assert.ok(condition, name),
+    async call(name, path, options = {}) {
+      calls.push({ name, path, ...options }); saved.journal[name] = { key: name };
+      if (options.expectedError) return { status: options.expected[0], error: { code: options.expectedError } };
+      let data;
+      if (path.endsWith('/payment-configuration')) data = { active_connection: connection };
+      else if (path.includes('/payment-connections/')) data = connection;
+      else if (['issued-order', 'after-payment-replay'].includes(name)) data = issued;
+      else if (name.endsWith('-quote')) data = { quote_id: name };
+      else if (name.endsWith('-order')) data = { ...order, order_id: name, order_token: name + '-token' };
+      else if (name.endsWith('-create')) data = { attempt_id: name, total: order.pricing.total, connection };
+      else if (name === 'checkout-register') data = { provider_checkout_reference: options.body.provider_checkout_reference };
+      else if (name === 'buyer-pending') data = order;
+      else data = { event_id: 'event-' + (options.auth ?? 'primary'), version: 1, ticket_offering: { available_quantity: 8 } };
+      return { status: options.expected?.[0] ?? 200, data, envelope: { data } };
+    },
+    read(name, path, options) { return this.call(name, path, options); },
+    write(name, path, body, expected = [200], options = {}) { return this.call(name, path, { method: 'POST', body, expected, ...options }); },
+  };
+  await execute(adapter);
+  assert.equal(calls.find(c => c.name === 'other-Site-shared-connection').expectedError, undefined);
+  for (const name of ['event', 'public-event', 'related-orders', 'related-tickets', 'order', 'attempt', 'order-token', 'ticket-token', 'provider-reference']) {
+    const call = calls.find(c => c.name === 'other-Site-' + name);
+    assert.equal(call.auth, 'other'); assert.deepEqual(call.expected, [404]); assert.equal(call.expectedError, 'not_found');
+  }
+  const reuse = calls.find(c => c.name === 'other-Site-provider-reference');
+  assert.equal(reuse.body.connection_id, connection.connection_id);
+  assert.equal(reuse.body.provider_checkout_reference, calls.find(c => c.name === 'checkout-register').body.provider_checkout_reference);
+  assert.equal(saved.privateContext.order.order_id, 'purchase-order');
+  assert.equal(saved.privateContext.attempt.attempt_id, 'attempt-create');
 });

@@ -92,7 +92,7 @@ export async function createDashboard({ config = loadConfig(), directory = fileU
         if (!['interrupted', 'unknown outcome', 'blocked'].includes(run.status)) return send(409, { error: 'Only an interrupted, unknown, or blocked saved run can resume.' });
         if (run.fingerprint !== config.fingerprint || run.dashboardHash !== dashboardHash || hash(run.source) !== hash(source)) return send(409, { error: 'Configuration or source snapshot changed. Review previous uncertainty before starting a different workflow.' });
         if (body.paymentId && run.profile === 'sandbox') {
-          if (run.journal['paid-report']) return send(409, { error: 'Payment report already started; its payment identity cannot be replaced.' });
+          if (run.journal['paid-report'] && body.paymentId !== run.privateContext.paymentId) return send(409, { error: 'Payment report already started; its payment identity cannot be replaced.' });
           run.privateContext.paymentId = body.paymentId;
         }
       } else {
