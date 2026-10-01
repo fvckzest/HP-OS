@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
-import { apiFailure } from "./api-response";
+import { apiFailure, apiSuccess } from "./api-response";
 import { withApiIdempotency } from "./api-idempotency";
 import { ApiOperationError } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
@@ -30,6 +30,44 @@ interface ReportInput {
 interface LockedAttempt extends AttemptRow {
   issuance_status: "not_started" | "pending" | "issued" | "failed" | "blocked";
   checkout_expired: boolean;
+}
+
+interface PaymentReportRow {
+  id: string;
+  attempt_id: string;
+  connection_id: string;
+  source_reference: string;
+  provider_checkout_reference: string;
+  provider_payment_reference: string | null;
+  outcome: ReportInput["outcome"];
+  observed_at: Date;
+  payment_started_at: Date | null;
+  provider_can_take_payment: boolean | null;
+  amount: string | null;
+  currency: string | null;
+  applied: boolean;
+  conflict_code: string | null;
+  created_at: Date;
+}
+
+interface PaymentIssueRow {
+  issue_id: string;
+  order_id: string;
+  attempt_id: string;
+  report_id: string;
+  code: string;
+  status: "open" | "resolved";
+  message: string;
+  created_at: Date;
+  resolved_at: Date | null;
+  resolution_id: string | null;
+  actor_type: "user" | "system" | null;
+  actor_reference: string | null;
+  reason: string | null;
+  verification_reference: string | null;
+  previous_version: number | null;
+  new_version: number | null;
+  resolution_created_at: Date | null;
 }
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -97,12 +135,150 @@ function parseInput(value: Record<string, unknown>): ReportInput | Response {
   };
 }
 
+interface ResolutionInput {
+  actor: { type: "user" | "system"; reference: string };
+  expected_version: number;
+  reason: string;
+  verification_reference: string;
+  report: ReportInput;
+}
+
+function parseResolutionInput(value: Record<string, unknown>): ResolutionInput | Response {
+  const allowed = ["actor", "expected_version", "reason", "verification_reference", "report"];
+  if (Object.keys(value).some((key) => !allowed.includes(key))) {
+    return apiFailure(422, "validation_failed", "A payment resolution contains an unsupported field.");
+  }
+  if (!object(value.actor) || Object.keys(value.actor).some((key) => !["type", "reference"].includes(key))
+    || (value.actor.type !== "user" && value.actor.type !== "system")
+    || !validReference(value.actor.reference) || value.actor.reference.length > 200) {
+    return apiFailure(422, "validation_failed", "Provide a non-secret Site-local actor reference.", {
+      details: [{ field: "actor", code: "invalid_actor", message: "actor must contain type and reference." }],
+    });
+  }
+  if (!Number.isSafeInteger(value.expected_version) || Number(value.expected_version) < 1) {
+    return apiFailure(422, "validation_failed", "expected_version must be a positive integer.", {
+      details: [{ field: "expected_version", code: "required", message: "Use the current payment-attempt version." }],
+    });
+  }
+  if (!validReference(value.reason) || value.reason.length > 1000) {
+    return apiFailure(422, "validation_failed", "reason must be a non-secret explanation of the staff decision.", {
+      details: [{ field: "reason", code: "invalid_reason", message: "Provide a reason of at most 1000 characters." }],
+    });
+  }
+  if (!validReference(value.verification_reference)) {
+    return apiFailure(422, "validation_failed", "verification_reference must identify non-secret verification evidence.", {
+      details: [{ field: "verification_reference", code: "invalid_reference", message: "Provide a non-secret evidence reference of at most 500 characters." }],
+    });
+  }
+  if (!object(value.report)) {
+    return apiFailure(422, "validation_failed", "report must contain a verified payment observation.", {
+      details: [{ field: "report", code: "required", message: "Provide the corrected payment report." }],
+    });
+  }
+  const report = parseInput(value.report);
+  if (report instanceof Response) return report;
+  return {
+    actor: { type: value.actor.type, reference: value.actor.reference.trim() },
+    expected_version: Number(value.expected_version),
+    reason: value.reason.trim(),
+    verification_reference: value.verification_reference.trim(),
+    report,
+  };
+}
+
+async function readJsonBody(request: Request): Promise<Record<string, unknown> | Response> {
+  if (request.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "application/json") {
+    return apiFailure(415, "unsupported_media_type", "Send payment-resolution fields as application/json.");
+  }
+  let bodyText: string;
+  try { bodyText = await request.text(); }
+  catch { return apiFailure(400, "invalid_request", "The payment-resolution body could not be read."); }
+  if (Buffer.byteLength(bodyText, "utf8") > 64 * 1024) return apiFailure(413, "request_too_large", "The request body exceeds 64 KiB.");
+  let body: unknown;
+  try { body = JSON.parse(bodyText); }
+  catch { return apiFailure(400, "invalid_request", "The payment-resolution body must contain readable JSON."); }
+  if (!object(body)) return apiFailure(400, "invalid_request", "The payment-resolution body must be a JSON object.");
+  return body;
+}
+
 function fingerprint(input: ReportInput): string {
   return createHash("sha256").update(JSON.stringify(input), "utf8").digest("hex");
 }
 
 function reportResult(reportId: string, applied: boolean, attempt: LockedAttempt, orderId: string): IdempotentResult {
   return { status: 201, data: { report_id: reportId, applied, attempt: paymentAttemptData(attempt), order_id: orderId } };
+}
+
+function paymentReportData(row: PaymentReportRow) {
+  return {
+    report_id: row.id,
+    attempt_id: row.attempt_id,
+    connection_id: row.connection_id,
+    source_reference: row.source_reference,
+    provider_checkout_reference: row.provider_checkout_reference,
+    provider_payment_reference: row.provider_payment_reference,
+    outcome: row.outcome,
+    observed_at: row.observed_at.toISOString(),
+    payment_started_at: row.payment_started_at?.toISOString() ?? null,
+    provider_can_take_payment: row.provider_can_take_payment,
+    amount: row.amount === null ? null : Number(row.amount),
+    currency: row.currency,
+    applied: row.applied,
+    conflict_code: row.conflict_code,
+    created_at: row.created_at.toISOString(),
+  };
+}
+
+function paymentIssueData(row: PaymentIssueRow) {
+  return {
+    issue_id: row.issue_id,
+    order_id: row.order_id,
+    attempt_id: row.attempt_id,
+    report_id: row.report_id,
+    code: row.code,
+    status: row.status,
+    message: row.message,
+    created_at: row.created_at.toISOString(),
+    resolved_at: row.resolved_at?.toISOString() ?? null,
+    resolution: row.resolution_id ? {
+      resolution_id: row.resolution_id,
+      actor: { type: row.actor_type, reference: row.actor_reference },
+      reason: row.reason,
+      verification_reference: row.verification_reference,
+      previous_version: row.previous_version,
+      new_version: row.new_version,
+      created_at: row.resolution_created_at?.toISOString() ?? null,
+    } : null,
+  };
+}
+
+async function paymentInvestigationData(client: PoolClient, siteId: string, attempt: LockedAttempt) {
+  const reports = await client.query<PaymentReportRow>(
+    `select id, attempt_id, connection_id, source_reference, provider_checkout_reference,
+            provider_payment_reference, outcome, observed_at, payment_started_at,
+            provider_can_take_payment, amount, currency, applied, conflict_code, created_at
+     from hpos.payment_attempt_reports
+     where site_id = $1 and attempt_id = $2
+     order by observed_at desc, created_at desc, id desc`,
+    [siteId, attempt.id],
+  );
+  const issues = await client.query<PaymentIssueRow>(
+    `select issue.id as issue_id, issue.order_id, issue.attempt_id, issue.report_id,
+            issue.code, issue.status, issue.message, issue.created_at, issue.resolved_at,
+            resolution.id as resolution_id, resolution.actor_type, resolution.actor_reference,
+            resolution.reason, resolution.verification_reference, resolution.previous_version,
+            resolution.new_version, resolution.created_at as resolution_created_at
+     from hpos.payment_report_issues issue
+     left join hpos.payment_report_issue_resolutions resolution
+       on resolution.issue_id = issue.id and resolution.site_id = issue.site_id
+     where issue.site_id = $1 and issue.attempt_id = $2
+     order by issue.created_at desc, issue.id desc`,
+    [siteId, attempt.id],
+  );
+  return {
+    reports: reports.rows.map(paymentReportData),
+    issues: issues.rows.map(paymentIssueData),
+  };
 }
 
 async function lockAttempt(client: PoolClient, siteId: string, attemptId: string): Promise<LockedAttempt | null> {
@@ -335,6 +511,96 @@ async function createPaymentReport(
   return reportResult(reportId, true, refreshed ?? { ...attempt, ...updatedAttempt.rows[0] }, attempt.order_id);
 }
 
+async function resolvePaymentConflict(
+  client: PoolClient,
+  site: AuthenticatedSite,
+  attemptId: string,
+  input: ResolutionInput,
+): Promise<IdempotentResult> {
+  const attempt = await lockAttempt(client, site.siteId, attemptId);
+  if (!attempt) throw new ApiOperationError(404, "not_found", "The payment attempt is not available to this Site.");
+  if (attempt.version !== input.expected_version) {
+    throw new ApiOperationError(409, "version_conflict", "The payment attempt changed after staff loaded it. Reload the investigation before resolving it.");
+  }
+
+  const openIssues = await client.query<{ id: string }>(
+    `select id
+     from hpos.payment_report_issues
+     where site_id = $1 and attempt_id = $2 and code = 'payment_report_conflict' and status = 'open'
+     order by created_at asc, id asc
+     for update`,
+    [site.siteId, attempt.id],
+  );
+  if (openIssues.rowCount === 0) {
+    throw new ApiOperationError(409, "invalid_state", "This payment attempt has no open payment conflict to resolve.");
+  }
+
+  const reusedSource = await client.query<{ id: string }>(
+    `select id
+     from hpos.payment_attempt_reports
+     where site_id = $1 and connection_id = $2 and source_reference = $3
+     limit 1`,
+    [site.siteId, attempt.connection_id, input.report.source_reference],
+  );
+  if (reusedSource.rowCount !== 0) {
+    throw new ApiOperationError(409, "payment_report_conflict", "A guarded resolution must use a new provider source reference.");
+  }
+
+  const result = await createPaymentReport(client, site, attempt.id, input.report);
+  if (result.status !== 201 || !object(result.data)) return result;
+  const reportId = result.data.report_id;
+  if (typeof reportId !== "string" || result.data.applied !== true) return result;
+
+  const resolvedAt = new Date();
+  const resolvedIssueIds: string[] = [];
+  for (const issue of openIssues.rows) {
+    const updated = await client.query<{ id: string }>(
+      `update hpos.payment_report_issues
+       set status = 'resolved', resolved_at = $3
+       where id = $1 and site_id = $2 and status = 'open'
+       returning id`,
+      [issue.id, site.siteId, resolvedAt],
+    );
+    if (updated.rowCount !== 1) {
+      throw new ApiOperationError(409, "request_in_progress", "The payment conflict changed while it was being resolved.");
+    }
+    await client.query(
+      `insert into hpos.payment_report_issue_resolutions (
+         id, site_id, issue_id, order_id, attempt_id, report_id,
+         actor_type, actor_reference, reason, verification_reference,
+         previous_version, new_version
+       ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+      [randomUUID(), site.siteId, issue.id, attempt.order_id, attempt.id, reportId,
+        input.actor.type, input.actor.reference, input.reason, input.verification_reference,
+        input.expected_version, input.expected_version + 1],
+    );
+    resolvedIssueIds.push(issue.id);
+  }
+
+  return {
+    status: 200,
+    data: {
+      report_id: reportId,
+      applied: true,
+      attempt: result.data.attempt,
+      order_id: attempt.order_id,
+      resolved_issue_ids: resolvedIssueIds,
+    },
+  };
+}
+
+async function maybeIssuePaidOrder(response: Response, site: AuthenticatedSite): Promise<void> {
+  if (!response.ok) return;
+  try {
+    const payload = await response.clone().json() as {
+      data?: { attempt?: { last_outcome?: string }; order_id?: string };
+    };
+    if (payload.data?.attempt?.last_outcome === "paid" && payload.data.order_id) {
+      await issuePaidOrder(site.siteId, payload.data.order_id);
+    }
+  } catch { /* The durable scheduler will retry any paid Order still awaiting issuance. */ }
+}
+
 export async function handlePaymentReportPost(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
   if (request.method !== "POST" || path.length !== 4 || path[0] !== "admin"
     || path[1] !== "payment-attempts" || path[3] !== "payment-reports") return null;
@@ -355,13 +621,56 @@ export async function handlePaymentReportPost(request: Request, site: Authentica
 
   const response = await withApiIdempotency(request, site, body,
     (client) => createPaymentReport(client, site, path[2], input));
-  if (response.ok) {
-    try {
-      const payload = await response.clone().json() as { data?: { attempt?: { last_outcome?: string }; order_id?: string } };
-      if (payload.data?.attempt?.last_outcome === "paid" && payload.data.order_id) {
-        await issuePaidOrder(site.siteId, payload.data.order_id);
-      }
-    } catch { /* The durable scheduler will retry any paid Order still awaiting issuance. */ }
-  }
+  await maybeIssuePaidOrder(response, site);
   return response;
+}
+
+export async function handlePaymentResolutionPost(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
+  if (request.method !== "POST" || path.length !== 5 || path[0] !== "admin"
+    || path[1] !== "payment-attempts" || path[3] !== "actions" || path[4] !== "resolve") return null;
+  if (!UUID_PATTERN.test(path[2])) return apiFailure(404, "not_found", "The payment attempt is not available to this Site.");
+  const body = await readJsonBody(request);
+  if (body instanceof Response) return body;
+  const input = parseResolutionInput(body);
+  if (input instanceof Response) return input;
+
+  const response = await withApiIdempotency(request, site, body,
+    (client) => resolvePaymentConflict(client, site, path[2], input));
+  await maybeIssuePaidOrder(response, site);
+  return response;
+}
+
+export async function handlePaymentInvestigationGet(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
+  if (request.method !== "GET" || path.length !== 3 || path[0] !== "admin"
+    || path[1] !== "payment-attempts" || !UUID_PATTERN.test(path[2])) return null;
+  const client = await getBusinessPool().connect();
+  try {
+    const result = await client.query<LockedAttempt>(
+      `select attempt.*, order_row.checkout_status, order_row.checkout_expires_at,
+              order_row.payment_status, order_row.issuance_status,
+              reservation.status as reservation_status,
+              order_row.checkout_expires_at <= clock_timestamp() as checkout_expired
+       from hpos.payment_attempts attempt
+       join hpos.orders order_row on order_row.id = attempt.order_id and order_row.site_id = attempt.site_id
+       join hpos.reservations reservation on reservation.order_id = order_row.id and reservation.site_id = order_row.site_id
+       where attempt.id = $1 and attempt.site_id = $2`,
+      [path[2], site.siteId],
+    );
+    const attempt = result.rows[0];
+    if (!attempt) return apiFailure(404, "not_found", "The payment attempt is not available to this Site.");
+    const investigation = await paymentInvestigationData(client, site.siteId, attempt);
+    return apiSuccess({
+      ...paymentAttemptData(attempt),
+      checkout_status: attempt.checkout_status,
+      checkout_expires_at: attempt.checkout_expires_at.toISOString(),
+      payment_status: attempt.payment_status,
+      issuance_status: attempt.issuance_status,
+      reservation_status: attempt.reservation_status,
+      requires_verification: attempt.status === "requires_verification"
+        || (attempt.checkout_expired && attempt.status !== "closed" && attempt.provider_can_take_payment !== false),
+      ...investigation,
+    });
+  } finally {
+    client.release();
+  }
 }

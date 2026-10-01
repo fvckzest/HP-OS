@@ -5,7 +5,7 @@ import { handleNotificationGet, handleNotificationPost } from "@/server/notifica
 import { handleCheckoutPost } from "@/server/checkout";
 import { handlePaymentAttemptGet, handlePaymentAttemptPost } from "@/server/payment-attempts";
 import { handleAdminOrderPaymentStatusGet, handleBuyerOrderGet, handleBuyerTicketGet } from "@/server/ticket-issuance";
-import { handlePaymentReportPost } from "@/server/payment-reports";
+import { handlePaymentInvestigationGet, handlePaymentReportPost, handlePaymentResolutionPost } from "@/server/payment-reports";
 import { handleEventActionPost, handleEventGet, handleEventPatch, handleEventPost } from "@/server/events";
 import { handleAdmissionPost } from "@/server/admissions";
 
@@ -35,6 +35,9 @@ export async function GET(request: Request, context: RouteContext) {
 
     const notificationResponse = await handleNotificationGet(request, authentication.site, path);
     if (notificationResponse) return notificationResponse;
+
+    const paymentInvestigationResponse = await handlePaymentInvestigationGet(request, authentication.site, path);
+    if (paymentInvestigationResponse) return paymentInvestigationResponse;
 
     const paymentAttemptResponse = await handlePaymentAttemptGet(request, authentication.site, path);
     if (paymentAttemptResponse) return paymentAttemptResponse;
@@ -67,6 +70,9 @@ export async function POST(request: Request, context: RouteContext) {
   try {
     const admissionResponse = await handleAdmissionPost(request, authentication.site, path);
     if (admissionResponse) return admissionResponse;
+
+    const paymentResolutionResponse = await handlePaymentResolutionPost(request, authentication.site, path);
+    if (paymentResolutionResponse) return paymentResolutionResponse;
 
     const paymentReportResponse = await handlePaymentReportPost(request, authentication.site, path);
     if (paymentReportResponse) return paymentReportResponse;

@@ -1198,6 +1198,149 @@ async function verifyPaymentReportsAndTicketIssuance(site) {
     "A duplicate provider payment identity issued another usable Ticket.");
 }
 
+async function verifyPaymentConflictResolution(site) {
+  const now = Date.now();
+  const event = await createPublishedEvent(site, {
+    title: "Issue 35 Guarded Payment Conflict Resolution",
+    startsAt: new Date(now + 60 * 60_000).toISOString(),
+    endsAt: new Date(now + 2 * 60 * 60_000).toISOString(),
+    timeZone: "UTC",
+    ticketOffering: { price: { amount: 2500, currency: "USD" }, capacity: 1, tax_amount: 0, buyer_fees: [] },
+  });
+  const quote = await api(site, `/v1/public/events/${event.event_id}/quotes`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
+  });
+  assert(quote.status === 201, "The Issue #35 fixture could not create a quote.");
+  const order = await api(site, "/v1/public/orders", {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { quote_id: quote.data.data.quote_id, buyer: { name: "Conflict Buyer", email: "conflict@example.test" } },
+  });
+  assert(order.status === 201, "The Issue #35 fixture could not create an Order.");
+  const attempt = await api(site, `/v1/admin/orders/${order.data.data.order_id}/payment-attempts`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "system", reference: "test:issue-35" } },
+  });
+  assert(attempt.status === 201, "The Issue #35 fixture could not create a payment attempt.");
+  const attemptId = attempt.data.data.attempt_id;
+  const checkoutReference = "square-test-link-35-" + randomUUID();
+  const registered = await api(site, `/v1/admin/payment-attempts/${attemptId}/checkout-reference`, {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "system", reference: "test:issue-35" },
+      connection_id: site.connectionId,
+      provider_checkout_reference: checkoutReference,
+      provider_can_take_payment: true,
+    },
+  });
+  assert(registered.status === 200, "The Issue #35 fixture could not register the provider checkout.");
+
+  const conflictBody = {
+    connection_id: site.connectionId,
+    source_reference: "square-conflict-35-" + randomUUID(),
+    provider_checkout_reference: checkoutReference,
+    provider_payment_reference: "square-payment-conflict-35-" + randomUUID(),
+    outcome: "paid",
+    observed_at: new Date(now + 1_000).toISOString(),
+    payment_started_at: new Date(now + 500).toISOString(),
+    provider_can_take_payment: false,
+    amount: 2600,
+    currency: "USD",
+  };
+  const conflict = await api(site, `/v1/admin/payment-attempts/${attemptId}/payment-reports`, {
+    method: "POST", idempotencyKey: randomUUID(), body: conflictBody,
+  });
+  assert(conflict.status === 409 && conflict.data.error.code === "payment_report_conflict",
+    "A pre-issuance amount mismatch did not create a payment conflict.");
+  const blocked = await api(site, `/v1/public/orders/${order.data.data.order_token}`);
+  assert(blocked.status === 200 && blocked.data.data.payment_status === "conflicted"
+    && blocked.data.data.tickets.length === 0,
+    "A pre-issuance conflict did not block fulfillment.");
+
+  const detail = await api(site, `/v1/admin/payment-attempts/${attemptId}`);
+  assert(detail.status === 200 && detail.data.data.reports.some((report) => report.conflict_code === "payment_report_conflict")
+    && detail.data.data.issues.some((issue) => issue.status === "open" && issue.code === "payment_report_conflict"),
+    "Payment-attempt detail did not retain the conflicting report and open issue.");
+  const resolutionBase = {
+    actor: { type: "user", reference: "test:issue-35-operator" },
+    reason: "Operator verified the provider payment against the recorded checkout.",
+    verification_reference: "ref:issue-35-payment-verification-" + randomUUID(),
+    report: {
+      connection_id: site.connectionId,
+      source_reference: "square-resolution-35-" + randomUUID(),
+      provider_checkout_reference: checkoutReference,
+      provider_payment_reference: "square-payment-resolution-35-" + randomUUID(),
+      outcome: "paid",
+      observed_at: new Date(now + 2_000).toISOString(),
+      payment_started_at: new Date(now + 500).toISOString(),
+      provider_can_take_payment: false,
+      amount: 2500,
+      currency: "USD",
+    },
+  };
+  const stale = await api(site, `/v1/admin/payment-attempts/${attemptId}/actions/resolve`, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { ...resolutionBase, expected_version: detail.data.data.version - 1 },
+  });
+  assert(stale.status === 409 && stale.data.error.code === "version_conflict",
+    "A stale guarded resolution was accepted.");
+  const invalid = await api(site, `/v1/admin/payment-attempts/${attemptId}/actions/resolve`, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: {
+      ...resolutionBase,
+      expected_version: detail.data.data.version,
+      report: { ...resolutionBase.report, source_reference: "square-invalid-resolution-35-" + randomUUID(), amount: 2601 },
+    },
+  });
+  assert(invalid.status === 409 && invalid.data.error.code === "payment_report_conflict",
+    "An invalid guarded resolution bypassed the frozen amount check.");
+  const afterInvalid = await api(site, `/v1/admin/payment-attempts/${attemptId}`);
+  assert(afterInvalid.status === 200 && afterInvalid.data.data.version > detail.data.data.version,
+    "A rejected resolution did not retain its conflicting observation for investigation.");
+
+  const resolutionKey = randomUUID();
+  const resolved = await api(site, `/v1/admin/payment-attempts/${attemptId}/actions/resolve`, {
+    method: "POST", idempotencyKey: resolutionKey,
+    body: { ...resolutionBase, expected_version: afterInvalid.data.data.version },
+  });
+  assert(resolved.status === 200 && resolved.data.data.applied === true
+    && resolved.data.data.resolved_issue_ids.length >= 2,
+    "A valid guarded resolution did not resolve all retained conflict issues.");
+  const replay = await api(site, `/v1/admin/payment-attempts/${attemptId}/actions/resolve`, {
+    method: "POST", idempotencyKey: resolutionKey,
+    body: { ...resolutionBase, expected_version: afterInvalid.data.data.version },
+  });
+  assert(replay.status === 200 && replay.data.data.report_id === resolved.data.data.report_id,
+    "Replaying the guarded resolution did not return its original result.");
+  const audit = await pool.query(
+    `select count(*)::integer as resolutions,
+            count(*) filter (where issue.status = 'resolved')::integer as resolved_issues,
+            count(*) filter (where resolution.actor_reference = 'test:issue-35-operator')::integer as actor_records
+     from hpos.payment_report_issue_resolutions resolution
+     join hpos.payment_report_issues issue on issue.id = resolution.issue_id
+     where resolution.attempt_id = $1`,
+    [attemptId],
+  );
+  assert(audit.rows[0]?.resolutions >= 2 && audit.rows[0]?.resolved_issues >= 2 && audit.rows[0]?.actor_records >= 2,
+    "The guarded resolution audit did not retain issue status and staff evidence.");
+
+  const delayed = await api(site, `/v1/admin/payment-attempts/${attemptId}/payment-reports`, {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      connection_id: site.connectionId,
+      source_reference: "square-delayed-failed-35-" + randomUUID(),
+      provider_checkout_reference: checkoutReference,
+      provider_payment_reference: null,
+      outcome: "failed",
+      observed_at: new Date(now + 1_500).toISOString(),
+      payment_started_at: null,
+      provider_can_take_payment: false,
+    },
+  });
+  assert(delayed.status === 201 && delayed.data.data.applied === false,
+    "Delayed failed evidence regressed the resolved paid attempt.");
+  const final = await api(site, `/v1/public/orders/${order.data.data.order_token}`);
+  assert(final.status === 200 && final.data.data.payment_status === "paid"
+    && final.data.data.issuance_status === "issued" && final.data.data.tickets.length === 1,
+    "A resolved conflict did not preserve one paid Order and Ticket after delayed evidence.");
+}
+
 async function verifyReservationBackedSalesControls(site) {
   const now = Date.now();
   const event = await createPublishedEvent(site, {
@@ -1741,13 +1884,14 @@ async function main() {
     await verifyPublicPaymentAttemptLifecycle(site);
     await verifySharedCheckoutReferenceIsolation(site);
     await verifyPaymentReportsAndTicketIssuance(site);
+    await verifyPaymentConflictResolution(site);
     await verifyReservationBackedSalesControls(site);
   } finally {
     await cleanup();
     await stopApp(app);
     await pool.end();
   }
-  console.log("Local Event, checkout, and Admission API verification passed: sales controls with actual Reservations, preserved purchase terms, capacity release, Organization pilot fees, explicit pricing, single-Ticket quotes, payment-attempt idempotency, shared-connection checkout-reference isolation under concurrent registration, verified payment reporting, interrupted issuance recovery, duplicate-safe Tickets and email work, separate buyer tokens, manual lookup, Admission rejection precedence, same-key replay, concurrent scans, conflict retention, provider closure safety, Reservation expiry, and concurrent last-capacity protection.");
+  console.log("Local Event, checkout, and Admission API verification passed: sales controls with actual Reservations, preserved purchase terms, capacity release, Organization pilot fees, explicit pricing, single-Ticket quotes, payment-attempt idempotency, shared-connection checkout-reference isolation under concurrent registration, verified payment reporting, interrupted issuance recovery, duplicate-safe Tickets and email work, separate buyer tokens, manual lookup, Admission rejection precedence, same-key replay, concurrent scans, conflict retention and guarded resolution, provider closure safety, Reservation expiry, and concurrent last-capacity protection.");
 }
 
 main().catch((error) => {

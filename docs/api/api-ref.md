@@ -584,6 +584,8 @@ PublicTicket uses its public/common fields above. AdminTicket uses admin/common 
 
 Verification list responses also expose Order deadlines and verification-required state; see [provider verification](api.md#checkout-expiry-and-provider-verification). Provider credentials and checkout URLs stay on the Site backend.
 
+Payment-attempt detail responses also include `reports` and `issues`. Reports retain source identity, provider references, observed outcome, applied/conflict state, and timestamps. Issues retain open/resolved state and message; resolved issues include the guarded actor, reason, non-secret verification reference, and prior/new attempt versions. These records are Site-scoped and never include provider credentials or buyer access tokens.
+
 ### Provider report fields
 
 | Field | Type | Meaning |
