@@ -23,7 +23,7 @@ Next.js manages `next-env.d.ts` and the `.next/` directory locally; both are exc
 
 Application code lives in `src/`: `src/app/` contains Next.js pages and routes, and `src/server/` contains HP-OS server logic. The `@/` import alias points to `src/`. Operational commands and verification scripts live in `scripts/`; database configuration and migrations live in `supabase/`; settled guidance lives in `docs/`. `CONTEXT.md` remains at the root as the domain glossary.
 
-Tool configuration, dependency files, `README.md`, and `AGENTS.md` remain at the root. Generated TypeScript cache data lives in `.next/cache/`. The shared `.vscode/settings.json` hides generated files and local runtime directories in compatible editors; the files remain available on disk. macOS `.DS_Store` metadata is excluded from Git.
+Tool configuration, dependency files, `README.md`, and `AGENTS.md` remain at the root. Generated TypeScript cache data lives in `.next/cache/`. macOS `.DS_Store` metadata is excluded from Git.
 
 ## Find the current guidance
 

@@ -10,3 +10,4 @@ supabase/.temp/
 .local-supabase-home/
 *.tsbuildinfo
 .DS_Store
+.vscode/
