@@ -17,6 +17,8 @@ In a second terminal, `pnpm test` verifies the local PostgreSQL schema, confirms
 
 Event, quote, unpaid Order, payment-attempt state transitions, verified payment reports, Ticket issuance recovery, Reservation-backed sales controls, and Admissions have local PostgreSQL API coverage. LMNL's Draft checkout integration verifies Square through the Site backend, but local checks do not call Square. Physical-device scan behavior, hosted LMNL behavior, live checkout, and actual fee settlement remain unverified. Local PostgreSQL checks do not establish hosted database, provider, device, or production readiness. The 10% Organization pilot-fee value must be configured explicitly; tax and buyer-fee inputs must also be explicit before a quote is available.
 
+Next.js manages `next-env.d.ts` and the `.next/` directory locally; both are excluded from Git so generated development and build changes do not block pulls. `pnpm typecheck` runs `next typegen` before TypeScript checking, which regenerates the required definitions even in a fresh checkout. Keep `next-env.d.ts` in `tsconfig.json` so TypeScript can load those definitions.
+
 ## Find the current guidance
 
 | Need | Source |
