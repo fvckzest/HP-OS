@@ -18,6 +18,7 @@ export const NOTIFICATION_KINDS = [
 export type NotificationKind = typeof NOTIFICATION_KINDS[number];
 export type DispatchOutcome = "completed" | "failed" | "unknown";
 export type DeliveryOutcome = "delivered" | "failed";
+export type FailureClass = "transient" | "permanent";
 
 export interface EventNotificationDetails {
   event_id: string;
@@ -73,6 +74,7 @@ interface NotificationJobRow extends QueryResultRow {
   updated_at: Date;
   requires_verification: boolean;
   provider_message_reference: string | null;
+  failure_class: FailureClass | null;
   payload: NotificationPayload;
   claim_id: string | null;
   lease_expires_at: Date | null;
@@ -303,7 +305,7 @@ export async function handleNotificationPost(request: Request, site: Authenticat
     if (body instanceof Response) return body;
     if (!object(body)) return apiFailure(400, "invalid_request", "The request body must be a JSON object.");
     try {
-      validateFields(body, ["claim_id", "lease_fence", "outcome", "provider_message_reference", "observed_at", "error_code", "actor"], ["claim_id", "lease_fence", "outcome", "provider_message_reference", "observed_at", "error_code", "actor"]);
+      validateFields(body, ["claim_id", "lease_fence", "outcome", "provider_message_reference", "observed_at", "error_code", "failure_class", "actor"], ["claim_id", "lease_fence", "outcome", "provider_message_reference", "observed_at", "error_code", "actor"]);
       const actor = hasActor(body);
       const claimId = requiredUuid(body.claim_id, "claim_id");
       if (!Number.isSafeInteger(body.lease_fence) || Number(body.lease_fence) < 1) reject(422, "validation_failed", "lease_fence must be a positive integer from the current job claim.", [{ field: "lease_fence", code: "out_of_range", message: "Use the lease_fence returned with the claimed job." }]);
@@ -312,6 +314,8 @@ export async function handleNotificationPost(request: Request, site: Authenticat
       if (!validTimestamp(body.observed_at)) reject(422, "validation_failed", "observed_at must be an RFC 3339 timestamp with a UTC offset.", [{ field: "observed_at", code: "invalid_timestamp", message: "Include Z or a numeric UTC offset." }]);
       if (body.error_code !== null && (typeof body.error_code !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(body.error_code))) reject(422, "validation_failed", "error_code must be a short provider or Site error code, or null.", [{ field: "error_code", code: "invalid_error_code", message: "Use an identifier up to 200 characters, or null." }]);
       if (body.outcome === "completed" && body.error_code !== null) reject(422, "validation_failed", "A completed dispatch cannot include an error_code.", [{ field: "error_code", code: "unexpected_value", message: "Send null when dispatch completed." }]);
+      if (body.failure_class !== undefined && body.failure_class !== null && body.failure_class !== "transient" && body.failure_class !== "permanent") reject(422, "validation_failed", "failure_class must be transient, permanent, or null.", [{ field: "failure_class", code: "invalid_enum", message: "Use transient or permanent only for a failed dispatch." }]);
+      if (body.failure_class !== undefined && body.failure_class !== null && body.outcome !== "failed") reject(422, "validation_failed", "failure_class is only valid for a failed dispatch.", [{ field: "failure_class", code: "unexpected_value", message: "Send null or omit the field for completed or unknown outcomes." }]);
       return withApiIdempotency(request, site, body, (client) => reportOutcome(client, site.siteId, jobId, claimId, body as unknown as OutcomeReportInput, actor), mapUnexpectedNotificationError, body);
     } catch (error) { return errorResponse(error); }
   }
@@ -335,7 +339,7 @@ export async function handleNotificationPost(request: Request, site: Authenticat
   return null;
 }
 
-interface OutcomeReportInput { claim_id: string; lease_fence: number; outcome: DispatchOutcome; provider_message_reference: string | null; observed_at: string; error_code: string | null }
+interface OutcomeReportInput { claim_id: string; lease_fence: number; outcome: DispatchOutcome; provider_message_reference: string | null; observed_at: string; error_code: string | null; failure_class?: FailureClass | null }
 interface DeliveryReportInput { outcome: DeliveryOutcome; provider_message_reference: string; provider_event_reference: string; observed_at: string }
 
 async function readJsonBody(request: Request): Promise<unknown | Response> {
@@ -428,15 +432,16 @@ function decodeCursor(value: string, siteId: string, filters: object, limit: num
 
 const JOB_SELECT = `select j.id, j.site_id, j.kind, j.status, j.event_id, j.order_id, j.access_request_id, j.ticket_id,
        j.is_superseded, j.attempt_count, j.available_at, j.created_at, j.updated_at,
-       j.requires_verification, j.provider_message_reference, j.payload, j.claim_id, j.lease_fence,
+       j.requires_verification, j.provider_message_reference, j.failure_class, j.payload, j.claim_id, j.lease_fence,
        c.lease_expires_at,
        (select coalesce(jsonb_agg(jsonb_build_object(
           'claim_id', recent.claim_id, 'lease_fence', recent.lease_fence,
           'attempt_number', recent.attempt_number, 'outcome', recent.outcome,
           'provider_message_reference', recent.provider_message_reference,
-          'observed_at', recent.observed_at, 'error_code', recent.error_code
+          'observed_at', recent.observed_at, 'error_code', recent.error_code,
+          'failure_class', recent.failure_class
         ) order by recent.attempt_number desc, recent.id desc), '[]'::jsonb)
-        from (select a.id, a.claim_id, a.lease_fence, a.attempt_number, a.outcome, a.provider_message_reference, a.observed_at, a.error_code
+        from (select a.id, a.claim_id, a.lease_fence, a.attempt_number, a.outcome, a.provider_message_reference, a.observed_at, a.error_code, a.failure_class
               from hpos.notification_dispatch_attempts a where a.site_id = j.site_id and a.job_id = j.id
               order by a.attempt_number desc, a.id desc limit 50) recent) as dispatch_attempts,
        (select coalesce(jsonb_agg(jsonb_build_object(
@@ -474,6 +479,7 @@ function jobObject(row: NotificationJobRow & QueryResultRow): Record<string, unk
     updated_at: row.updated_at,
     requires_verification: row.requires_verification,
     provider_message_reference: row.provider_message_reference,
+    failure_class: row.failure_class,
     payload: row.payload,
     claim_id: row.claim_id,
     lease_expires_at: row.lease_expires_at,
@@ -542,7 +548,7 @@ async function reportOutcome(client: PoolClient, siteId: string, jobId: string, 
   const jobResult = await client.query<NotificationJobRow & QueryResultRow>(
     `select j.id, j.site_id, j.kind, j.status, j.event_id, j.order_id, j.access_request_id, j.ticket_id,
        j.is_superseded, j.attempt_count, j.available_at, j.created_at, j.updated_at,
-       j.requires_verification, j.provider_message_reference, j.payload, j.claim_id, j.lease_fence,
+       j.requires_verification, j.provider_message_reference, j.failure_class, j.payload, j.claim_id, j.lease_fence,
        c.lease_expires_at
      from hpos.notification_jobs j
      left join hpos.notification_claims c on c.id = j.claim_id and c.site_id = j.site_id
@@ -554,33 +560,38 @@ async function reportOutcome(client: PoolClient, siteId: string, jobId: string, 
   const activeClaim = job.claim_id === claimId
     ? await client.query<{ is_active: boolean }>(`select closed_at is null and lease_expires_at > clock_timestamp() as is_active from hpos.notification_claims where id = $1 and site_id = $2 for update`, [claimId, siteId])
     : null;
-  if (job.status !== "pending" || job.claim_id !== claimId || Number(job.lease_fence) !== input.lease_fence || !activeClaim?.rows[0]?.is_active) reject(409, "claim_conflict", "The notification outcome does not hold the current active lease fence.");
+  if (job.status !== "pending" || job.is_superseded || job.claim_id !== claimId || Number(job.lease_fence) !== input.lease_fence || !activeClaim?.rows[0]?.is_active) reject(409, "claim_conflict", "The notification outcome does not hold the current active lease fence.");
 
   const nextAttempt = job.attempt_count + 1;
   let nextStatus: "pending" | "failed" | "completed" = "pending";
   let retryDelayMinutes: number | null = null;
   let requiresVerification = false;
+  const failureClass = input.outcome === "failed" ? input.failure_class ?? "transient" : null;
   if (input.outcome === "completed") nextStatus = "completed";
   if (input.outcome === "unknown") requiresVerification = true;
   if (input.outcome === "failed") {
-    const retryDelay = RETRY_DELAYS_MINUTES[nextAttempt - 1];
-    if (retryDelay === undefined) nextStatus = "failed";
-    else retryDelayMinutes = retryDelay;
+    if (failureClass === "permanent") nextStatus = "failed";
+    else {
+      const retryDelay = RETRY_DELAYS_MINUTES[nextAttempt - 1];
+      if (retryDelay === undefined) nextStatus = "failed";
+      else retryDelayMinutes = retryDelay;
+    }
   }
   await client.query(
     `insert into hpos.notification_dispatch_attempts
-       (site_id, job_id, claim_id, lease_fence, attempt_number, outcome, provider_message_reference, observed_at, error_code, actor_type, actor_reference)
-     values ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9, $10, $11)`,
-    [siteId, jobId, claimId, input.lease_fence, nextAttempt, input.outcome, input.provider_message_reference, input.observed_at, input.error_code, actor.type, actor.reference],
+       (site_id, job_id, claim_id, lease_fence, attempt_number, outcome, provider_message_reference, observed_at, error_code, failure_class, actor_type, actor_reference)
+     values ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9, $10, $11, $12)`,
+    [siteId, jobId, claimId, input.lease_fence, nextAttempt, input.outcome, input.provider_message_reference, input.observed_at, input.error_code, failureClass, actor.type, actor.reference],
   );
   const updated = await client.query(
     `update hpos.notification_jobs set status = $3, attempt_count = $4,
        available_at = case when $3 = 'pending' and $5::integer is not null then clock_timestamp() + ($5::integer * interval '1 minute') else available_at end,
        requires_verification = $6,
-       provider_message_reference = coalesce($7, provider_message_reference),
+       failure_class = $7,
+       provider_message_reference = coalesce($8, provider_message_reference),
        claim_id = null, updated_at = clock_timestamp()
      where site_id = $1 and id = $2`,
-    [siteId, jobId, nextStatus, nextAttempt, retryDelayMinutes, requiresVerification, input.provider_message_reference],
+    [siteId, jobId, nextStatus, nextAttempt, retryDelayMinutes, requiresVerification, failureClass, input.provider_message_reference],
   );
   await closeEmptyClaim(client, siteId, claimId);
   if (updated.rowCount !== 1) reject(404, "not_found", "The notification job is not available to this Site.");
@@ -668,7 +679,8 @@ export async function runBoundedProcessing(trigger: ProcessingTrigger): Promise<
       `select j.id, j.claim_id
        from hpos.notification_jobs j
        join hpos.notification_claims c on c.id = j.claim_id and c.site_id = j.site_id
-       where j.status = 'pending' and (c.closed_at is not null or c.lease_expires_at <= clock_timestamp())
+       where j.status = 'pending' and j.is_superseded = false
+         and (c.closed_at is not null or c.lease_expires_at <= clock_timestamp())
        order by c.lease_expires_at, j.id
        limit $1
        for update of j skip locked`,
@@ -773,7 +785,8 @@ export async function runBoundedProcessing(trigger: ProcessingTrigger): Promise<
     }
     const more = await client.query(
       `select 1 from hpos.notification_jobs j join hpos.notification_claims c on c.id = j.claim_id and c.site_id = j.site_id
-       where j.status = 'pending' and (c.closed_at is not null or c.lease_expires_at <= clock_timestamp()) limit 1`,
+       where j.status = 'pending' and j.is_superseded = false
+         and (c.closed_at is not null or c.lease_expires_at <= clock_timestamp()) limit 1`,
     );
     const moreReservations = await client.query(
       `select 1

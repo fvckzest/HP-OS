@@ -445,6 +445,7 @@ interface RecoveryJobRow {
   attempt_count: number;
   requires_verification: boolean;
   provider_message_reference: string | null;
+  failure_class: "transient" | "permanent" | null;
   delivery_status: "delivered" | "failed" | null;
   created_at: Date;
 }
@@ -508,6 +509,7 @@ async function readBuyerOrder(site: AuthenticatedSite, token: string): Promise<R
            order by observed_at desc, id desc limit 1
          ) delivery_event on true
          where job.site_id = order_row.site_id and job.order_id = order_row.id and job.kind = 'tickets_ready'
+           and job.is_superseded = false
          order by job.created_at desc, job.id desc limit 1
        ) delivery on true
        where order_row.site_id = $1 and order_row.order_token_hash = $2`,
@@ -709,10 +711,11 @@ async function readAdminOrder(site: AuthenticatedSite, orderId: string, existing
       id: string; kind: string; status: "pending" | "failed" | "completed"; event_id: string | null; order_id: string | null;
       is_superseded: boolean; attempt_count: number; available_at: Date; created_at: Date; updated_at: Date;
       requires_verification: boolean; provider_message_reference: string | null;
+      failure_class: "transient" | "permanent" | null;
       delivery_status: "delivered" | "failed" | null;
     }>(
       `select id, kind, status, event_id, order_id, is_superseded, attempt_count,
-              available_at, created_at, updated_at, requires_verification, provider_message_reference,
+              available_at, created_at, updated_at, requires_verification, provider_message_reference, failure_class,
               (select d.outcome
                from hpos.notification_delivery_events d
                where d.site_id = notification_jobs.site_id and d.job_id = notification_jobs.id
@@ -770,7 +773,7 @@ async function readAdminOrder(site: AuthenticatedSite, orderId: string, existing
       payment_status: row.payment_status,
       issuance_status: row.issuance_status,
       delivery_status: recoveryDeliveryState(jobsResult.rows
-        .filter((job) => job.kind === "tickets_ready")
+        .filter((job) => job.kind === "tickets_ready" && !job.is_superseded)
         .at(-1) ?? null) ?? row.delivery_status,
       refund_status: row.refund_status,
       event,
@@ -815,6 +818,7 @@ async function readAdminOrder(site: AuthenticatedSite, orderId: string, existing
         updated_at: job.updated_at.toISOString(),
         requires_verification: job.requires_verification,
         provider_message_reference: job.provider_message_reference,
+        failure_class: job.failure_class,
         delivery_status: job.delivery_status,
       })),
       issues: issuesResult.rows.map((issue) => ({
@@ -896,18 +900,26 @@ async function retryTicketIssuance(client: PoolClient, site: AuthenticatedSite, 
 }
 
 async function latestTicketEmailJob(client: PoolClient, siteId: string, orderId: string): Promise<RecoveryJobRow | null> {
+  const current = await client.query<{ id: string }>(
+    `select job.id
+     from hpos.notification_jobs job
+     where job.site_id = $1 and job.order_id = $2 and job.kind = 'tickets_ready'
+       and job.is_superseded = false
+     order by job.created_at desc, job.id desc
+     limit 1 for update of job`,
+    [siteId, orderId],
+  );
+  if (!current.rows[0]) return null;
   const result = await client.query<RecoveryJobRow>(
     `select job.id, job.status, job.is_superseded, job.attempt_count,
-            job.requires_verification, job.provider_message_reference, job.created_at,
+            job.requires_verification, job.provider_message_reference, job.failure_class, job.created_at,
             (select delivery.outcome
              from hpos.notification_delivery_events delivery
              where delivery.site_id = job.site_id and delivery.job_id = job.id
              order by delivery.observed_at desc, delivery.id desc limit 1) as delivery_status
      from hpos.notification_jobs job
-     where job.site_id = $1 and job.order_id = $2 and job.kind = 'tickets_ready'
-     order by job.created_at desc, job.id desc
-     limit 1`,
-    [siteId, orderId],
+     where job.site_id = $1 and job.id = $2`,
+    [siteId, current.rows[0].id],
   );
   return result.rows[0] ?? null;
 }
@@ -1007,7 +1019,9 @@ async function correctDeliveryEmail(client: PoolClient, site: AuthenticatedSite,
   if (row.refund_status === "full") throw new ApiOperationError(409, "invalid_state", "A fully refunded Order cannot receive corrected Ticket access.");
   const latest = await latestTicketEmailJob(client, site.siteId, orderId);
   if (latest?.requires_verification) throw new ApiOperationError(409, "delivery_verification_required", "The latest Ticket email outcome is unknown. Verify it before replacing access links and sending to another address.");
-  if (recoveryDeliveryState(latest) === "pending") throw new ApiOperationError(409, "delivery_in_progress", "The latest Ticket email is still in progress. Wait for its outcome before correcting the delivery email.");
+  const latestState = recoveryDeliveryState(latest);
+  if (latestState === "pending") throw new ApiOperationError(409, "delivery_in_progress", "The latest Ticket email is still in progress. Wait for its outcome before correcting the delivery email.");
+  if (latestState === "sent") throw new ApiOperationError(409, "delivery_verification_required", "The latest Ticket email was sent, but its delivery outcome is not known. Verify it before replacing access links and sending to another address.");
   const ticketRows = await client.query<{ id: string }>(
     `select id from hpos.tickets where site_id = $1 and order_id = $2 order by ordinal asc for update`,
     [site.siteId, orderId],
