@@ -1467,6 +1467,32 @@ async function verifyEmailDeliveryRecovery(site) {
     deliveryEmail: "delivery-recovery@example.test",
     normalOrderToken: order.data.data.order_token,
   });
+  const staleRecoveryJobId = randomUUID();
+  const staleRecoveryClaimId = randomUUID();
+  await pool.query(
+    `insert into hpos.notification_jobs (id, site_id, kind, available_at, payload)
+     values ($1, $2, 'order_recovery', clock_timestamp(), $3::jsonb)`,
+    [staleRecoveryJobId, site.siteId, JSON.stringify({
+      recipient_email: "delivery-recovery@example.test",
+      orders: [{ order_id: orderId, order_reference: order.data.data.order_reference, order_token: recovery.recoveryToken, expires_at: new Date(Date.now() + 30 * 60_000).toISOString() }],
+    })],
+  );
+  await pool.query(
+    `insert into hpos.notification_claims (id, site_id, lease_expires_at, created_actor_type, created_actor_reference)
+     values ($1, $2, clock_timestamp() + interval '10 minutes', 'system', 'test:issue-39')`,
+    [staleRecoveryClaimId, site.siteId],
+  );
+  await pool.query(
+    `update hpos.notification_jobs
+     set claim_id = $3, lease_fence = lease_fence + 1, attempt_count = attempt_count + 1
+     where site_id = $1 and id = $2`,
+    [site.siteId, staleRecoveryJobId, staleRecoveryClaimId],
+  );
+  const attendeeName = "Approved attendee " + randomUUID();
+  await pool.query(
+    `update hpos.tickets set attendee_name = $3 where site_id = $1 and id = $2`,
+    [site.siteId, originalTicket.ticket_id, attendeeName],
+  );
   const admission = await api(site, "/v1/admin/events/" + event.event_id + "/admissions", {
     method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "user", reference: "test:issue-37" }, qr_token: originalTicket.qr_payload },
   });
@@ -1651,50 +1677,98 @@ async function verifyEmailDeliveryRecovery(site) {
   assert(resentFailure.status === 200, "The resent Ticket-email delivery failure could not be recorded for correction testing.");
   const resendFailedOrder = await api(site, "/v1/admin/orders/" + orderId);
 
+  const correctedDeliveryEmail = "corrected-" + randomUUID() + "@example.test";
+  const existingCorrectedBuyerId = randomUUID();
+  await pool.query(
+    `insert into hpos.buyers (id, site_id, normalized_email, name)
+     values ($1, $2, $3, $4)`,
+    [existingCorrectedBuyerId, site.siteId, correctedDeliveryEmail.toLowerCase(), "Existing corrected Buyer profile"],
+  );
   const correctionKey = randomUUID();
   const correctionVerificationReference = "test-verification-37-" + randomUUID();
   const correction = await api(site, "/v1/admin/orders/" + orderId + "/actions/correct_delivery_email", {
     method: "POST", idempotencyKey: correctionKey, body: {
       actor: { type: "user", reference: "test:issue-37" }, expected_version: resendFailedOrder.data.data.version,
-      email: "corrected-delivery@example.test", reason: "Buyer verified the corrected address with staff.", verification_reference: correctionVerificationReference,
+      email: correctedDeliveryEmail, reason: "Buyer verified the corrected address with staff.", verification_reference: correctionVerificationReference,
     },
   });
-  assert(correction.status === 202 && correction.data.data.delivery_email === "corrected-delivery@example.test"
+  assert(correction.status === 202 && correction.data.data.delivery_email === correctedDeliveryEmail
     && correction.data.data.checkout_identity.email === "delivery-recovery@example.test"
     && correction.data.data.tickets.length === 1
     && correction.data.data.tickets[0].ticket_id === originalTicket.ticket_id,
   "Verified delivery-email correction did not preserve checkout and Ticket identity.");
-  const revokedRecovery = await api(site, "/v1/public/orders/" + encodeURIComponent(recovery.recoveryToken));
-  assert(revokedRecovery.status === 404, "Delivery-email correction did not revoke temporary recovery access.");
+  const staleClaimedRecovery = await api(site, "/v1/public/orders/" + encodeURIComponent(recovery.recoveryToken));
+  assert(staleClaimedRecovery.status === 404, "Delivery-email correction did not revoke temporary recovery access.");
+  const staleRecoveryOutcome = await api(site, "/v1/admin/notification-jobs/" + staleRecoveryJobId + "/outcome-reports", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "system", reference: "test:issue-39" }, claim_id: staleRecoveryClaimId,
+      lease_fence: 1, outcome: "failed", provider_message_reference: null,
+      observed_at: new Date().toISOString(), error_code: "ORDER_RECOVERY_LINK_UNAVAILABLE", failure_class: "permanent",
+    },
+  });
+  assert(staleClaimedRecovery.status === 404 && staleRecoveryOutcome.status === 200
+    && staleRecoveryOutcome.data.data.status === "failed"
+    && staleRecoveryOutcome.data.data.failure_class === "permanent",
+  "A claimed recovery worker could not verify that the temporary link was revoked before it sent the email.");
   const recoveryJobsAfterCorrection = await api(site, "/v1/admin/notification-jobs?kind=order_recovery");
   const oldAddressRecoveryJobs = recoveryJobsAfterCorrection.data.data.filter((job) => job.kind === "order_recovery"
     && job.payload?.recipient_email?.toLowerCase() === "delivery-recovery@example.test");
-  assert(oldAddressRecoveryJobs.length === 5
-    && oldAddressRecoveryJobs.every((job) => job.is_superseded && job.payload.orders.length === 0),
-  "Delivery-email correction left an unsent temporary Order link in the old-address queue.");
+  const claimedRecoveryRecord = oldAddressRecoveryJobs.find((job) => job.job_id === staleRecoveryJobId);
+  const untouchedRecoveryRecords = oldAddressRecoveryJobs.filter((job) => job.job_id !== staleRecoveryJobId);
+  assert(oldAddressRecoveryJobs.length === 6
+    && untouchedRecoveryRecords.every((job) => job.is_superseded && job.payload.orders.length === 0)
+    && claimedRecoveryRecord?.is_superseded === false && claimedRecoveryRecord.status === "failed",
+  "Correction did not remove unsent old-address links or preserve and settle the claimed worker record.");
   const oldOrder = await api(site, "/v1/public/orders/" + order.data.data.order_token);
   assert(oldOrder.status === 404, "The old Order access token remained valid after delivery-email correction.");
+  const oldEmailLookup = await api(site, "/v1/admin/events/" + event.event_id + "/ticket-lookup", {
+    method: "POST", body: { email: "delivery-recovery@example.test" },
+  });
+  const correctedEmailLookup = await api(site, "/v1/admin/events/" + event.event_id + "/ticket-lookup", {
+    method: "POST", body: { email: correctedDeliveryEmail },
+  });
+  assert(oldEmailLookup.status === 200 && oldEmailLookup.data.data.length === 0
+    && correctedEmailLookup.status === 200 && correctedEmailLookup.data.data.length === 1
+    && correctedEmailLookup.data.data[0].order_reference === order.data.data.order_reference,
+  "Staff lookup did not move from the old delivery address to the corrected Site Buyer.");
+  const correctedBuyer = await pool.query(
+    `select orders.buyer_id, buyers.name, buyers.normalized_email
+     from hpos.orders join hpos.buyers on buyers.id = orders.buyer_id and buyers.site_id = orders.site_id
+     where orders.site_id = $1 and orders.id = $2`,
+    [site.siteId, orderId],
+  );
+  assert(correctedBuyer.rows[0]?.buyer_id === existingCorrectedBuyerId
+    && correctedBuyer.rows[0]?.name === "Existing corrected Buyer profile"
+    && correctedBuyer.rows[0]?.normalized_email === correctedDeliveryEmail.toLowerCase(),
+  "Correction did not associate the Order with the existing corrected Site Buyer without replacing that Buyer's profile name.");
   const correctionJobs = await api(site, "/v1/admin/notification-jobs?order_id=" + orderId + "&kind=tickets_ready");
   const currentJob = correctionJobs.data.data.find((job) => job.kind === "tickets_ready" && !job.is_superseded);
-  assert(currentJob?.payload?.recipient_email === "corrected-delivery@example.test" && correctionJobs.data.data.length === 3,
+  assert(currentJob?.payload?.recipient_email === correctedDeliveryEmail && correctionJobs.data.data.length === 3,
     "Correction did not retain delivery history and queue current-address work.");
   const currentOrderToken = currentJob.payload.order.order_token;
   const currentOrder = await api(site, "/v1/public/orders/" + currentOrderToken);
-  assert(currentOrder.status === 200 && currentOrder.data.data.delivery_email === "corrected-delivery@example.test", "The corrected Order link did not open for the current address.");
-  const ticketRow = await pool.query("select id, ticket_token, qr_payload, version, (select count(*)::integer from hpos.admissions where ticket_id = tickets.id) as admissions from hpos.tickets where site_id = $1 and order_id = $2", [site.siteId, orderId]);
+  assert(currentOrder.status === 200 && currentOrder.data.data.delivery_email === correctedDeliveryEmail, "The corrected Order link did not open for the current address.");
+  const ticketRow = await pool.query("select id, ticket_token, qr_payload, attendee_name, version, (select count(*)::integer from hpos.admissions where ticket_id = tickets.id) as admissions from hpos.tickets where site_id = $1 and order_id = $2", [site.siteId, orderId]);
   assert(ticketRow.rows[0]?.id === originalTicket.ticket_id && ticketRow.rows[0]?.qr_payload === originalTicket.qr_payload
-    && ticketRow.rows[0]?.ticket_token !== originalTicket.ticket_token && ticketRow.rows[0]?.version > 1 && ticketRow.rows[0]?.admissions === 1,
-  "Delivery-email correction changed QR or Ticket identity unexpectedly.");
+    && ticketRow.rows[0]?.attendee_name === attendeeName && ticketRow.rows[0]?.ticket_token !== originalTicket.ticket_token
+    && ticketRow.rows[0]?.version > 1 && ticketRow.rows[0]?.admissions === 1,
+  "Delivery-email correction changed the approved-attendee identity, QR, or Ticket identity unexpectedly.");
   const oldTicket = await api(site, "/v1/public/tickets/" + originalTicket.ticket_token);
   assert(oldTicket.status === 404, "The old Ticket page token remained valid after correction.");
   const newTicket = await api(site, "/v1/public/tickets/" + ticketRow.rows[0].ticket_token);
   assert(newTicket.status === 200 && newTicket.data.data.ticket_id === originalTicket.ticket_id && newTicket.data.data.qr_payload === originalTicket.qr_payload
     && newTicket.data.data.admission_status === "admitted" && newTicket.data.data.can_admit === false,
   "The replacement Ticket page did not preserve the QR payload and Admission history.");
+  const oldQrReplay = await api(site, "/v1/admin/events/" + event.event_id + "/admissions", {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-39" }, qr_token: originalTicket.qr_payload },
+  });
+  assert(oldQrReplay.status === 409 && oldQrReplay.data.error.code === "already_admitted",
+    "The pre-correction QR presentation changed its prior Admission eligibility after correction.");
   const correctionReplay = await api(site, "/v1/admin/orders/" + orderId + "/actions/correct_delivery_email", {
     method: "POST", idempotencyKey: correctionKey, body: {
       actor: { type: "user", reference: "test:issue-37" }, expected_version: resendFailedOrder.data.data.version,
-      email: "corrected-delivery@example.test", reason: "Buyer verified the corrected address with staff.", verification_reference: correctionVerificationReference,
+      email: correctedDeliveryEmail, reason: "Buyer verified the corrected address with staff.", verification_reference: correctionVerificationReference,
     },
   });
   assert(correctionReplay.status === 202 && correctionReplay.data.data.notification_jobs.filter((job) => job.kind === "tickets_ready").length === 3,
