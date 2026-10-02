@@ -1472,6 +1472,30 @@ async function verifyEmailDeliveryRecovery(site) {
   assert(failedDelivery.status === 200, "The Issue #37 delivery failure could not be recorded.");
   const failedOrder = await api(site, "/v1/admin/orders/" + orderId);
   assert(failedOrder.status === 200 && failedOrder.data.data.delivery_status === "failed", "The failed delivery was not visible on the admin Order.");
+  const deliveredEvidence = await api(site, "/v1/admin/notification-jobs/" + initialJob.job_id + "/delivery-reports", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "system", reference: "test:issue-37" }, outcome: "delivered",
+      provider_message_reference: "provider-37-" + initialJob.job_id,
+      provider_event_reference: "provider-event-delivered-37-" + randomUUID(), observed_at: new Date(Date.now() + 500).toISOString(),
+    },
+  });
+  assert(deliveredEvidence.status === 200, "The Issue #37 delivered-state fixture could not be recorded.");
+  const deliveredOrder = await api(site, "/v1/admin/orders/" + orderId);
+  const deliveredCorrection = await api(site, "/v1/admin/orders/" + orderId + "/actions/correct_delivery_email", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "user", reference: "test:issue-37" }, expected_version: deliveredOrder.data.data.version,
+      email: "delivered-correction-37@example.test", reason: "Buyer verified the corrected address with staff.", verification_reference: "test-verification-delivered-37-" + randomUUID(),
+    },
+  });
+  assert(deliveredCorrection.status === 409 && deliveredCorrection.data.error.code === "already_delivered", "Delivery-email correction was allowed after a confirmed delivery.");
+  const restoreFailedBeforeRace = await api(site, "/v1/admin/notification-jobs/" + initialJob.job_id + "/delivery-reports", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "system", reference: "test:issue-37" }, outcome: "failed",
+      provider_message_reference: "provider-37-" + initialJob.job_id,
+      provider_event_reference: "provider-event-restore-37-" + randomUUID(), observed_at: new Date(Date.now() + 750).toISOString(),
+    },
+  });
+  assert(restoreFailedBeforeRace.status === 200, "The delivered-state fixture could not be restored to a confirmed failure.");
   const raceResendKey = randomUUID();
   const [lateDelivery, raceResend] = await Promise.all([
     api(site, "/v1/admin/notification-jobs/" + initialJob.job_id + "/delivery-reports", {
@@ -1546,10 +1570,12 @@ async function verifyEmailDeliveryRecovery(site) {
   assert(resentFailure.status === 200, "The resent Ticket-email delivery failure could not be recorded for correction testing.");
   const resendFailedOrder = await api(site, "/v1/admin/orders/" + orderId);
 
+  const correctionKey = randomUUID();
+  const correctionVerificationReference = "test-verification-37-" + randomUUID();
   const correction = await api(site, "/v1/admin/orders/" + orderId + "/actions/correct_delivery_email", {
-    method: "POST", idempotencyKey: randomUUID(), body: {
+    method: "POST", idempotencyKey: correctionKey, body: {
       actor: { type: "user", reference: "test:issue-37" }, expected_version: resendFailedOrder.data.data.version,
-      email: "corrected-delivery@example.test", reason: "Buyer verified the corrected address with staff.", verification_reference: "test-verification-37-" + randomUUID(),
+      email: "corrected-delivery@example.test", reason: "Buyer verified the corrected address with staff.", verification_reference: correctionVerificationReference,
     },
   });
   assert(correction.status === 202 && correction.data.data.delivery_email === "corrected-delivery@example.test"
@@ -1576,6 +1602,24 @@ async function verifyEmailDeliveryRecovery(site) {
   assert(newTicket.status === 200 && newTicket.data.data.ticket_id === originalTicket.ticket_id && newTicket.data.data.qr_payload === originalTicket.qr_payload
     && newTicket.data.data.admission_status === "admitted" && newTicket.data.data.can_admit === false,
   "The replacement Ticket page did not preserve the QR payload and Admission history.");
+  const correctionReplay = await api(site, "/v1/admin/orders/" + orderId + "/actions/correct_delivery_email", {
+    method: "POST", idempotencyKey: correctionKey, body: {
+      actor: { type: "user", reference: "test:issue-37" }, expected_version: resendFailedOrder.data.data.version,
+      email: "corrected-delivery@example.test", reason: "Buyer verified the corrected address with staff.", verification_reference: correctionVerificationReference,
+    },
+  });
+  assert(correctionReplay.status === 202 && correctionReplay.data.data.notification_jobs.filter((job) => job.kind === "tickets_ready").length === 3,
+    "Delivery-email correction idempotency replay created another Ticket-email job.");
+  const supersededOrder = await api(site, "/v1/admin/orders/" + orderId);
+  await pool.query(`update hpos.notification_jobs set is_superseded = true where site_id = $1 and order_id = $2 and kind = 'tickets_ready'`, [site.siteId, orderId]);
+  const supersededCorrection = await api(site, "/v1/admin/orders/" + orderId + "/actions/correct_delivery_email", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "user", reference: "test:issue-37" }, expected_version: supersededOrder.data.data.version,
+      email: "superseded-correction-37@example.test", reason: "Buyer verified the corrected address with staff.", verification_reference: "test-verification-superseded-37-" + randomUUID(),
+    },
+  });
+  assert(supersededCorrection.status === 409 && supersededCorrection.data.error.code === "invalid_state", "Delivery-email correction was allowed when the latest Ticket-email job was superseded.");
+  await pool.query(`update hpos.notification_jobs set is_superseded = false where site_id = $1 and id = $2`, [site.siteId, currentJob.job_id]);
 
   const currentClaim = await api(site, "/v1/admin/notification-jobs/claims", {
     method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "system", reference: "test:issue-37" }, limit: 100, kinds: ["tickets_ready"] },
@@ -1591,6 +1635,13 @@ async function verifyEmailDeliveryRecovery(site) {
   });
   assert(unknown.status === 200 && unknown.data.data.requires_verification === true, "Unknown Ticket-email dispatch was not fenced for verification.");
   const unresolved = await api(site, "/v1/admin/orders/" + orderId);
+  const unknownCorrection = await api(site, "/v1/admin/orders/" + orderId + "/actions/correct_delivery_email", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "user", reference: "test:issue-37" }, expected_version: unresolved.data.data.version,
+      email: "unknown-correction-37@example.test", reason: "Buyer verified the corrected address with staff.", verification_reference: "test-verification-unknown-37-" + randomUUID(),
+    },
+  });
+  assert(unknownCorrection.status === 409 && unknownCorrection.data.error.code === "delivery_verification_required", "Delivery-email correction was allowed after an unknown dispatch.");
   const blindResend = await api(site, "/v1/admin/orders/" + orderId + "/actions/resend_ticket_email", {
     method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "user", reference: "test:issue-37" }, expected_version: unresolved.data.data.version },
   });

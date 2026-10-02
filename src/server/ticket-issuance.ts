@@ -1018,10 +1018,13 @@ async function correctDeliveryEmail(client: PoolClient, site: AuthenticatedSite,
   if (row.payment_status !== "paid" || row.issuance_status !== "issued") throw new ApiOperationError(409, "invalid_state", "Delivery email correction requires a paid Order with issued Tickets.");
   if (row.refund_status === "full") throw new ApiOperationError(409, "invalid_state", "A fully refunded Order cannot receive corrected Ticket access.");
   const latest = await latestTicketEmailJob(client, site.siteId, orderId);
+  if (!latest) throw new ApiOperationError(409, "invalid_state", "The Order has no current Ticket email failure that can be safely corrected.");
   if (latest?.requires_verification) throw new ApiOperationError(409, "delivery_verification_required", "The latest Ticket email outcome is unknown. Verify it before replacing access links and sending to another address.");
   const latestState = recoveryDeliveryState(latest);
   if (latestState === "pending") throw new ApiOperationError(409, "delivery_in_progress", "The latest Ticket email is still in progress. Wait for its outcome before correcting the delivery email.");
   if (latestState === "sent") throw new ApiOperationError(409, "delivery_verification_required", "The latest Ticket email was sent, but its delivery outcome is not known. Verify it before replacing access links and sending to another address.");
+  if (latestState === "delivered") throw new ApiOperationError(409, "already_delivered", "The latest Ticket email has confirmed delivery; correction requires a confirmed delivery failure.");
+  if (latestState !== "failed") throw new ApiOperationError(409, "invalid_state", "The latest Ticket email is not in a safely correctable failure state.");
   const ticketRows = await client.query<{ id: string }>(
     `select id from hpos.tickets where site_id = $1 and order_id = $2 order by ordinal asc for update`,
     [site.siteId, orderId],

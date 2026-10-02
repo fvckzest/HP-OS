@@ -761,7 +761,7 @@ All members shown are required. `venue.address` may be `null`; `changed_fields` 
 | `expected_version` | integer; guarded input | Version the client loaded; reject stale changes. |
 | `actor` | Actor; admin writes | Site-asserted user/system attribution, not a credential. |
 
-For `tickets_ready` jobs, an Order's current delivery state is derived from the newest applicable job: `pending` while dispatch is pending or requires verification, `sent` after confirmed dispatch without a delivery report, `delivered` after a successful delivery report, and `failed` after a failed dispatch or delivery report. An unknown result never authorizes a blind resend. `recovery_actions` records `reason` and `verification_reference` for delivery-email corrections.
+For `tickets_ready` jobs, an Order's current delivery state is derived from the newest applicable job: `pending` while dispatch is pending or requires verification, `sent` after confirmed dispatch without a delivery report, `delivered` after a successful delivery report, and `failed` after a failed dispatch or delivery report. An unknown result never authorizes a blind resend. Delivery-email correction is accepted only for a confirmed failed latest job; pending, sent without delivery, delivered, unknown, missing, and superseded latest jobs return a stable `409` state fence. `recovery_actions` records `reason` and `verification_reference` for delivery-email corrections.
 
 Audit history retains actor, operation, timestamp, prior/new versions, and non-secret evidence references. Exact audit-history wire fields are not enumerated in the contract; use its detailed rules rather than assuming a schema.
 
