@@ -108,7 +108,7 @@ async function fixture(a) {
   await configuration(a); const e = await event(a), { order } = await reserve(a, e), at = await attempt(a, order), reference = await checkout(a, at), payment = await paid(a, order, at, reference);
   return { e, order, at, reference, ...payment };
 }
-async function deliver(a, f, { unknown = false, overlap = false } = {}) {
+async function deliver(a, f, { unknown = false, overlap = false, failure = false } = {}) {
   const jobs = await a.read('email-list', `/v1/admin/notification-jobs?order_id=${id(f.order.order_id)}&kind=tickets_ready`);
   const job = jobs.data.find(j => j.order_id === f.order.order_id && j.kind === 'tickets_ready');
   a.check('initial email job', jobs.data.length === 1 && Boolean(job), 'Exactly one initial email job for this Order', jobs.data.length);
@@ -156,9 +156,115 @@ async function deliver(a, f, { unknown = false, overlap = false } = {}) {
     const status = await a.read('sent-not-delivered', `/v1/admin/orders/${id(f.order.order_id)}/payment-status`);
     a.check('sent is distinct from delivered', status.data.delivery_status !== 'delivered', 'Dispatch alone does not assert delivery', status.data.delivery_status);
   }
+  if (failure) {
+    const sentOrder = await a.read('sent-order-before-failure', `/v1/admin/orders/${id(f.order.order_id)}`, { fresh: true });
+    await a.write('correction-before-delivery', `/v1/admin/orders/${id(f.order.order_id)}/actions/correct_delivery_email`, {
+      actor: human,
+      expected_version: sentOrder.data.version,
+      email: `sent-${a.run.id.slice(0, 8)}@example.test`,
+      reason: 'Buyer verified the corrected address through the Site staff workflow.',
+      verification_reference: `fake-sent-verification-${a.run.id}`,
+    }, [409], { expectedError: 'delivery_verification_required' });
+    await a.write('email-failed', `/v1/admin/notification-jobs/${id(job.job_id)}/delivery-reports`, { actor: system, outcome: 'failed', provider_message_reference: messageReference, provider_event_reference: `${a.run.profile}-observed-failure-${job.job_id}`, observed_at: observedAt });
+    const failed = await a.read('failed-order', `/v1/admin/orders/${id(f.order.order_id)}`, { fresh: true });
+    a.check('delivery failure retained', failed.data.delivery_status === 'failed', 'A failed delivery remains visible without invalidating the Ticket', failed.data.delivery_status);
+    const resend = await a.write('resend-failed-email', `/v1/admin/orders/${id(f.order.order_id)}/actions/resend_ticket_email`, { actor: human, expected_version: failed.data.version }, [202]);
+    a.check('resend preserves Ticket', resend.data.tickets.length === 1 && resend.data.tickets[0].ticket_id === f.ticket.ticket_id
+      && resend.data.notification_jobs.filter(item => item.kind === 'tickets_ready').length === 2,
+    'A guarded resend queues another email while retaining the original Ticket and failed history', {
+      tickets: resend.data.tickets.length,
+      jobs: resend.data.notification_jobs.filter(item => item.kind === 'tickets_ready').length,
+    });
+    return resend.data;
+  }
   await a.write('email-delivered', `/v1/admin/notification-jobs/${id(job.job_id)}/delivery-reports`, { actor: system, outcome: 'delivered', provider_message_reference: messageReference, provider_event_reference: `${a.run.profile}-observed-delivery-${job.job_id}`, observed_at: observedAt });
   const after = await a.read('delivered-order', `/v1/public/orders/${id(f.order.order_token)}`, { fresh: true });
   a.check('delivery observed', after.data.delivery_status === 'delivered', 'Delivery has separate evidence', after.data.delivery_status);
+}
+
+async function deliveryRecovery(a, f) {
+  await a.write('admit-before-delivery-correction', `/v1/admin/events/${id(f.e.event_id)}/admissions`, { actor: human, qr_token: f.ticket.qr_payload }, [201]);
+  const afterResend = await deliver(a, f, { failure: true });
+  const resendJob = afterResend.notification_jobs.filter(item => item.kind === 'tickets_ready').at(-1);
+  await a.write('correction-while-pending', `/v1/admin/orders/${id(f.order.order_id)}/actions/correct_delivery_email`, {
+    actor: human,
+    expected_version: afterResend.version,
+    email: `pending-${a.run.id.slice(0, 8)}@example.test`,
+    reason: 'Buyer verified the corrected address through the Site staff workflow.',
+    verification_reference: `fake-pending-verification-${a.run.id}`,
+  }, [409], { expectedError: 'delivery_in_progress' });
+  const resendClaim = await a.write('resend-email-claim', '/v1/admin/notification-jobs/claims', { actor: system, limit: 100, kinds: ['tickets_ready'] });
+  const claimedResend = resendClaim.data.jobs.find(item => item.job_id === resendJob?.job_id);
+  if (!claimedResend) throw new Blocked('The resent Ticket-email job is not claimable. Resolve its existing claim before testing address correction.');
+  await a.write('resend-email-completed', `/v1/admin/notification-jobs/${id(resendJob.job_id)}/outcome-reports`, {
+    actor: system, claim_id: resendClaim.data.claim_id, lease_fence: claimedResend.lease_fence,
+    outcome: 'completed', provider_message_reference: `fake-resend-${resendJob.job_id}`, observed_at: iso(a.run.clock + 2000), error_code: null,
+  });
+  await a.write('resend-email-failed', `/v1/admin/notification-jobs/${id(resendJob.job_id)}/delivery-reports`, {
+    actor: system, outcome: 'failed', provider_message_reference: `fake-resend-${resendJob.job_id}`,
+    provider_event_reference: `${a.run.profile}-resend-failure-${resendJob.job_id}`, observed_at: iso(a.run.clock + 3000),
+  });
+  const failedResend = await a.read('failed-resend-order', `/v1/admin/orders/${id(f.order.order_id)}`, { fresh: true });
+  const correctedEmail = `corrected-${a.run.id.slice(0, 8)}@example.test`;
+  const corrected = await a.write('correct-delivery-email', `/v1/admin/orders/${id(f.order.order_id)}/actions/correct_delivery_email`, {
+    actor: human,
+    expected_version: failedResend.data.version,
+    email: correctedEmail,
+    reason: 'Buyer verified the corrected address through the Site staff workflow.',
+    verification_reference: `fake-verification-${a.run.id}`,
+  }, [202]);
+  a.check('correction preserves identities', corrected.data.delivery_email === correctedEmail
+    && corrected.data.checkout_identity.email === f.order.delivery_email
+    && corrected.data.tickets.length === 1
+    && corrected.data.tickets[0].ticket_id === f.ticket.ticket_id,
+  'Verified correction changes current delivery while preserving checkout identity and Ticket identity', {
+    deliveryEmail: corrected.data.delivery_email,
+    ticketId: corrected.data.tickets[0]?.ticket_id,
+  });
+  const jobs = await a.read('corrected-email-jobs', `/v1/admin/notification-jobs?order_id=${id(f.order.order_id)}&kind=tickets_ready`, { fresh: true });
+  const current = jobs.data.find(item => item.kind === 'tickets_ready' && !item.is_superseded);
+  const correctionReason = 'Buyer verified the corrected address through the Site staff workflow.';
+  const correctionVerification = `fake-verification-${a.run.id}`;
+  a.check('old access replaced', current?.payload?.recipient_email === correctedEmail
+    && jobs.data.length === 3
+    && (await a.read('old-order-token', `/v1/public/orders/${id(f.order.order_token)}`, { expected: [404], expectedError: 'not_found' })).status === 404,
+  'Correction retains history, queues current-address delivery, and invalidates the old Order link', {
+    jobs: jobs.data.length,
+    currentRecipient: current?.payload?.recipient_email,
+  });
+  const claim = await a.write('corrected-email-claim', '/v1/admin/notification-jobs/claims', { actor: system, limit: 100, kinds: ['tickets_ready'] });
+  const claimed = claim.data.jobs.find(item => item.job_id === current?.job_id);
+  if (!claimed) throw new Blocked('The corrected Ticket-email job is not claimable. Resolve its existing claim before testing unknown recovery.');
+  await a.write('corrected-email-unknown', `/v1/admin/notification-jobs/${id(current.job_id)}/outcome-reports`, {
+    actor: system, claim_id: claim.data.claim_id, lease_fence: claimed.lease_fence,
+    outcome: 'unknown', provider_message_reference: null, observed_at: iso(a.run.clock + 4000), error_code: 'provider_unavailable',
+  });
+  const unresolved = await a.read('unknown-after-correction', `/v1/admin/orders/${id(f.order.order_id)}`, { fresh: true });
+  await a.write('blind-resend-blocked', `/v1/admin/orders/${id(f.order.order_id)}/actions/resend_ticket_email`, { actor: human, expected_version: unresolved.data.version }, [409], { expectedError: 'delivery_verification_required' });
+  const unresolvedJob = unresolved.data.notification_jobs.find(item => item.job_id === current.job_id && !item.is_superseded);
+  a.check('unknown blocks resend', unresolvedJob?.requires_verification === true,
+    'An unknown dispatch remains unresolved and blocks a blind resend', unresolvedJob);
+  const correctedOrder = await a.read('corrected-order-page', `/v1/public/orders/${id(current.payload.order.order_token)}`, { fresh: true });
+  const replacementTicket = correctedOrder.data.tickets.find(ticket => ticket.ticket_id === f.ticket.ticket_id);
+  const oldTicket = await a.read('old-ticket-token', `/v1/public/tickets/${id(f.ticket.ticket_token)}`, { expected: [404], expectedError: 'not_found' });
+  const replacementPage = replacementTicket
+    ? await a.read('replacement-ticket-page', `/v1/public/tickets/${id(replacementTicket.ticket_token)}`, { fresh: true })
+    : { data: {}, status: 0 };
+  a.check('replacement preserves admission history', correctedOrder.status === 200
+    && replacementTicket?.qr_payload === f.ticket.qr_payload
+    && replacementPage.data.ticket_id === f.ticket.ticket_id
+    && replacementPage.data.qr_payload === f.ticket.qr_payload
+    && replacementPage.data.admission_status === 'admitted'
+    && replacementPage.data.can_admit === false
+    && oldTicket.status === 404,
+  'The replacement Order and Ticket pages preserve QR and Admission history while the old Ticket token is invalid', {
+    replacementTicket: replacementTicket?.ticket_id,
+    admission: replacementPage.data.admission_status,
+    oldTicketStatus: oldTicket.status,
+  });
+  a.check('correction audit recorded', unresolved.data.recovery_actions.some(action => action.action === 'correct_delivery_email'
+    && action.reason === correctionReason && action.verification_reference === correctionVerification),
+  'Delivery-email correction records its reason and verification reference', unresolved.data.recovery_actions);
 }
 async function admit(a, f, { concurrency = false } = {}) {
   const p = `/v1/admin/events/${id(f.e.event_id)}`;
@@ -397,6 +503,7 @@ export async function execute(a) {
     });
     return;
   }
+  if (workflow === 'delivery-recovery') { await deliveryRecovery(a, f); return; }
   if (['delivery', 'durable-jobs', 'unknown-email', 'journey'].includes(workflow)) await deliver(a, f, { unknown: workflow === 'unknown-email', overlap: workflow === 'durable-jobs' });
   if (workflow === 'durable-jobs') await a.scheduler('bounded-scheduler');
   if (['admission', 'journey'].includes(workflow)) await admit(a, f, { concurrency: workflow === 'admission' });
