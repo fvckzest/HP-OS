@@ -83,7 +83,21 @@ async function paid(a, order, at, reference) {
   a.check('complete issuance', buyer.data.payment_status === 'paid' && buyer.data.issuance_status === 'issued' && buyer.data.tickets.length === 1, 'Paid Order has exactly one fully issued Ticket', { payment: buyer.data.payment_status, issuance: buyer.data.issuance_status, tickets: buyer.data.tickets.length });
   const ticket = buyer.data.tickets[0];
   a.check('distinct access scopes', ticket.ticket_token !== order.order_token && ticket.ticket_token !== ticket.qr_payload && !ticket.qr_payload.includes('@'), 'Order token, Ticket token and QR are distinct; QR has no email', { distinct: true });
-  await a.read('buyer-ticket', `/v1/public/tickets/${id(ticket.ticket_token)}`);
+  const buyerTicket = await a.read('buyer-ticket', `/v1/public/tickets/${id(ticket.ticket_token)}`);
+  a.check(
+    'buyer Ticket page',
+    buyerTicket.data.ticket_id === ticket.ticket_id
+      && buyerTicket.data.qr_payload === ticket.qr_payload
+      && buyerTicket.data.admission_status === 'unused'
+      && buyerTicket.data.can_admit === true,
+    'Buyer Ticket page exposes this Ticket QR and current unused Admission eligibility',
+    {
+      ticket_id: buyerTicket.data.ticket_id,
+      qr_payload: buyerTicket.data.qr_payload,
+      admission_status: buyerTicket.data.admission_status,
+      can_admit: buyerTicket.data.can_admit,
+    },
+  );
   await a.read('staff-payment-status', `/v1/admin/orders/${id(order.order_id)}/payment-status`);
   await a.write('paid-report-duplicate-source', `/v1/admin/payment-attempts/${id(at.attempt_id)}/payment-reports`, body, [200]);
   const duplicate = await a.read('after-payment-replay', `/v1/public/orders/${id(order.order_token)}`, { fresh: true });
@@ -94,7 +108,7 @@ async function fixture(a) {
   await configuration(a); const e = await event(a), { order } = await reserve(a, e), at = await attempt(a, order), reference = await checkout(a, at), payment = await paid(a, order, at, reference);
   return { e, order, at, reference, ...payment };
 }
-async function deliver(a, f, { unknown = false, overlap = false } = {}) {
+async function deliver(a, f, { unknown = false, overlap = false, failure = false } = {}) {
   const jobs = await a.read('email-list', `/v1/admin/notification-jobs?order_id=${id(f.order.order_id)}&kind=tickets_ready`);
   const job = jobs.data.find(j => j.order_id === f.order.order_id && j.kind === 'tickets_ready');
   a.check('initial email job', jobs.data.length === 1 && Boolean(job), 'Exactly one initial email job for this Order', jobs.data.length);
@@ -142,9 +156,115 @@ async function deliver(a, f, { unknown = false, overlap = false } = {}) {
     const status = await a.read('sent-not-delivered', `/v1/admin/orders/${id(f.order.order_id)}/payment-status`);
     a.check('sent is distinct from delivered', status.data.delivery_status !== 'delivered', 'Dispatch alone does not assert delivery', status.data.delivery_status);
   }
+  if (failure) {
+    const sentOrder = await a.read('sent-order-before-failure', `/v1/admin/orders/${id(f.order.order_id)}`, { fresh: true });
+    await a.write('correction-before-delivery', `/v1/admin/orders/${id(f.order.order_id)}/actions/correct_delivery_email`, {
+      actor: human,
+      expected_version: sentOrder.data.version,
+      email: `sent-${a.run.id.slice(0, 8)}@example.test`,
+      reason: 'Buyer verified the corrected address through the Site staff workflow.',
+      verification_reference: `fake-sent-verification-${a.run.id}`,
+    }, [409], { expectedError: 'delivery_verification_required' });
+    await a.write('email-failed', `/v1/admin/notification-jobs/${id(job.job_id)}/delivery-reports`, { actor: system, outcome: 'failed', provider_message_reference: messageReference, provider_event_reference: `${a.run.profile}-observed-failure-${job.job_id}`, observed_at: observedAt });
+    const failed = await a.read('failed-order', `/v1/admin/orders/${id(f.order.order_id)}`, { fresh: true });
+    a.check('delivery failure retained', failed.data.delivery_status === 'failed', 'A failed delivery remains visible without invalidating the Ticket', failed.data.delivery_status);
+    const resend = await a.write('resend-failed-email', `/v1/admin/orders/${id(f.order.order_id)}/actions/resend_ticket_email`, { actor: human, expected_version: failed.data.version }, [202]);
+    a.check('resend preserves Ticket', resend.data.tickets.length === 1 && resend.data.tickets[0].ticket_id === f.ticket.ticket_id
+      && resend.data.notification_jobs.filter(item => item.kind === 'tickets_ready').length === 2,
+    'A guarded resend queues another email while retaining the original Ticket and failed history', {
+      tickets: resend.data.tickets.length,
+      jobs: resend.data.notification_jobs.filter(item => item.kind === 'tickets_ready').length,
+    });
+    return resend.data;
+  }
   await a.write('email-delivered', `/v1/admin/notification-jobs/${id(job.job_id)}/delivery-reports`, { actor: system, outcome: 'delivered', provider_message_reference: messageReference, provider_event_reference: `${a.run.profile}-observed-delivery-${job.job_id}`, observed_at: observedAt });
   const after = await a.read('delivered-order', `/v1/public/orders/${id(f.order.order_token)}`, { fresh: true });
   a.check('delivery observed', after.data.delivery_status === 'delivered', 'Delivery has separate evidence', after.data.delivery_status);
+}
+
+async function deliveryRecovery(a, f) {
+  await a.write('admit-before-delivery-correction', `/v1/admin/events/${id(f.e.event_id)}/admissions`, { actor: human, qr_token: f.ticket.qr_payload }, [201]);
+  const afterResend = await deliver(a, f, { failure: true });
+  const resendJob = afterResend.notification_jobs.filter(item => item.kind === 'tickets_ready').at(-1);
+  await a.write('correction-while-pending', `/v1/admin/orders/${id(f.order.order_id)}/actions/correct_delivery_email`, {
+    actor: human,
+    expected_version: afterResend.version,
+    email: `pending-${a.run.id.slice(0, 8)}@example.test`,
+    reason: 'Buyer verified the corrected address through the Site staff workflow.',
+    verification_reference: `fake-pending-verification-${a.run.id}`,
+  }, [409], { expectedError: 'delivery_in_progress' });
+  const resendClaim = await a.write('resend-email-claim', '/v1/admin/notification-jobs/claims', { actor: system, limit: 100, kinds: ['tickets_ready'] });
+  const claimedResend = resendClaim.data.jobs.find(item => item.job_id === resendJob?.job_id);
+  if (!claimedResend) throw new Blocked('The resent Ticket-email job is not claimable. Resolve its existing claim before testing address correction.');
+  await a.write('resend-email-completed', `/v1/admin/notification-jobs/${id(resendJob.job_id)}/outcome-reports`, {
+    actor: system, claim_id: resendClaim.data.claim_id, lease_fence: claimedResend.lease_fence,
+    outcome: 'completed', provider_message_reference: `fake-resend-${resendJob.job_id}`, observed_at: iso(a.run.clock + 2000), error_code: null,
+  });
+  await a.write('resend-email-failed', `/v1/admin/notification-jobs/${id(resendJob.job_id)}/delivery-reports`, {
+    actor: system, outcome: 'failed', provider_message_reference: `fake-resend-${resendJob.job_id}`,
+    provider_event_reference: `${a.run.profile}-resend-failure-${resendJob.job_id}`, observed_at: iso(a.run.clock + 3000),
+  });
+  const failedResend = await a.read('failed-resend-order', `/v1/admin/orders/${id(f.order.order_id)}`, { fresh: true });
+  const correctedEmail = `corrected-${a.run.id.slice(0, 8)}@example.test`;
+  const corrected = await a.write('correct-delivery-email', `/v1/admin/orders/${id(f.order.order_id)}/actions/correct_delivery_email`, {
+    actor: human,
+    expected_version: failedResend.data.version,
+    email: correctedEmail,
+    reason: 'Buyer verified the corrected address through the Site staff workflow.',
+    verification_reference: `fake-verification-${a.run.id}`,
+  }, [202]);
+  a.check('correction preserves identities', corrected.data.delivery_email === correctedEmail
+    && corrected.data.checkout_identity.email === f.order.delivery_email
+    && corrected.data.tickets.length === 1
+    && corrected.data.tickets[0].ticket_id === f.ticket.ticket_id,
+  'Verified correction changes current delivery while preserving checkout identity and Ticket identity', {
+    deliveryEmail: corrected.data.delivery_email,
+    ticketId: corrected.data.tickets[0]?.ticket_id,
+  });
+  const jobs = await a.read('corrected-email-jobs', `/v1/admin/notification-jobs?order_id=${id(f.order.order_id)}&kind=tickets_ready`, { fresh: true });
+  const current = jobs.data.find(item => item.kind === 'tickets_ready' && !item.is_superseded);
+  const correctionReason = 'Buyer verified the corrected address through the Site staff workflow.';
+  const correctionVerification = `fake-verification-${a.run.id}`;
+  a.check('old access replaced', current?.payload?.recipient_email === correctedEmail
+    && jobs.data.length === 3
+    && (await a.read('old-order-token', `/v1/public/orders/${id(f.order.order_token)}`, { expected: [404], expectedError: 'not_found' })).status === 404,
+  'Correction retains history, queues current-address delivery, and invalidates the old Order link', {
+    jobs: jobs.data.length,
+    currentRecipient: current?.payload?.recipient_email,
+  });
+  const claim = await a.write('corrected-email-claim', '/v1/admin/notification-jobs/claims', { actor: system, limit: 100, kinds: ['tickets_ready'] });
+  const claimed = claim.data.jobs.find(item => item.job_id === current?.job_id);
+  if (!claimed) throw new Blocked('The corrected Ticket-email job is not claimable. Resolve its existing claim before testing unknown recovery.');
+  await a.write('corrected-email-unknown', `/v1/admin/notification-jobs/${id(current.job_id)}/outcome-reports`, {
+    actor: system, claim_id: claim.data.claim_id, lease_fence: claimed.lease_fence,
+    outcome: 'unknown', provider_message_reference: null, observed_at: iso(a.run.clock + 4000), error_code: 'provider_unavailable',
+  });
+  const unresolved = await a.read('unknown-after-correction', `/v1/admin/orders/${id(f.order.order_id)}`, { fresh: true });
+  await a.write('blind-resend-blocked', `/v1/admin/orders/${id(f.order.order_id)}/actions/resend_ticket_email`, { actor: human, expected_version: unresolved.data.version }, [409], { expectedError: 'delivery_verification_required' });
+  const unresolvedJob = unresolved.data.notification_jobs.find(item => item.job_id === current.job_id && !item.is_superseded);
+  a.check('unknown blocks resend', unresolvedJob?.requires_verification === true,
+    'An unknown dispatch remains unresolved and blocks a blind resend', unresolvedJob);
+  const correctedOrder = await a.read('corrected-order-page', `/v1/public/orders/${id(current.payload.order.order_token)}`, { fresh: true });
+  const replacementTicket = correctedOrder.data.tickets.find(ticket => ticket.ticket_id === f.ticket.ticket_id);
+  const oldTicket = await a.read('old-ticket-token', `/v1/public/tickets/${id(f.ticket.ticket_token)}`, { expected: [404], expectedError: 'not_found' });
+  const replacementPage = replacementTicket
+    ? await a.read('replacement-ticket-page', `/v1/public/tickets/${id(replacementTicket.ticket_token)}`, { fresh: true })
+    : { data: {}, status: 0 };
+  a.check('replacement preserves admission history', correctedOrder.status === 200
+    && replacementTicket?.qr_payload === f.ticket.qr_payload
+    && replacementPage.data.ticket_id === f.ticket.ticket_id
+    && replacementPage.data.qr_payload === f.ticket.qr_payload
+    && replacementPage.data.admission_status === 'admitted'
+    && replacementPage.data.can_admit === false
+    && oldTicket.status === 404,
+  'The replacement Order and Ticket pages preserve QR and Admission history while the old Ticket token is invalid', {
+    replacementTicket: replacementTicket?.ticket_id,
+    admission: replacementPage.data.admission_status,
+    oldTicketStatus: oldTicket.status,
+  });
+  a.check('correction audit recorded', unresolved.data.recovery_actions.some(action => action.action === 'correct_delivery_email'
+    && action.reason === correctionReason && action.verification_reference === correctionVerification),
+  'Delivery-email correction records its reason and verification reference', unresolved.data.recovery_actions);
 }
 async function admit(a, f, { concurrency = false } = {}) {
   const p = `/v1/admin/events/${id(f.e.event_id)}`;
@@ -180,10 +300,38 @@ async function closure(a) {
   const after = await a.read('capacity-after-setup-failure', `/v1/admin/events/${id(e.event_id)}`);
   a.check('Reservation released', after.data.ticket_offering.available_quantity === e.ticket_offering.available_quantity, 'Safe setup failure restores availability', after.data.ticket_offering.available_quantity);
 }
+async function recoveryFrontier(a) {
+  await configuration(a);
+  const e = await event(a, 'recovery-frontier');
+  const { order } = await reserve(a, e, 'recovery-frontier');
+  const at = await attempt(a, order, 'recovery-frontier');
+  const reference = await checkout(a, at);
+  await a.write('unknown-payment', `/v1/admin/payment-attempts/${id(at.attempt_id)}/payment-reports`, {
+    connection_id: at.connection.connection_id,
+    source_reference: `fake-unknown-${a.run.id}`,
+    provider_checkout_reference: reference,
+    provider_payment_reference: null,
+    outcome: 'unknown',
+    observed_at: iso(a.run.clock + 1000),
+    payment_started_at: null,
+    provider_can_take_payment: null,
+  });
+  const frontier = await a.read('verification-frontier', '/v1/admin/payment-attempts?requires_verification=true&limit=100');
+  const discovered = frontier.data.find(row => row.attempt_id === at.attempt_id);
+  a.check('verification frontier', discovered?.requires_verification === true
+    && discovered.provider_checkout_reference === reference
+    && discovered.connection?.connection_id === at.connection.connection_id
+    && Date.parse(discovered.checkout_expires_at) === Date.parse(order.checkout_expires_at),
+  'The Site can discover the unresolved attempt with its frozen connection and deadline', discovered);
+  await a.write('replacement-blocked', `/v1/admin/orders/${id(order.order_id)}/payment-attempts`, { actor: system }, [409], { expectedError: 'payment_attempt_in_progress' });
+  const scheduled = await a.scheduler('verification-frontier-scheduler');
+  a.check('scheduler verification count', Number.isInteger(scheduled.data.verification_required_attempts), 'The bounded scheduler reports payment attempts promoted for verification', scheduled.data.verification_required_attempts);
+}
 export async function execute(a) {
   const workflow = a.run.workflow;
   if (workflow === 'service') { await configuration(a); return; }
   if (workflow === 'checkout' || workflow === 'closure') { await closure(a); return; }
+  if (workflow === 'recovery-frontier') { await recoveryFrontier(a); return; }
   if (workflow === 'configuration') {
     await configuration(a); await a.read('missing-key', '/v1/admin/payment-configuration', { auth: 'none', expected: [401], expectedError: 'unauthorized' });
     const otherConfig = await a.read('other-Site-configuration', '/v1/admin/payment-configuration', { auth: 'other' });
@@ -244,11 +392,118 @@ export async function execute(a) {
       a.check('last-capacity race', race.filter(r => r.status === 201).length === 1 && race.some(r => r.error?.code === 'sold_out'), 'One Order succeeds and one is sold_out', race.map(r => ({ status: r.status, error: r.error?.code })));
     } return;
   }
-  const f = await fixture(a);
   if (workflow === 'conflict') {
-    await a.write('conflicting-payment', `/v1/admin/payment-attempts/${id(f.at.attempt_id)}/payment-reports`, { ...f.body, amount: f.body.amount + 1 }, [409], { expectedError: 'payment_report_conflict' });
-    const after = await a.read('paid-after-conflict', `/v1/public/orders/${id(f.order.order_token)}`); a.check('paid facts retained', after.data.payment_status === 'paid' && after.data.tickets[0].ticket_id === f.ticket.ticket_id, 'Conflict preserves confirmed payment and Ticket', { payment: after.data.payment_status, tickets: after.data.tickets.length });
+    await configuration(a);
+    const e = await event(a, 'conflict-event');
+    const { order } = await reserve(a, e, 'conflict-purchase');
+    const at = await attempt(a, order, 'conflict-attempt');
+    const reference = await checkout(a, at);
+    const conflicting = {
+      connection_id: at.connection.connection_id,
+      source_reference: `fake-conflict-${a.run.id}`,
+      provider_checkout_reference: reference,
+      provider_payment_reference: `fake-payment-${a.run.id}`,
+      outcome: 'paid',
+      observed_at: iso(a.run.clock + 1000),
+      payment_started_at: iso(a.run.clock + 500),
+      provider_can_take_payment: false,
+      amount: at.total.amount + 1,
+      currency: at.total.currency,
+    };
+    await a.write('conflicting-payment', `/v1/admin/payment-attempts/${id(at.attempt_id)}/payment-reports`, conflicting, [409], { expectedError: 'payment_report_conflict' });
+    const blocked = await a.read('conflicted-order', `/v1/public/orders/${id(order.order_token)}`);
+    a.check('conflict blocks fulfillment', blocked.data.payment_status === 'conflicted' && blocked.data.tickets.length === 0,
+      'A conflicting payment remains unresolved without issuing a Ticket', { payment: blocked.data.payment_status, tickets: blocked.data.tickets.length });
+    const frontier = await a.read('conflict-frontier', '/v1/admin/payment-attempts?requires_verification=true&limit=100');
+    a.check('conflict frontier', frontier.data.some(item => item.attempt_id === at.attempt_id && item.requires_verification),
+      'Staff can find the conflicted attempt in the verification frontier', frontier.data.map(item => item.attempt_id));
+    const detail = await a.read('conflict-investigation', `/v1/admin/payment-attempts/${id(at.attempt_id)}`);
+    a.check('conflict investigation', detail.data.issues.some(issue => issue.status === 'open' && issue.code === 'payment_report_conflict')
+      && detail.data.reports.some(report => report.source_reference === conflicting.source_reference && report.conflict_code === 'payment_report_conflict'),
+    'Attempt detail retains the conflicting report and open issue', { issues: detail.data.issues.length, reports: detail.data.reports.length });
+    const resolutionBase = {
+      actor: human,
+      reason: 'Operator verified the provider payment against the recorded checkout.',
+      verification_reference: `ref:fake-payment-verification-${a.run.id}`,
+      report: {
+        connection_id: at.connection.connection_id,
+        source_reference: `fake-resolution-${a.run.id}`,
+        provider_checkout_reference: reference,
+        provider_payment_reference: `fake-resolved-payment-${a.run.id}`,
+        outcome: 'paid',
+        observed_at: iso(a.run.clock + 2000),
+        payment_started_at: iso(a.run.clock + 500),
+        provider_can_take_payment: false,
+        amount: at.total.amount,
+        currency: at.total.currency,
+      },
+    };
+    await a.write('stale-resolution', `/v1/admin/payment-attempts/${id(at.attempt_id)}/actions/resolve`,
+      { ...resolutionBase, expected_version: detail.data.version - 1 }, [409], { expectedError: 'version_conflict' });
+    await a.write('invalid-resolution', `/v1/admin/payment-attempts/${id(at.attempt_id)}/actions/resolve`,
+      { ...resolutionBase, expected_version: detail.data.version, report: { ...resolutionBase.report, source_reference: `fake-invalid-resolution-${a.run.id}`, amount: at.total.amount + 2 } },
+      [409], { expectedError: 'payment_report_conflict' });
+    const afterInvalid = await a.read('after-invalid-resolution', `/v1/admin/payment-attempts/${id(at.attempt_id)}`);
+    const resolved = await a.write('resolve-payment', `/v1/admin/payment-attempts/${id(at.attempt_id)}/actions/resolve`,
+      { ...resolutionBase, expected_version: afterInvalid.data.version }, [200]);
+    a.check('guarded resolution', resolved.data.applied === true && resolved.data.resolved_issue_ids.length >= 1,
+      'A valid verified report resolves the retained conflict', resolved.data.resolved_issue_ids);
+    await a.write('resolve-payment-replay', `/v1/admin/payment-attempts/${id(at.attempt_id)}/actions/resolve`,
+      { ...resolutionBase, expected_version: afterInvalid.data.version }, [200], { key: a.run.journal['resolve-payment'].key });
+    const issued = await a.read('resolved-order', `/v1/public/orders/${id(order.order_token)}`, { fresh: true });
+    a.check('resolved issuance', issued.data.payment_status === 'paid' && issued.data.issuance_status === 'issued' && issued.data.tickets.length === 1,
+      'Guarded resolution permits one complete Ticket issuance', { payment: issued.data.payment_status, issuance: issued.data.issuance_status, tickets: issued.data.tickets.length });
+    const resolvedReportFrontier = await a.read('resolved-report-frontier', '/v1/admin/payment-attempts?requires_report_work=true&limit=100');
+    a.check('resolved conflict is not requeued', !resolvedReportFrontier.data.some(item => item.attempt_id === at.attempt_id),
+      'A valid paid resolution excludes resolved historical conflicts from report work', resolvedReportFrontier.data.map(item => item.attempt_id));
+    const delayed = await a.write('delayed-failed-report', `/v1/admin/payment-attempts/${id(at.attempt_id)}/payment-reports`, {
+      connection_id: at.connection.connection_id,
+      source_reference: `fake-delayed-failed-${a.run.id}`,
+      provider_checkout_reference: reference,
+      provider_payment_reference: null,
+      outcome: 'failed',
+      observed_at: iso(a.run.clock + 1500),
+      payment_started_at: null,
+      provider_can_take_payment: false,
+    }, [201]);
+    a.check('delayed evidence is stale', delayed.data.applied === false, 'Older failed evidence is retained without regressing paid state', delayed.data.applied);
+    const delayedReportFrontier = await a.read('delayed-report-frontier', '/v1/admin/payment-attempts?requires_report_work=true&limit=100');
+    a.check('delayed report is discoverable', delayedReportFrontier.data.some(item => item.attempt_id === at.attempt_id && item.requires_report_work === true),
+      'An unapplied delayed report is visible through the report-work frontier', delayedReportFrontier.data.map(item => item.attempt_id));
+    const final = await a.read('after-delayed-evidence', `/v1/public/orders/${id(order.order_token)}`, { fresh: true });
+    a.check('paid state remains authoritative', final.data.payment_status === 'paid' && final.data.tickets.length === 1,
+      'Delayed evidence does not create a second Ticket or undo payment', { payment: final.data.payment_status, tickets: final.data.tickets.length });
+    return;
   }
+  const f = await fixture(a);
+  if (workflow === 'issuance-recovery') {
+    const staff = await a.read('staff-order-recovery', `/v1/admin/orders/${id(f.order.order_id)}`, { fresh: true });
+    a.check('staff Order recovery view', staff.data.payment_status === 'paid'
+      && staff.data.issuance_status === 'issued'
+      && staff.data.tickets.length === 1
+      && staff.data.notification_jobs.filter(job => job.kind === 'tickets_ready').length === 1,
+    'Staff Order view retains one Ticket and one initial delivery job', {
+      payment: staff.data.payment_status,
+      issuance: staff.data.issuance_status,
+      tickets: staff.data.tickets.length,
+      jobs: staff.data.notification_jobs.length,
+    });
+    const scheduled = await a.scheduler('issuance-recovery-scheduler');
+    a.check('scheduler does not duplicate completed Order', scheduled.data.ticket_issuance?.checked >= 0,
+      'The bounded scheduler can run without visitor traffic and leaves the completed Order unchanged', scheduled.data.ticket_issuance);
+    await a.write('retry-issued-order', `/v1/admin/orders/${id(f.order.order_id)}/actions/retry_ticket_issuance`, {
+      actor: human, expected_version: staff.data.version,
+    }, [409], { expectedError: 'invalid_state' });
+    const after = await a.read('staff-order-after-retry', `/v1/admin/orders/${id(f.order.order_id)}`, { fresh: true });
+    a.check('retry remains idempotent', after.data.tickets.length === 1
+      && after.data.notification_jobs.filter(job => job.kind === 'tickets_ready').length === 1,
+    'A guarded retry cannot duplicate Ticket identities or initial delivery work', {
+      tickets: after.data.tickets.length,
+      jobs: after.data.notification_jobs.length,
+    });
+    return;
+  }
+  if (workflow === 'delivery-recovery') { await deliveryRecovery(a, f); return; }
   if (['delivery', 'durable-jobs', 'unknown-email', 'journey'].includes(workflow)) await deliver(a, f, { unknown: workflow === 'unknown-email', overlap: workflow === 'durable-jobs' });
   if (workflow === 'durable-jobs') await a.scheduler('bounded-scheduler');
   if (['admission', 'journey'].includes(workflow)) await admit(a, f, { concurrency: workflow === 'admission' });

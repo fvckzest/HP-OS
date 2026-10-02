@@ -690,6 +690,19 @@ async function verifyPublicPaymentAttemptLifecycle(site) {
     `update hpos.orders set checkout_expires_at = clock_timestamp() - interval '1 second' where id = $1`,
     [lateOrder.data.data.order_id],
   );
+  const lateDeadlineResult = await pool.query(
+    `select checkout_expires_at from hpos.orders where id = $1`,
+    [lateOrder.data.data.order_id],
+  );
+  const lateDeadline = lateDeadlineResult.rows[0]?.checkout_expires_at?.toISOString();
+  const lateFrontier = await api(site, `/v1/admin/payment-attempts?requires_verification=true&event_id=${lateEvent.event_id}`);
+  assert(lateFrontier.status === 200 && lateFrontier.data.data.some((row) => row.attempt_id === lateAttempt.data.data.attempt_id
+    && row.requires_verification === true && row.connection.connection_id === site.connectionId
+    && row.checkout_expires_at === lateDeadline),
+    "The Site verification frontier did not expose the overdue interrupted attempt with its deadline and frozen connection.");
+  const lateProcessing = await api(site, "/api/cron/process");
+  assert(lateProcessing.status === 200 && lateProcessing.data.data.verification_required_attempts >= 1,
+    "The bounded processor did not promote the overdue interrupted payment attempt for verification.");
   const lateRegistration = await api(site, `/v1/admin/payment-attempts/${lateAttempt.data.data.attempt_id}/checkout-reference`, {
     method: "POST", idempotencyKey: randomUUID(), body: {
       ...referenceBody,
@@ -698,15 +711,16 @@ async function verifyPublicPaymentAttemptLifecycle(site) {
   });
   assert(lateRegistration.status === 409 && lateRegistration.data.error.code === "checkout_expired",
     "HP-OS registered provider checkout after its accepted Order deadline.");
-  const lateClosure = await api(site, `/v1/admin/payment-attempts/${lateAttempt.data.data.attempt_id}/closure-reports`, {
+  const lateClosure = await api(site, `/v1/admin/payment-attempts/${lateAttempt.data.data.attempt_id}/setup-failure`, {
     method: "POST", idempotencyKey: randomUUID(), body: {
-      ...closureBody,
-      source_reference: "ref:verify-square-checkout-closed-29-late",
-      provider_checkout_reference: "square-test-link-29-late",
+      actor,
+      reason: "provider_unavailable",
+      provider_checkout_closed: true,
+      payment_outcome: "not_started",
     },
   });
   assert(lateClosure.status === 200 && lateClosure.data.data.status === "closed",
-    "The Site could not report verified closure for a late provider setup.");
+    "The Site could not report verified setup failure for a late interrupted checkout.");
   const lateCapacity = await pool.query(
     `select offering.reserved_quantity, reservation.status, order_row.checkout_status
      from hpos.ticket_offerings offering
@@ -718,6 +732,44 @@ async function verifyPublicPaymentAttemptLifecycle(site) {
   assert(lateCapacity.rows[0]?.reserved_quantity === "0" && lateCapacity.rows[0]?.status === "released"
     && lateCapacity.rows[0]?.checkout_status === "expired",
     "A late provider checkout kept capacity after the Site verified it was closed.");
+
+  const batchEvent = await createPublishedEvent(site, {
+    title: "Issue 34 Bounded Verification Promotion",
+    startsAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+    endsAt: new Date(Date.now() + 2 * 60 * 60_000).toISOString(),
+    timeZone: "UTC",
+    ticketOffering: { price: { amount: 2500, currency: "USD" }, capacity: 51, tax_amount: 0, buyer_fees: [] },
+  });
+  const batchAttempts = [];
+  for (let index = 0; index < 51; index += 1) {
+    batchAttempts.push(await createPendingPaymentAttempt(site, batchEvent, `verification-batch-${index}`));
+  }
+  await pool.query(
+    `update hpos.orders order_row
+     set checkout_expires_at = clock_timestamp() - interval '1 second'
+     where order_row.id in (
+       select attempt.order_id from hpos.payment_attempts attempt where attempt.id = any($1::uuid[])
+     )`,
+    [batchAttempts.map((attempt) => attempt.attempt_id)],
+  );
+  const firstVerificationBatch = await api(site, "/api/cron/process");
+  assert(firstVerificationBatch.status === 200
+    && firstVerificationBatch.data.data.verification_required_attempts === 50
+    && firstVerificationBatch.data.data.has_more === true,
+    "The bounded scheduler did not promote exactly 50 overdue payment attempts or expose the remaining verification work.");
+  const secondVerificationBatch = await api(site, "/api/cron/process");
+  assert(secondVerificationBatch.status === 200
+    && secondVerificationBatch.data.data.verification_required_attempts === 1
+    && secondVerificationBatch.data.data.has_more === false,
+    "The next bounded scheduler run did not promote the one remaining overdue payment attempt.");
+  const promotedBatch = await pool.query(
+    `select count(*)::integer as count
+     from hpos.payment_attempts
+     where id = any($1::uuid[]) and status = 'requires_verification'`,
+    [batchAttempts.map((attempt) => attempt.attempt_id)],
+  );
+  assert(promotedBatch.rows[0]?.count === 51,
+    "Bounded verification promotion did not leave every overdue attempt in the durable verification frontier.");
 }
 
 async function verifySharedCheckoutReferenceIsolation(site) {
@@ -799,7 +851,7 @@ async function verifyPaymentReportsAndTicketIssuance(site) {
     endsAt: new Date(now + 60 * 60_000).toISOString(),
     checkInOpensAt: new Date(now - 30 * 60_000).toISOString(),
     timeZone: "UTC",
-    ticketOffering: { price: { amount: 2500, currency: "USD" }, capacity: 2, tax_amount: 0, buyer_fees: [] },
+    ticketOffering: { price: { amount: 2500, currency: "USD" }, capacity: 3, tax_amount: 0, buyer_fees: [] },
   });
   const quote = await api(site, `/v1/public/events/${event.event_id}/quotes`, {
     method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
@@ -826,62 +878,180 @@ async function verifyPaymentReportsAndTicketIssuance(site) {
   });
   assert(registered.status === 200, "The Issue #30 fixture could not register the provider checkout: " + JSON.stringify(registered.data));
 
-  const suffix = randomUUID().replaceAll("-", "");
-  const functionName = `hpos.test_issue30_reject_job_${suffix}`;
-  const triggerName = `issue30_reject_job_${suffix}`;
   const orderId = order.data.data.order_id;
-  await pool.query(`create function ${functionName}() returns trigger language plpgsql as $$
-    begin
-      if new.kind = 'tickets_ready' and new.order_id = '${orderId}'::uuid then
-        raise exception 'injected interruption after confirmed payment';
-      end if;
-      return new;
-    end;
-  $$`);
-  await pool.query(`create trigger ${triggerName} before insert on hpos.notification_jobs
-    for each row execute function ${functionName}()`);
-  const paidObservedAt = new Date().toISOString();
-  const paidBody = {
-    connection_id: site.connectionId,
-    source_reference: "square-event-30-" + randomUUID(),
-    provider_checkout_reference: checkoutReference,
-    provider_payment_reference: "square-payment-30-" + randomUUID(),
-    outcome: "paid",
-    observed_at: paidObservedAt,
-    payment_started_at: paidObservedAt,
-    provider_can_take_payment: false,
-    amount: 2500,
-    currency: "USD",
-  };
-  let paid;
-  try {
-    paid = await api(site, `/v1/admin/payment-attempts/${attemptId}/payment-reports`, {
-      method: "POST", idempotencyKey: randomUUID(), body: paidBody,
-    });
-  } finally {
-    await pool.query(`drop trigger ${triggerName} on hpos.notification_jobs`);
-    await pool.query(`drop function ${functionName}()`);
+  async function forcePaidIssuanceFailure(targetOrderId, targetAttemptId, targetCheckoutReference, label) {
+    const functionName = `hpos.test_issue36_reject_job_${randomUUID().replaceAll("-", "")}`;
+    const triggerName = `issue36_reject_job_${randomUUID().replaceAll("-", "")}`;
+    await pool.query(`create function ${functionName}() returns trigger language plpgsql as $$
+      begin
+        if new.kind = 'tickets_ready' and new.order_id = '${targetOrderId}'::uuid then
+          raise exception 'injected interruption after confirmed payment';
+        end if;
+        return new;
+      end;
+    $$`);
+    await pool.query(`create trigger ${triggerName} before insert on hpos.notification_jobs
+      for each row execute function ${functionName}()`);
+    const paidObservedAt = new Date().toISOString();
+    const paidBody = {
+      connection_id: site.connectionId,
+      source_reference: `square-event-${label}-${randomUUID()}`,
+      provider_checkout_reference: targetCheckoutReference,
+      provider_payment_reference: `square-payment-${label}-${randomUUID()}`,
+      outcome: "paid",
+      observed_at: paidObservedAt,
+      payment_started_at: paidObservedAt,
+      provider_can_take_payment: false,
+      amount: 2500,
+      currency: "USD",
+    };
+    let paid;
+    try {
+      paid = await api(site, `/v1/admin/payment-attempts/${targetAttemptId}/payment-reports`, {
+        method: "POST", idempotencyKey: randomUUID(), body: paidBody,
+      });
+    } finally {
+      await pool.query(`drop trigger ${triggerName} on hpos.notification_jobs`);
+      await pool.query(`drop function ${functionName}()`);
+    }
+    assert(paid.status === 201 && paid.data.data.attempt.last_outcome === "paid",
+      "HP-OS did not persist the provider-confirmed payment before attempting issuance.");
+    const interrupted = await pool.query(
+      `select payment_status, issuance_status, version,
+              (select count(*)::integer from hpos.tickets where order_id = orders.id) as tickets
+       from hpos.orders where id = $1`,
+      [targetOrderId],
+    );
+    const row = interrupted.rows[0];
+    assert(row?.payment_status === "paid" && row?.issuance_status === "failed" && row?.tickets === 0,
+      "An interrupted issuance erased payment or left a partial Ticket set.");
+    const admin = await api(site, `/v1/admin/orders/${targetOrderId}`);
+    assert(admin.status === 200 && admin.data.data.payment_status === "paid"
+      && admin.data.data.issuance_status === "failed" && admin.data.data.version === row.version
+      && admin.data.data.tickets.length === 0
+      && admin.data.data.issues.some((issue) => issue.code === "ticket_issuance_failed" && issue.status === "open"),
+      "The failed paid Order did not retain paid/awaiting state and open durable Ticket-issuance evidence.");
+    return { version: row.version, admin, paidBody, paidObservedAt };
   }
-  assert(paid.status === 201 && paid.data.data.attempt.last_outcome === "paid",
-    "HP-OS did not persist the provider-confirmed payment before attempting issuance.");
-  const interrupted = await pool.query(
+
+  const automaticFailure = await forcePaidIssuanceFailure(orderId, attemptId, checkoutReference, "automatic");
+  const paidBody = automaticFailure.paidBody;
+  const paidObservedAt = automaticFailure.paidObservedAt;
+  const interruptedVersion = automaticFailure.version;
+  assert(!JSON.stringify(automaticFailure.admin.data).includes(order.data.data.order_token),
+    "The staff Order recovery view exposed the buyer's raw Order token.");
+
+  const recoveredRuns = await Promise.all([api(site, "/api/cron/process"), api(site, "/api/cron/process")]);
+  assert(recoveredRuns.every((run) => run.status === 200)
+    && recoveredRuns.some((run) => run.data.data.ticket_issuance?.issued >= 1),
+    "Overlapping bounded scheduler runs did not recover the paid Order directly from failed issuance.");
+  const automaticState = await pool.query(
     `select payment_status, issuance_status,
             (select count(*)::integer from hpos.tickets where order_id = orders.id) as tickets
      from hpos.orders where id = $1`,
     [orderId],
   );
-  assert(interrupted.rows[0]?.payment_status === "paid" && interrupted.rows[0]?.issuance_status === "failed"
-    && interrupted.rows[0]?.tickets === 0,
-    "An interrupted issuance erased payment or left a partial Ticket set.");
-
-  const recovered = await api(site, "/api/cron/process");
-  assert(recovered.status === 200 && recovered.data.data.ticket_issuance?.issued >= 1,
-    "The bounded scheduler did not recover the paid Order's failed issuance.");
-  const deliveredJobCount = await pool.query(
+  assert(automaticState.rows[0]?.payment_status === "paid" && automaticState.rows[0]?.issuance_status === "issued"
+    && automaticState.rows[0]?.tickets === 1,
+    "Automatic recovery did not leave the original paid Order issued with exactly one Ticket.");
+  const automaticJobCount = await pool.query(
     `select count(*)::integer as count from hpos.notification_jobs where order_id = $1 and kind = 'tickets_ready'`,
     [orderId],
   );
-  assert(deliveredJobCount.rows[0]?.count === 1, "Issuance recovery did not create exactly one initial Ticket email job.");
+  assert(automaticJobCount.rows[0]?.count === 1, "Automatic recovery created a duplicate initial Ticket email job.");
+  const automaticAdmin = await api(site, `/v1/admin/orders/${orderId}`);
+  assert(automaticAdmin.status === 200 && automaticAdmin.data.data.tickets.length === 1
+    && automaticAdmin.data.data.issues.some((issue) => issue.code === "ticket_issuance_failed" && issue.status === "resolved")
+    && automaticAdmin.data.data.recovery_actions.length === 0,
+    "Automatic recovery did not retain resolved failure evidence without a staff action.");
+  const automaticOrderRead = await api(site, `/v1/public/orders/${order.data.data.order_token}`);
+  assert(automaticOrderRead.status === 200 && automaticOrderRead.data.data.payment_status === "paid"
+    && automaticOrderRead.data.data.issuance_status === "issued" && automaticOrderRead.data.data.tickets.length === 1,
+    "The automatic recovery Order did not expose its eventual Ticket access.");
+
+  const guardedQuote = await api(site, `/v1/public/events/${event.event_id}/quotes`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
+  });
+  assert(guardedQuote.status === 201, "The guarded Issue #36 fixture could not create a quote.");
+  const guardedOrder = await api(site, "/v1/public/orders", {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { quote_id: guardedQuote.data.data.quote_id, buyer: { name: "Guarded Ticket Buyer", email: "guarded-ticket@example.test" } },
+  });
+  assert(guardedOrder.status === 201, "The guarded Issue #36 fixture could not create an Order.");
+  const guardedAttempt = await api(site, `/v1/admin/orders/${guardedOrder.data.data.order_id}/payment-attempts`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "system", reference: "test:issue-36" } },
+  });
+  assert(guardedAttempt.status === 201, "The guarded Issue #36 fixture could not create a payment attempt.");
+  const guardedCheckoutReference = "square-test-link-36-" + randomUUID();
+  const guardedRegistered = await api(site, `/v1/admin/payment-attempts/${guardedAttempt.data.data.attempt_id}/checkout-reference`, {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "system", reference: "test:issue-36" },
+      connection_id: site.connectionId,
+      provider_checkout_reference: guardedCheckoutReference,
+      provider_can_take_payment: true,
+    },
+  });
+  assert(guardedRegistered.status === 200, "The guarded Issue #36 fixture could not register the provider checkout: " + JSON.stringify(guardedRegistered.data));
+  const guardedOrderId = guardedOrder.data.data.order_id;
+  const guardedFailure = await forcePaidIssuanceFailure(
+    guardedOrderId, guardedAttempt.data.data.attempt_id, guardedCheckoutReference, "guarded",
+  );
+  const guardedVersion = guardedFailure.version;
+  await pool.query(`update hpos.orders set refund_status = 'full' where site_id = $1 and id = $2`, [site.siteId, guardedOrderId]);
+  const refundedRetry = await api(site, `/v1/admin/orders/${guardedOrderId}/actions/retry_ticket_issuance`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "user", reference: "test:issue-36" }, expected_version: guardedVersion },
+  });
+  assert(refundedRetry.status === 409 && refundedRetry.data?.error?.code === "invalid_state",
+    "A fully refunded paid Order accepted a Ticket-issuance retry.");
+  await pool.query(`update hpos.orders set refund_status = 'none' where site_id = $1 and id = $2`, [site.siteId, guardedOrderId]);
+
+  await pool.query(`update hpos.events set is_canceled = true where site_id = $1 and id = (select event_id from hpos.orders where id = $2)`, [site.siteId, guardedOrderId]);
+  const canceledRetry = await api(site, `/v1/admin/orders/${guardedOrderId}/actions/retry_ticket_issuance`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "user", reference: "test:issue-36" }, expected_version: guardedVersion },
+  });
+  assert(canceledRetry.status === 409 && canceledRetry.data?.error?.code === "invalid_state",
+    "A canceled Event accepted a Ticket-issuance retry.");
+  await pool.query(`update hpos.events set is_canceled = false where site_id = $1 and id = (select event_id from hpos.orders where id = $2)`, [site.siteId, guardedOrderId]);
+
+  const guardedRetry = await api(site, `/v1/admin/orders/${guardedOrderId}/actions/retry_ticket_issuance`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "user", reference: "test:issue-36" }, expected_version: guardedVersion },
+  });
+  assert(guardedRetry.status === 202 && guardedRetry.data.data.issuance_status === "pending"
+    && guardedRetry.data.data.version === guardedVersion + 1,
+    "The guarded retry did not queue the failed paid Order with a new version.");
+  const staleRetry = await api(site, `/v1/admin/orders/${guardedOrderId}/actions/retry_ticket_issuance`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "user", reference: "test:issue-36" }, expected_version: guardedVersion },
+  });
+  assert(staleRetry.status === 409 && staleRetry.data?.error?.code === "version_conflict",
+    "A stale guarded retry did not return version_conflict.");
+
+  const guardedRuns = await Promise.all([api(site, "/api/cron/process"), api(site, "/api/cron/process")]);
+  assert(guardedRuns.every((run) => run.status === 200)
+    && guardedRuns.some((run) => run.data.data.ticket_issuance?.issued >= 1),
+    "Overlapping bounded scheduler runs did not finish the guarded Ticket-issuance retry.");
+  const guardedState = await pool.query(
+    `select payment_status, issuance_status,
+            (select count(*)::integer from hpos.tickets where order_id = orders.id) as tickets
+     from hpos.orders where id = $1`,
+    [guardedOrderId],
+  );
+  assert(guardedState.rows[0]?.payment_status === "paid" && guardedState.rows[0]?.issuance_status === "issued"
+    && guardedState.rows[0]?.tickets === 1,
+    "Guarded recovery did not leave the paid Order issued with exactly one Ticket.");
+  const guardedJobCount = await pool.query(
+    `select count(*)::integer as count from hpos.notification_jobs where order_id = $1 and kind = 'tickets_ready'`,
+    [guardedOrderId],
+  );
+  assert(guardedJobCount.rows[0]?.count === 1, "Guarded recovery created a duplicate initial Ticket email job.");
+  const guardedAdmin = await api(site, `/v1/admin/orders/${guardedOrderId}`);
+  assert(guardedAdmin.status === 200 && guardedAdmin.data.data.tickets.length === 1
+    && guardedAdmin.data.data.issues.some((issue) => issue.code === "ticket_issuance_failed" && issue.status === "resolved")
+    && guardedAdmin.data.data.recovery_actions.length === 1,
+    "Guarded recovery did not retain resolved failure evidence and one action audit record.");
+  const guardedOrderRead = await api(site, `/v1/public/orders/${guardedOrder.data.data.order_token}`);
+  assert(guardedOrderRead.status === 200 && guardedOrderRead.data.data.payment_status === "paid"
+    && guardedOrderRead.data.data.issuance_status === "issued" && guardedOrderRead.data.data.tickets.length === 1,
+    "The guarded recovery Order did not expose its eventual Ticket access.");
 
   const orderRead = await api(site, `/v1/public/orders/${order.data.data.order_token}`);
   assert(orderRead.status === 200 && orderRead.headers.get("cache-control") === "no-store"
@@ -1075,7 +1245,8 @@ async function verifyPaymentReportsAndTicketIssuance(site) {
     "A provider amount mismatch was not retained as a payment conflict.");
   const retainedConflict = await pool.query(
     `select count(*)::integer as reports,
-            (select count(*)::integer from hpos.payment_report_issues where order_id = $1) as issues
+            (select count(*)::integer from hpos.payment_report_issues
+             where order_id = $1 and code = 'payment_report_conflict') as issues
      from hpos.payment_attempt_reports where attempt_id = $2 and conflict_code = 'payment_report_conflict'`,
     [orderId, attemptId],
   );
@@ -1144,6 +1315,567 @@ async function verifyPaymentReportsAndTicketIssuance(site) {
     && duplicatePaymentState.rows[0]?.issuance_status === "not_started"
     && duplicatePaymentState.rows[0]?.tickets === 0,
     "A duplicate provider payment identity issued another usable Ticket.");
+}
+
+async function verifyEmailDeliveryRecovery(site) {
+  const now = Date.now();
+  const event = await createPublishedEvent(site, {
+    title: "Issue 37 Email Delivery Recovery",
+    startsAt: new Date(now - 60 * 60_000).toISOString(),
+    endsAt: new Date(now + 60 * 60_000).toISOString(),
+    checkInOpensAt: new Date(now - 30 * 60_000).toISOString(),
+    timeZone: "UTC",
+    ticketOffering: { price: { amount: 2700, currency: "USD" }, capacity: 3, tax_amount: 0, buyer_fees: [] },
+  });
+  const quote = await api(site, "/v1/public/events/" + event.event_id + "/quotes", {
+    method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
+  });
+  assert(quote.status === 201, "The Issue #37 fixture could not create a quote.");
+  const order = await api(site, "/v1/public/orders", {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { quote_id: quote.data.data.quote_id, buyer: { name: "Delivery Recovery Buyer", email: "delivery-recovery@example.test" } },
+  });
+  assert(order.status === 201, "The Issue #37 fixture could not create an Order.");
+  const attempt = await api(site, "/v1/admin/orders/" + order.data.data.order_id + "/payment-attempts", {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "system", reference: "test:issue-37" } },
+  });
+  assert(attempt.status === 201, "The Issue #37 fixture could not create a payment attempt.");
+  const checkoutReference = "square-test-link-37-" + randomUUID();
+  const registered = await api(site, "/v1/admin/payment-attempts/" + attempt.data.data.attempt_id + "/checkout-reference", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "system", reference: "test:issue-37" }, connection_id: site.connectionId,
+      provider_checkout_reference: checkoutReference, provider_can_take_payment: true,
+    },
+  });
+  assert(registered.status === 200, "The Issue #37 fixture could not register a checkout reference.");
+  const observedAt = new Date().toISOString();
+  const paid = await api(site, "/v1/admin/payment-attempts/" + attempt.data.data.attempt_id + "/payment-reports", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      connection_id: site.connectionId, source_reference: "square-event-37-" + randomUUID(),
+      provider_checkout_reference: checkoutReference, provider_payment_reference: "square-payment-37-" + randomUUID(),
+      outcome: "paid", observed_at: observedAt, payment_started_at: observedAt,
+      provider_can_take_payment: false, amount: 2700, currency: "USD",
+    },
+  });
+  assert(paid.status === 201, "The Issue #37 fixture could not report a verified payment.");
+  const orderId = order.data.data.order_id;
+  const initialRead = await api(site, "/v1/public/orders/" + order.data.data.order_token);
+  assert(initialRead.status === 200 && initialRead.data.data.tickets.length === 1, "The Issue #37 fixture did not issue one Ticket.");
+  const originalTicket = initialRead.data.data.tickets[0];
+  const admission = await api(site, "/v1/admin/events/" + event.event_id + "/admissions", {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "user", reference: "test:issue-37" }, qr_token: originalTicket.qr_payload },
+  });
+  assert(admission.status === 201, "The Issue #37 fixture could not establish admission history.");
+  const jobs = await api(site, "/v1/admin/notification-jobs?order_id=" + orderId + "&kind=tickets_ready");
+  const initialJob = jobs.data.data.find((job) => job.kind === "tickets_ready");
+  assert(jobs.status === 200 && initialJob, "The Issue #37 fixture did not create its initial Ticket-email job.");
+
+  const claim = await api(site, "/v1/admin/notification-jobs/claims", {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "system", reference: "test:issue-37" }, limit: 100, kinds: ["tickets_ready"] },
+  });
+  const target = claim.data.data.jobs.find((job) => job.job_id === initialJob.job_id);
+  assert(claim.status === 200 && target, "The Issue #37 initial Ticket-email job could not be claimed.");
+  await pool.query(`update hpos.notification_claims set lease_expires_at = clock_timestamp() - interval '1 second' where site_id = $1 and id = $2`, [site.siteId, claim.data.data.claim_id]);
+  const staleOutcome = await api(site, "/v1/admin/notification-jobs/" + target.job_id + "/outcome-reports", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "system", reference: "test:issue-37" }, claim_id: claim.data.data.claim_id,
+      lease_fence: target.lease_fence, outcome: "completed", provider_message_reference: "provider-37-stale-" + target.job_id,
+      observed_at: new Date().toISOString(), error_code: null,
+    },
+  });
+  assert(staleOutcome.status === 409 && staleOutcome.data.error.code === "claim_conflict", "An expired Ticket-email claim accepted a stale dispatch outcome.");
+  const recovered = await api(site, "/api/cron/process");
+  assert(recovered.status === 200 && recovered.data.data.recovered_jobs >= 1, "The bounded scheduler did not recover the expired Ticket-email claim.");
+  const retryClaim = await api(site, "/v1/admin/notification-jobs/claims", {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "system", reference: "test:issue-37" }, limit: 100, kinds: ["tickets_ready"] },
+  });
+  const recoveredTarget = retryClaim.data.data.jobs.find((job) => job.job_id === initialJob.job_id);
+  assert(retryClaim.status === 200 && recoveredTarget, "The recovered Ticket-email job could not be claimed for transient retry proof.");
+  for (const job of retryClaim.data.data.jobs) {
+    if (job.job_id === initialJob.job_id) {
+      const transient = await api(site, "/v1/admin/notification-jobs/" + job.job_id + "/outcome-reports", {
+        method: "POST", idempotencyKey: randomUUID(), body: {
+          actor: { type: "system", reference: "test:issue-37" }, claim_id: retryClaim.data.data.claim_id,
+          lease_fence: job.lease_fence, outcome: "failed", provider_message_reference: null,
+          observed_at: new Date().toISOString(), error_code: "temporary_provider_failure", failure_class: "transient",
+        },
+      });
+      assert(transient.status === 200 && transient.data.data.status === "pending" && transient.data.data.failure_class === "transient", "A transient dispatch failure did not remain pending for automatic retry.");
+      await pool.query(`update hpos.notification_jobs set available_at = clock_timestamp() where site_id = $1 and id = $2`, [site.siteId, job.job_id]);
+    } else {
+      const outcome = await api(site, "/v1/admin/notification-jobs/" + job.job_id + "/outcome-reports", {
+        method: "POST", idempotencyKey: randomUUID(), body: {
+          actor: { type: "system", reference: "test:issue-37" }, claim_id: retryClaim.data.data.claim_id,
+          lease_fence: job.lease_fence, outcome: "completed", provider_message_reference: "provider-37-" + job.job_id,
+          observed_at: new Date().toISOString(), error_code: null,
+        },
+      });
+      assert(outcome.status === 200, "A recovered unrelated Issue #37 dispatch could not be completed.");
+    }
+  }
+  const retryAfterTransient = await api(site, "/v1/admin/notification-jobs/claims", {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "system", reference: "test:issue-37" }, limit: 100, kinds: ["tickets_ready"] },
+  });
+  const retriedTarget = retryAfterTransient.data.data.jobs.find((job) => job.job_id === initialJob.job_id);
+  assert(retryAfterTransient.status === 200 && retriedTarget, "A transient failure was not eligible for its scheduled retry.");
+  for (const job of retryAfterTransient.data.data.jobs) {
+    const outcome = await api(site, "/v1/admin/notification-jobs/" + job.job_id + "/outcome-reports", {
+      method: "POST", idempotencyKey: randomUUID(), body: {
+        actor: { type: "system", reference: "test:issue-37" }, claim_id: retryAfterTransient.data.data.claim_id,
+        lease_fence: job.lease_fence, outcome: "completed", provider_message_reference: "provider-37-" + job.job_id,
+        observed_at: new Date().toISOString(), error_code: null,
+      },
+    });
+    assert(outcome.status === 200 && (job.job_id !== initialJob.job_id || outcome.data.data.status === "completed"), "A scheduled Ticket-email retry could not be completed.");
+  }
+  const permanentJobId = randomUUID();
+  await pool.query(
+    `insert into hpos.notification_jobs (id, site_id, kind, available_at, payload)
+     values ($1, $2, 'order_recovery', clock_timestamp(), $3::jsonb)`,
+    [permanentJobId, site.siteId, JSON.stringify({ recipient_email: "permanent-failure-37@example.test", orders: [{ order_id: orderId, order_reference: order.data.data.order_reference, order_token: order.data.data.order_token, expires_at: new Date(Date.now() + 3600000).toISOString() }] })],
+  );
+  const permanentClaim = await api(site, "/v1/admin/notification-jobs/claims", {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "system", reference: "test:issue-37" }, limit: 100, kinds: ["order_recovery"] },
+  });
+  const permanentTarget = permanentClaim.data.data.jobs.find((job) => job.job_id === permanentJobId);
+  assert(permanentClaim.status === 200 && permanentTarget, "The permanent-failure fixture could not be claimed.");
+  for (const job of permanentClaim.data.data.jobs) {
+    const outcome = await api(site, "/v1/admin/notification-jobs/" + job.job_id + "/outcome-reports", {
+      method: "POST", idempotencyKey: randomUUID(), body: {
+        actor: { type: "system", reference: "test:issue-37" }, claim_id: permanentClaim.data.data.claim_id,
+        lease_fence: job.lease_fence, outcome: "failed", provider_message_reference: null,
+        observed_at: new Date().toISOString(), error_code: "invalid_recipient", failure_class: job.job_id === permanentJobId ? "permanent" : "transient",
+      },
+    });
+    assert(outcome.status === 200, "A classified Issue #37 dispatch failure could not be recorded.");
+  }
+  await pool.query(`update hpos.notification_jobs set available_at = clock_timestamp() where site_id = $1 and id = $2`, [site.siteId, permanentJobId]);
+  const permanentRetryClaim = await api(site, "/v1/admin/notification-jobs/claims", {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "system", reference: "test:issue-37" }, limit: 100, kinds: ["order_recovery"] },
+  });
+  assert(permanentRetryClaim.status === 200 && !permanentRetryClaim.data.data.jobs.some((job) => job.job_id === permanentJobId), "A permanent dispatch failure was scheduled for automatic retry.");
+  const sentOrder = await api(site, "/v1/admin/orders/" + orderId);
+  const sentCorrection = await api(site, "/v1/admin/orders/" + orderId + "/actions/correct_delivery_email", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "user", reference: "test:issue-37" }, expected_version: sentOrder.data.data.version,
+      email: "sent-without-delivery-37@example.test", reason: "Buyer verified the corrected address with staff.", verification_reference: "test-verification-sent-37-" + randomUUID(),
+    },
+  });
+  assert(sentCorrection.status === 409 && sentCorrection.data.error.code === "delivery_verification_required", "Delivery-email correction was allowed after a send without a delivery report.");
+  const failedDelivery = await api(site, "/v1/admin/notification-jobs/" + initialJob.job_id + "/delivery-reports", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "system", reference: "test:issue-37" }, outcome: "failed",
+      provider_message_reference: "provider-37-" + initialJob.job_id,
+      provider_event_reference: "provider-event-failed-37-" + randomUUID(), observed_at: new Date().toISOString(),
+    },
+  });
+  assert(failedDelivery.status === 200, "The Issue #37 delivery failure could not be recorded.");
+  const failedOrder = await api(site, "/v1/admin/orders/" + orderId);
+  assert(failedOrder.status === 200 && failedOrder.data.data.delivery_status === "failed", "The failed delivery was not visible on the admin Order.");
+  const raceResendKey = randomUUID();
+  const [lateDelivery, raceResend] = await Promise.all([
+    api(site, "/v1/admin/notification-jobs/" + initialJob.job_id + "/delivery-reports", {
+      method: "POST", idempotencyKey: randomUUID(), body: {
+        actor: { type: "system", reference: "test:issue-37" }, outcome: "delivered",
+        provider_message_reference: "provider-37-" + initialJob.job_id,
+        provider_event_reference: "provider-event-late-37-" + randomUUID(), observed_at: new Date(Date.now() + 1000).toISOString(),
+      },
+    }),
+    api(site, "/v1/admin/orders/" + orderId + "/actions/resend_ticket_email", {
+      method: "POST", idempotencyKey: raceResendKey,
+      body: { actor: { type: "user", reference: "test:issue-37" }, expected_version: failedOrder.data.data.version },
+    }),
+  ]);
+  assert(lateDelivery.status === 200, "The late Issue #37 delivery report could not be recorded.");
+  let resent = raceResend;
+  let resentKey = raceResendKey;
+  if (raceResend.status !== 202) {
+    assert(raceResend.status === 409 && raceResend.data.error.code === "already_delivered", "The resend race returned an unexpected state.");
+    const afterLateDelivery = await api(site, "/v1/admin/orders/" + orderId);
+    const restoreFailed = await api(site, "/v1/admin/notification-jobs/" + initialJob.job_id + "/delivery-reports", {
+      method: "POST", idempotencyKey: randomUUID(), body: {
+        actor: { type: "system", reference: "test:issue-37" }, outcome: "failed",
+        provider_message_reference: "provider-37-" + initialJob.job_id,
+        provider_event_reference: "provider-event-race-failed-37-" + randomUUID(), observed_at: new Date(Date.now() + 2000).toISOString(),
+      },
+    });
+    assert(restoreFailed.status === 200, "The delivery race could not be restored to a confirmed failure for resend proof.");
+    resentKey = randomUUID();
+    resent = await api(site, "/v1/admin/orders/" + orderId + "/actions/resend_ticket_email", {
+      method: "POST", idempotencyKey: resentKey, body: { actor: { type: "user", reference: "test:issue-37" }, expected_version: afterLateDelivery.data.data.version },
+    });
+  }
+  assert(resent.status === 202 && resent.data.data.tickets.length === 1
+    && resent.data.data.tickets[0].ticket_id === originalTicket.ticket_id
+    && resent.data.data.notification_jobs.filter((job) => job.kind === "tickets_ready").length === 2,
+  "Guarded resend did not preserve the Ticket or the original failed job.");
+  const replayResend = await api(site, "/v1/admin/orders/" + orderId + "/actions/resend_ticket_email", {
+    method: "POST", idempotencyKey: resentKey,
+    body: { actor: { type: "user", reference: "test:issue-37" }, expected_version: failedOrder.data.data.version },
+  });
+  assert(replayResend.status === 202 && replayResend.data.data.notification_jobs.filter((job) => job.kind === "tickets_ready").length === 2, "Resend idempotency replay created another Ticket-email job.");
+
+  const pendingCorrection = await api(site, "/v1/admin/orders/" + orderId + "/actions/correct_delivery_email", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "user", reference: "test:issue-37" }, expected_version: resent.data.data.version,
+      email: "corrected-delivery@example.test", reason: "Buyer verified the corrected address with staff.", verification_reference: "test-verification-pending-37-" + randomUUID(),
+    },
+  });
+  assert(pendingCorrection.status === 409 && pendingCorrection.data.error.code === "delivery_in_progress", "Delivery-email correction was allowed while a resend was still pending.");
+  const resentJob = resent.data.data.notification_jobs.filter((job) => job.kind === "tickets_ready").at(-1);
+  const resendClaim = await api(site, "/v1/admin/notification-jobs/claims", {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "system", reference: "test:issue-37" }, limit: 100, kinds: ["tickets_ready"] },
+  });
+  const resentClaimed = resendClaim.data.data.jobs.find((job) => job.job_id === resentJob?.job_id);
+  assert(resendClaim.status === 200 && resentClaimed, "The resent Ticket-email job could not be claimed for the correction race check.");
+  const resentOutcome = await api(site, "/v1/admin/notification-jobs/" + resentJob.job_id + "/outcome-reports", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "system", reference: "test:issue-37" }, claim_id: resendClaim.data.data.claim_id,
+      lease_fence: resentClaimed.lease_fence, outcome: "completed", provider_message_reference: "provider-37-resend-" + resentJob.job_id,
+      observed_at: new Date().toISOString(), error_code: null,
+    },
+  });
+  assert(resentOutcome.status === 200, "The resent Ticket-email dispatch could not be completed for correction testing.");
+  const resentFailure = await api(site, "/v1/admin/notification-jobs/" + resentJob.job_id + "/delivery-reports", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "system", reference: "test:issue-37" }, outcome: "failed",
+      provider_message_reference: "provider-37-resend-" + resentJob.job_id,
+      provider_event_reference: "provider-event-failed-resend-37-" + randomUUID(), observed_at: new Date().toISOString(),
+    },
+  });
+  assert(resentFailure.status === 200, "The resent Ticket-email delivery failure could not be recorded for correction testing.");
+  const resendFailedOrder = await api(site, "/v1/admin/orders/" + orderId);
+
+  const correctionKey = randomUUID();
+  const correctionVerificationReference = "test-verification-37-" + randomUUID();
+  const correction = await api(site, "/v1/admin/orders/" + orderId + "/actions/correct_delivery_email", {
+    method: "POST", idempotencyKey: correctionKey, body: {
+      actor: { type: "user", reference: "test:issue-37" }, expected_version: resendFailedOrder.data.data.version,
+      email: "corrected-delivery@example.test", reason: "Buyer verified the corrected address with staff.", verification_reference: correctionVerificationReference,
+    },
+  });
+  assert(correction.status === 202 && correction.data.data.delivery_email === "corrected-delivery@example.test"
+    && correction.data.data.checkout_identity.email === "delivery-recovery@example.test"
+    && correction.data.data.tickets.length === 1
+    && correction.data.data.tickets[0].ticket_id === originalTicket.ticket_id,
+  "Verified delivery-email correction did not preserve checkout and Ticket identity.");
+  const oldOrder = await api(site, "/v1/public/orders/" + order.data.data.order_token);
+  assert(oldOrder.status === 404, "The old Order access token remained valid after delivery-email correction.");
+  const correctionJobs = await api(site, "/v1/admin/notification-jobs?order_id=" + orderId + "&kind=tickets_ready");
+  const currentJob = correctionJobs.data.data.find((job) => job.kind === "tickets_ready" && !job.is_superseded);
+  assert(currentJob?.payload?.recipient_email === "corrected-delivery@example.test" && correctionJobs.data.data.length === 3,
+    "Correction did not retain delivery history and queue current-address work.");
+  const currentOrderToken = currentJob.payload.order.order_token;
+  const currentOrder = await api(site, "/v1/public/orders/" + currentOrderToken);
+  assert(currentOrder.status === 200 && currentOrder.data.data.delivery_email === "corrected-delivery@example.test", "The corrected Order link did not open for the current address.");
+  const ticketRow = await pool.query("select id, ticket_token, qr_payload, version, (select count(*)::integer from hpos.admissions where ticket_id = tickets.id) as admissions from hpos.tickets where site_id = $1 and order_id = $2", [site.siteId, orderId]);
+  assert(ticketRow.rows[0]?.id === originalTicket.ticket_id && ticketRow.rows[0]?.qr_payload === originalTicket.qr_payload
+    && ticketRow.rows[0]?.ticket_token !== originalTicket.ticket_token && ticketRow.rows[0]?.version > 1 && ticketRow.rows[0]?.admissions === 1,
+  "Delivery-email correction changed QR or Ticket identity unexpectedly.");
+  const oldTicket = await api(site, "/v1/public/tickets/" + originalTicket.ticket_token);
+  assert(oldTicket.status === 404, "The old Ticket page token remained valid after correction.");
+  const newTicket = await api(site, "/v1/public/tickets/" + ticketRow.rows[0].ticket_token);
+  assert(newTicket.status === 200 && newTicket.data.data.ticket_id === originalTicket.ticket_id && newTicket.data.data.qr_payload === originalTicket.qr_payload
+    && newTicket.data.data.admission_status === "admitted" && newTicket.data.data.can_admit === false,
+  "The replacement Ticket page did not preserve the QR payload and Admission history.");
+  const correctionReplay = await api(site, "/v1/admin/orders/" + orderId + "/actions/correct_delivery_email", {
+    method: "POST", idempotencyKey: correctionKey, body: {
+      actor: { type: "user", reference: "test:issue-37" }, expected_version: resendFailedOrder.data.data.version,
+      email: "corrected-delivery@example.test", reason: "Buyer verified the corrected address with staff.", verification_reference: correctionVerificationReference,
+    },
+  });
+  assert(correctionReplay.status === 202 && correctionReplay.data.data.notification_jobs.filter((job) => job.kind === "tickets_ready").length === 3,
+    "Delivery-email correction idempotency replay created another Ticket-email job.");
+  const supersededOrder = await api(site, "/v1/admin/orders/" + orderId);
+  await pool.query(`update hpos.notification_jobs set is_superseded = true where site_id = $1 and order_id = $2 and kind = 'tickets_ready'`, [site.siteId, orderId]);
+  const supersededCorrection = await api(site, "/v1/admin/orders/" + orderId + "/actions/correct_delivery_email", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "user", reference: "test:issue-37" }, expected_version: supersededOrder.data.data.version,
+      email: "superseded-correction-37@example.test", reason: "Buyer verified the corrected address with staff.", verification_reference: "test-verification-superseded-37-" + randomUUID(),
+    },
+  });
+  assert(supersededCorrection.status === 409 && supersededCorrection.data.error.code === "invalid_state", "Delivery-email correction was allowed when the latest Ticket-email job was superseded.");
+  await pool.query(`update hpos.notification_jobs set is_superseded = false where site_id = $1 and id = $2`, [site.siteId, currentJob.job_id]);
+
+  const currentClaim = await api(site, "/v1/admin/notification-jobs/claims", {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "system", reference: "test:issue-37" }, limit: 100, kinds: ["tickets_ready"] },
+  });
+  const currentClaimed = currentClaim.data.data.jobs.find((job) => job.job_id === currentJob.job_id);
+  assert(currentClaim.status === 200 && currentClaimed, "The corrected Ticket-email job could not be claimed for unknown-outcome verification.");
+  const unknown = await api(site, "/v1/admin/notification-jobs/" + currentJob.job_id + "/outcome-reports", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "system", reference: "test:issue-37" }, claim_id: currentClaim.data.data.claim_id,
+      lease_fence: currentClaimed.lease_fence, outcome: "unknown", provider_message_reference: null,
+      observed_at: new Date().toISOString(), error_code: "provider_unavailable",
+    },
+  });
+  assert(unknown.status === 200 && unknown.data.data.requires_verification === true, "Unknown Ticket-email dispatch was not fenced for verification.");
+  const unresolved = await api(site, "/v1/admin/orders/" + orderId);
+  const unknownCorrection = await api(site, "/v1/admin/orders/" + orderId + "/actions/correct_delivery_email", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "user", reference: "test:issue-37" }, expected_version: unresolved.data.data.version,
+      email: "unknown-correction-37@example.test", reason: "Buyer verified the corrected address with staff.", verification_reference: "test-verification-unknown-37-" + randomUUID(),
+    },
+  });
+  assert(unknownCorrection.status === 409 && unknownCorrection.data.error.code === "delivery_verification_required", "Delivery-email correction was allowed after an unknown dispatch.");
+  const blindResend = await api(site, "/v1/admin/orders/" + orderId + "/actions/resend_ticket_email", {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "user", reference: "test:issue-37" }, expected_version: unresolved.data.data.version },
+  });
+  assert(blindResend.status === 409 && blindResend.data.error.code === "delivery_verification_required", "An unknown Ticket-email dispatch accepted a blind resend.");
+  const finalJobs = await api(site, "/v1/admin/notification-jobs?order_id=" + orderId + "&kind=tickets_ready");
+  const finalCurrentJob = finalJobs.data.data.find((job) => job.job_id === currentJob.job_id && !job.is_superseded);
+  assert(finalJobs.data.data.length === 3 && finalCurrentJob?.requires_verification === true, "The unknown dispatch changed durable job count or verification state.");
+
+  const deliveredEvent = await createPublishedEvent(site, {
+    title: "Issue 37 Delivered Correction Guard",
+    startsAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+    endsAt: new Date(Date.now() + 2 * 60 * 60_000).toISOString(),
+    timeZone: "UTC",
+    ticketOffering: { price: { amount: 2800, currency: "USD" }, capacity: 1, tax_amount: 0, buyer_fees: [] },
+  });
+  const deliveredQuote = await api(site, `/v1/public/events/${deliveredEvent.event_id}/quotes`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
+  });
+  const deliveredOrder = await api(site, "/v1/public/orders", {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { quote_id: deliveredQuote.data.data.quote_id, buyer: { name: "Delivered Correction Buyer", email: "delivered-correction-37@example.test" } },
+  });
+  const deliveredAttempt = await api(site, "/v1/admin/orders/" + deliveredOrder.data.data.order_id + "/payment-attempts", {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "system", reference: "test:issue-37" } },
+  });
+  const deliveredCheckoutReference = "square-test-link-delivered-37-" + randomUUID();
+  const deliveredCheckout = await api(site, "/v1/admin/payment-attempts/" + deliveredAttempt.data.data.attempt_id + "/checkout-reference", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "system", reference: "test:issue-37" }, connection_id: site.connectionId,
+      provider_checkout_reference: deliveredCheckoutReference, provider_can_take_payment: true,
+    },
+  });
+  const deliveredPayment = await api(site, "/v1/admin/payment-attempts/" + deliveredAttempt.data.data.attempt_id + "/payment-reports", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      connection_id: site.connectionId, source_reference: "square-event-delivered-37-" + randomUUID(),
+      provider_checkout_reference: deliveredCheckoutReference, provider_payment_reference: "square-payment-delivered-37-" + randomUUID(),
+      outcome: "paid", observed_at: new Date().toISOString(), payment_started_at: new Date().toISOString(),
+      provider_can_take_payment: false, amount: 2800, currency: "USD",
+    },
+  });
+  assert(deliveredQuote.status === 201 && deliveredOrder.status === 201 && deliveredCheckout.status === 200 && deliveredPayment.status === 201,
+    "The delivered-correction fixture could not create its paid Order.");
+  const deliveredOrderId = deliveredOrder.data.data.order_id;
+  const deliveredRead = await api(site, "/v1/public/orders/" + deliveredOrder.data.data.order_token);
+  const deliveredTicket = deliveredRead.data.data.tickets[0];
+  const deliveredJobs = await api(site, "/v1/admin/notification-jobs?order_id=" + deliveredOrderId + "&kind=tickets_ready");
+  const deliveredJob = deliveredJobs.data.data.find((job) => job.kind === "tickets_ready" && !job.is_superseded);
+  const deliveredClaim = await api(site, "/v1/admin/notification-jobs/claims", {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "system", reference: "test:issue-37" }, limit: 10, kinds: ["tickets_ready"] },
+  });
+  const deliveredClaimed = deliveredClaim.data.data.jobs.find((job) => job.job_id === deliveredJob?.job_id);
+  const deliveredProviderReference = "provider-37-delivered-correction-" + deliveredJob?.job_id;
+  const deliveredOutcome = deliveredJob && deliveredClaimed ? await api(site, "/v1/admin/notification-jobs/" + deliveredJob.job_id + "/outcome-reports", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "system", reference: "test:issue-37" }, claim_id: deliveredClaim.data.data.claim_id,
+      lease_fence: deliveredClaimed.lease_fence, outcome: "completed", provider_message_reference: deliveredProviderReference,
+      observed_at: new Date().toISOString(), error_code: null,
+    },
+  }) : { status: 0 };
+  const deliveredReport = deliveredJob ? await api(site, "/v1/admin/notification-jobs/" + deliveredJob.job_id + "/delivery-reports", {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "system", reference: "test:issue-37" }, outcome: "delivered",
+      provider_message_reference: deliveredProviderReference,
+      provider_event_reference: "provider-event-delivered-correction-37-" + randomUUID(), observed_at: new Date().toISOString(),
+    },
+  }) : { status: 0 };
+  const deliveredAdminOrder = await api(site, "/v1/admin/orders/" + deliveredOrderId);
+  const deliveredCorrectionKey = randomUUID();
+  const deliveredCorrectionEmail = "delivered-corrected-37@example.test";
+  const deliveredCorrectionBody = {
+    actor: { type: "user", reference: "test:issue-37" }, expected_version: deliveredAdminOrder.data.data.version,
+    email: deliveredCorrectionEmail, reason: "Buyer verified the delivered address with staff.", verification_reference: "test-verification-delivered-success-37-" + randomUUID(),
+  };
+  const deliveredCorrection = await api(site, "/v1/admin/orders/" + deliveredOrderId + "/actions/correct_delivery_email", {
+    method: "POST", idempotencyKey: deliveredCorrectionKey, body: deliveredCorrectionBody,
+  });
+  assert(deliveredRead.status === 200 && deliveredTicket && deliveredJobs.status === 200 && deliveredJob && deliveredClaim.status === 200
+    && deliveredClaimed && deliveredOutcome.status === 200 && deliveredReport.status === 200
+    && deliveredAdminOrder.status === 200 && deliveredAdminOrder.data.data.delivery_status === "delivered"
+    && deliveredCorrection.status === 202 && deliveredCorrection.data.data.delivery_email === deliveredCorrectionEmail
+    && deliveredCorrection.data.data.tickets[0].ticket_id === deliveredTicket.ticket_id,
+  "Delivery-email correction did not remain available after a confirmed delivery.");
+  const deliveredCorrectionReplay = await api(site, "/v1/admin/orders/" + deliveredOrderId + "/actions/correct_delivery_email", {
+    method: "POST", idempotencyKey: deliveredCorrectionKey, body: deliveredCorrectionBody,
+  });
+  assert(deliveredCorrectionReplay.status === 202
+    && deliveredCorrectionReplay.data.data.notification_jobs.filter((job) => job.kind === "tickets_ready").length === 2,
+  "Delivered delivery-email correction idempotency replay created duplicate work.");
+}
+
+async function verifyPaymentConflictResolution(site) {
+  const now = Date.now();
+  const event = await createPublishedEvent(site, {
+    title: "Issue 35 Guarded Payment Conflict Resolution",
+    startsAt: new Date(now + 60 * 60_000).toISOString(),
+    endsAt: new Date(now + 2 * 60 * 60_000).toISOString(),
+    timeZone: "UTC",
+    ticketOffering: { price: { amount: 2500, currency: "USD" }, capacity: 1, tax_amount: 0, buyer_fees: [] },
+  });
+  const quote = await api(site, `/v1/public/events/${event.event_id}/quotes`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
+  });
+  assert(quote.status === 201, "The Issue #35 fixture could not create a quote.");
+  const order = await api(site, "/v1/public/orders", {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { quote_id: quote.data.data.quote_id, buyer: { name: "Conflict Buyer", email: "conflict@example.test" } },
+  });
+  assert(order.status === 201, "The Issue #35 fixture could not create an Order.");
+  const attempt = await api(site, `/v1/admin/orders/${order.data.data.order_id}/payment-attempts`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "system", reference: "test:issue-35" } },
+  });
+  assert(attempt.status === 201, "The Issue #35 fixture could not create a payment attempt.");
+  const attemptId = attempt.data.data.attempt_id;
+  const checkoutReference = "square-test-link-35-" + randomUUID();
+  const registered = await api(site, `/v1/admin/payment-attempts/${attemptId}/checkout-reference`, {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "system", reference: "test:issue-35" },
+      connection_id: site.connectionId,
+      provider_checkout_reference: checkoutReference,
+      provider_can_take_payment: true,
+    },
+  });
+  assert(registered.status === 200, "The Issue #35 fixture could not register the provider checkout.");
+
+  const conflictBody = {
+    connection_id: site.connectionId,
+    source_reference: "square-conflict-35-" + randomUUID(),
+    provider_checkout_reference: checkoutReference,
+    provider_payment_reference: "square-payment-conflict-35-" + randomUUID(),
+    outcome: "paid",
+    observed_at: new Date(now + 1_000).toISOString(),
+    payment_started_at: new Date(now + 500).toISOString(),
+    provider_can_take_payment: false,
+    amount: 2600,
+    currency: "USD",
+  };
+  const conflict = await api(site, `/v1/admin/payment-attempts/${attemptId}/payment-reports`, {
+    method: "POST", idempotencyKey: randomUUID(), body: conflictBody,
+  });
+  assert(conflict.status === 409 && conflict.data.error.code === "payment_report_conflict",
+    "A pre-issuance amount mismatch did not create a payment conflict.");
+  const blocked = await api(site, `/v1/public/orders/${order.data.data.order_token}`);
+  assert(blocked.status === 200 && blocked.data.data.payment_status === "conflicted"
+    && blocked.data.data.tickets.length === 0,
+    "A pre-issuance conflict did not block fulfillment.");
+
+  const matchingWhileOpen = await api(site, `/v1/admin/payment-attempts/${attemptId}/payment-reports`, {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      ...conflictBody,
+      source_reference: "square-matching-while-open-35-" + randomUUID(),
+      provider_payment_reference: "square-payment-matching-while-open-35-" + randomUUID(),
+      amount: 2500,
+    },
+  });
+  assert(matchingWhileOpen.status === 409 && matchingWhileOpen.data.error.code === "payment_report_conflict",
+    "A matching report was applied while the payment conflict was still open.");
+  const blockedByOpenConflict = await api(site, `/v1/public/orders/${order.data.data.order_token}`);
+  assert(blockedByOpenConflict.status === 200
+    && blockedByOpenConflict.data.data.payment_status === "conflicted"
+    && blockedByOpenConflict.data.data.issuance_status !== "issued"
+    && blockedByOpenConflict.data.data.tickets.length === 0,
+    "A matching report during an open conflict triggered payment or Ticket issuance.");
+
+  const detail = await api(site, `/v1/admin/payment-attempts/${attemptId}`);
+  assert(detail.status === 200 && detail.data.data.reports.some((report) => report.conflict_code === "payment_report_conflict")
+    && detail.data.data.reports.some((report) => report.source_reference.startsWith("square-matching-while-open-35-") && report.applied === false)
+    && detail.data.data.issues.some((issue) => issue.status === "open" && issue.code === "payment_report_conflict"),
+    "Payment-attempt detail did not retain the conflicting report and open issue.");
+  const resolutionBase = {
+    actor: { type: "user", reference: "test:issue-35-operator" },
+    reason: "Operator verified the provider payment against the recorded checkout.",
+    verification_reference: "ref:issue-35-payment-verification-" + randomUUID(),
+    report: {
+      connection_id: site.connectionId,
+      source_reference: "square-resolution-35-" + randomUUID(),
+      provider_checkout_reference: checkoutReference,
+      provider_payment_reference: "square-payment-resolution-35-" + randomUUID(),
+      outcome: "paid",
+      observed_at: new Date(now + 2_000).toISOString(),
+      payment_started_at: new Date(now + 500).toISOString(),
+      provider_can_take_payment: false,
+      amount: 2500,
+      currency: "USD",
+    },
+  };
+  const stale = await api(site, `/v1/admin/payment-attempts/${attemptId}/actions/resolve`, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { ...resolutionBase, expected_version: detail.data.data.version - 1 },
+  });
+  assert(stale.status === 409 && stale.data.error.code === "version_conflict",
+    "A stale guarded resolution was accepted.");
+  const invalid = await api(site, `/v1/admin/payment-attempts/${attemptId}/actions/resolve`, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: {
+      ...resolutionBase,
+      expected_version: detail.data.data.version,
+      report: { ...resolutionBase.report, source_reference: "square-invalid-resolution-35-" + randomUUID(), amount: 2601 },
+    },
+  });
+  assert(invalid.status === 409 && invalid.data.error.code === "payment_report_conflict",
+    "An invalid guarded resolution bypassed the frozen amount check.");
+  const afterInvalid = await api(site, `/v1/admin/payment-attempts/${attemptId}`);
+  assert(afterInvalid.status === 200 && afterInvalid.data.data.version > detail.data.data.version,
+    "A rejected resolution did not retain its conflicting observation for investigation.");
+
+  const resolutionKey = randomUUID();
+  const resolved = await api(site, `/v1/admin/payment-attempts/${attemptId}/actions/resolve`, {
+    method: "POST", idempotencyKey: resolutionKey,
+    body: { ...resolutionBase, expected_version: afterInvalid.data.data.version },
+  });
+  assert(resolved.status === 200 && resolved.data.data.applied === true
+    && resolved.data.data.resolved_issue_ids.length >= 2,
+    "A valid guarded resolution did not resolve all retained conflict issues.");
+  const replay = await api(site, `/v1/admin/payment-attempts/${attemptId}/actions/resolve`, {
+    method: "POST", idempotencyKey: resolutionKey,
+    body: { ...resolutionBase, expected_version: afterInvalid.data.data.version },
+  });
+  assert(replay.status === 200 && replay.data.data.report_id === resolved.data.data.report_id,
+    "Replaying the guarded resolution did not return its original result.");
+  const audit = await pool.query(
+    `select count(*)::integer as resolutions,
+            count(*) filter (where issue.status = 'resolved')::integer as resolved_issues,
+            count(*) filter (where resolution.actor_reference = 'test:issue-35-operator')::integer as actor_records
+     from hpos.payment_report_issue_resolutions resolution
+     join hpos.payment_report_issues issue on issue.id = resolution.issue_id
+     where resolution.attempt_id = $1`,
+    [attemptId],
+  );
+  assert(audit.rows[0]?.resolutions >= 2 && audit.rows[0]?.resolved_issues >= 2 && audit.rows[0]?.actor_records >= 2,
+    "The guarded resolution audit did not retain issue status and staff evidence.");
+
+  const resolvedReportFrontier = await api(site, "/v1/admin/payment-attempts?requires_report_work=true&limit=100");
+  assert(resolvedReportFrontier.status === 200
+    && !resolvedReportFrontier.data.data.some((item) => item.attempt_id === attemptId),
+    "A valid paid resolution requeued its resolved historical conflict.");
+
+  const delayed = await api(site, `/v1/admin/payment-attempts/${attemptId}/payment-reports`, {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      connection_id: site.connectionId,
+      source_reference: "square-delayed-failed-35-" + randomUUID(),
+      provider_checkout_reference: checkoutReference,
+      provider_payment_reference: null,
+      outcome: "failed",
+      observed_at: new Date(now + 1_500).toISOString(),
+      payment_started_at: null,
+      provider_can_take_payment: false,
+    },
+  });
+  assert(delayed.status === 201 && delayed.data.data.applied === false,
+    "Delayed failed evidence regressed the resolved paid attempt.");
+  const delayedReportFrontier = await api(site, "/v1/admin/payment-attempts?requires_report_work=true&limit=100");
+  assert(delayedReportFrontier.status === 200
+    && delayedReportFrontier.data.data.some((item) => item.attempt_id === attemptId && item.requires_report_work === true),
+    "An unapplied delayed report was not discoverable through the report-work frontier.");
+  const final = await api(site, `/v1/public/orders/${order.data.data.order_token}`);
+  assert(final.status === 200 && final.data.data.payment_status === "paid"
+    && final.data.data.issuance_status === "issued" && final.data.data.tickets.length === 1,
+    "A resolved conflict did not preserve one paid Order and Ticket after delayed evidence.");
 }
 
 async function verifyReservationBackedSalesControls(site) {
@@ -1689,13 +2421,15 @@ async function main() {
     await verifyPublicPaymentAttemptLifecycle(site);
     await verifySharedCheckoutReferenceIsolation(site);
     await verifyPaymentReportsAndTicketIssuance(site);
+    await verifyEmailDeliveryRecovery(site);
+    await verifyPaymentConflictResolution(site);
     await verifyReservationBackedSalesControls(site);
   } finally {
     await cleanup();
     await stopApp(app);
     await pool.end();
   }
-  console.log("Local Event, checkout, and Admission API verification passed: sales controls with actual Reservations, preserved purchase terms, capacity release, Organization pilot fees, explicit pricing, single-Ticket quotes, payment-attempt idempotency, shared-connection checkout-reference isolation under concurrent registration, verified payment reporting, interrupted issuance recovery, duplicate-safe Tickets and email work, separate buyer tokens, manual lookup, Admission rejection precedence, same-key replay, concurrent scans, conflict retention, provider closure safety, Reservation expiry, and concurrent last-capacity protection.");
+  console.log("Local Event, checkout, and Admission API verification passed: sales controls with actual Reservations, preserved purchase terms, capacity release, Organization pilot fees, explicit pricing, single-Ticket quotes, payment-attempt idempotency, shared-connection checkout-reference isolation under concurrent registration, verified payment reporting, interrupted issuance recovery, duplicate-safe Tickets and email work, guarded failed-delivery resend, verified delivery-email correction, strict unknown-outcome fencing, separate buyer tokens, manual lookup, Admission rejection precedence, same-key replay, concurrent scans, conflict retention and guarded resolution, provider closure safety, Reservation expiry, and concurrent last-capacity protection.");
 }
 
 main().catch((error) => {

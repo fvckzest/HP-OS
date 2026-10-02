@@ -25,6 +25,93 @@ test('all current documented routes and tickets have explicit coverage, with rel
   assert.ok(workflows.every(w => w.ticket < 51));
   assert.equal(routes.find(r => r.route.includes('/refund-reports')).implemented, false);
 });
+test('Issue #33 journey runs its connected single-ticket checkpoints in order', async () => {
+  const calls = [], checks = [];
+  const connection = { connection_id: 'dedicated-connection', environment: 'test' };
+  const event = { event_id: 'event-one', version: 2, ticket_offering: { available_quantity: 8 } };
+  const order = {
+    order_id: 'order-one', order_reference: 'ORDER-ONE', order_token: 'order-token',
+    pricing: { total: { amount: 2500, currency: 'USD' } }, payment_status: 'unpaid', tickets: [],
+  };
+  const ticket = { ticket_id: 'ticket-one', ticket_token: 'ticket-token', qr_payload: 'Q'.repeat(32) };
+  const issued = { ...order, payment_status: 'paid', issuance_status: 'issued', delivery_status: 'pending', tickets: [ticket] };
+  const delivered = { ...issued, delivery_status: 'delivered' };
+  const job = { job_id: 'job-one', order_id: order.order_id, kind: 'tickets_ready', status: 'pending', requires_verification: false };
+  const claimed = { ...job, claim_id: 'claim-one', lease_fence: 1, lease_expires_at: new Date(Date.now() + 60_000).toISOString(), is_superseded: false };
+  const saved = {
+    id: '12345678-1234-1234-1234-123456789012', workflow: 'journey', profile: 'simulation', clock: Date.now(),
+    status: 'not run', steps: [], checks: [], journal: {}, privateContext: {},
+  };
+  const adapter = {
+    run: saved,
+    config: { connectionId: connection.connection_id },
+    save: async () => {},
+    check(name, condition, expected, actual) {
+      checks.push({ name, passed: Boolean(condition) });
+      assert.ok(condition, `${name}: ${expected}; actual ${JSON.stringify(actual)}`);
+    },
+    async call(name, path, options = {}) {
+      calls.push({ name, path, options });
+      saved.journal[name] = { key: options.key ?? name };
+      if (options.expectedError) {
+        return { status: options.expected?.[0] ?? 409, error: { code: options.expectedError }, data: null, envelope: { error: { code: options.expectedError } } };
+      }
+      let data;
+      if (name === 'configuration') data = { active_connection: connection };
+      else if (name === 'historical-connection') data = connection;
+      else if (name.endsWith('-draft')) data = { ...event, version: 1 };
+      else if (name.endsWith('-save') || name.endsWith('-publish')) data = event;
+      else if (name.endsWith('-quote')) data = { quote_id: 'quote-one', total: order.pricing.total };
+      else if (name === 'issued-order' || name === 'after-payment-replay') data = issued;
+      else if (name === 'delivered-order') data = delivered;
+      else if (name.endsWith('-order')) data = order;
+      else if (name === 'attempt-create') data = { attempt_id: 'attempt-one', total: order.pricing.total, connection };
+      else if (name === 'checkout-register') data = { provider_checkout_reference: options.body.provider_checkout_reference };
+      else if (name === 'buyer-pending') data = order;
+      else if (name === 'buyer-ticket') data = {
+        ticket_id: ticket.ticket_id,
+        qr_payload: ticket.qr_payload,
+        admission_status: 'unused',
+        can_admit: true,
+      };
+      else if (name === 'staff-payment-status') data = { payment_status: 'paid' };
+      else if (name === 'email-list') data = [job];
+      else if (name === 'email-frontier') data = [];
+      else if (name === 'email-claim') data = { claim_id: claimed.claim_id, jobs: [claimed] };
+      else if (name === 'email-recheck' || name === 'unknown-job') data = claimed;
+      else if (name === 'sent-not-delivered') data = { delivery_status: 'pending' };
+      else if (name === 'lookup-reference' || name === 'lookup-email') data = [];
+      else if (name === 'scan-one' || name === 'scan-replay') data = { admission_id: 'admission-one' };
+      else if (name === 'after-admission') data = { admission_status: 'admitted', can_admit: false };
+      else data = {};
+      const status = options.expected?.[0] ?? 200;
+      return { status, data, envelope: { data } };
+    },
+    read(name, path, options) { return this.call(name, path, options); },
+    write(name, path, body, expected = [200], options = {}) { return this.call(name, path, { method: 'POST', body, expected, ...options }); },
+    scheduler(name) { return this.call(name, '/api/cron/process'); },
+  };
+
+  await execute(adapter);
+
+  assert.deepEqual(calls.map(call => call.name), [
+    'configuration', 'historical-connection', 'event-draft', 'event-save', 'event-publish',
+    'purchase-quote', 'purchase-order', 'attempt-create', 'checkout-register', 'buyer-pending',
+    'paid-report', 'issued-order', 'buyer-ticket', 'staff-payment-status', 'paid-report-duplicate-source',
+    'after-payment-replay', 'email-list', 'email-frontier', 'email-claim', 'email-recheck', 'email-dispatch',
+    'sent-not-delivered', 'email-delivered', 'delivered-order', 'lookup-reference',
+    'lookup-email', 'invalid-qr', 'scan-one', 'scan-replay', 'scan-again', 'manual-again', 'after-admission',
+  ]);
+  const checkout = calls.find(call => call.name === 'checkout-register');
+  assert.deepEqual(checkout.options.body.connection_id, connection.connection_id);
+  assert.equal(checkout.options.body.provider_checkout_reference, 'fake-checkout-' + saved.id);
+  assert.equal(calls.find(call => call.name === 'buyer-pending').path, '/v1/public/orders/order-token');
+  assert.equal(calls.find(call => call.name === 'invalid-qr').options.body.qr_token.length, 32);
+  assert.equal(calls.find(call => call.name === 'email-dispatch').options.body.outcome, 'completed');
+  assert.equal(calls.find(call => call.name === 'email-delivered').options.body.outcome, 'delivered');
+  assert.ok(checks.some(check => check.name === 'buyer Ticket page' && check.passed));
+  assert.equal(checks.filter(check => check.passed).length, checks.length);
+});
 test('local configuration rejects remote, credential-bearing and alternate-target origins', () => {
   for (const origin of ['https://example.com:3000', 'http://example.com:3000', 'http://127.0.0.1:3000/v1', 'http://user:pass@127.0.0.1:3000', 'http://127.0.0.1:443', 'http://host.docker.internal:3000']) assert.throws(() => loadConfig({ HPOS_ORIGIN: origin }));
   assert.equal(loadConfig({ TEST_SITE_CONTAINER: 'true', HPOS_ORIGIN: 'http://host.docker.internal:3000' }).bind, '0.0.0.0');
@@ -183,6 +270,12 @@ test('isolation scenario checks private records and provider references while bo
       else if (name.endsWith('-create')) data = { attempt_id: name, total: order.pricing.total, connection };
       else if (name === 'checkout-register') data = { provider_checkout_reference: options.body.provider_checkout_reference };
       else if (name === 'buyer-pending') data = order;
+      else if (name === 'buyer-ticket') data = {
+        ticket_id: ticket.ticket_id,
+        qr_payload: ticket.qr_payload,
+        admission_status: 'unused',
+        can_admit: true,
+      };
       else data = { event_id: 'event-' + (options.auth ?? 'primary'), version: 1, ticket_offering: { available_quantity: 8 } };
       return { status: options.expected?.[0] ?? 200, data, envelope: { data } };
     },

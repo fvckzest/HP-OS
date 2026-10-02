@@ -138,7 +138,7 @@ Paths are relative to the base URL. `{...}` identifies a path parameter. All end
 | `GET /v1/admin/payment-configuration` | Read the active connection for new Orders. |
 | `GET /v1/admin/payment-connections/{connection_id}` | Read assigned/historical non-secret connection metadata. |
 | `GET /v1/admin/payment-attempts/{attempt_id}` | Read one Site-owned attempt without caching. |
-| `GET /v1/admin/payment-attempts` | List attempts, including those requiring verification. |
+| `GET /v1/admin/payment-attempts` | List attempts, including `requires_verification=true` recovery work and `requires_report_work=true` unapplied-report work. |
 | `POST /v1/admin/orders/{order_id}/payment-attempts` | Record an attempt before calling the provider. |
 | `POST /v1/admin/payment-attempts/{attempt_id}/checkout-reference` | Register provider checkout before the buyer opens it. |
 | `POST /v1/admin/payment-attempts/{attempt_id}/payment-reports` | Report a Site-verified payment outcome. |
@@ -582,7 +582,11 @@ PublicTicket uses its public/common fields above. AdminTicket uses admin/common 
 | `PaymentAttempt.created_at` | timestamp | Creation instant. |
 | `PaymentAttempt.updated_at` | timestamp | Latest update instant. |
 
+Payment-attempt list rows also include `requires_report_work`. The list accepts `requires_verification=true|false`, `requires_report_work=true|false`, and `event_id`, together with the signed `cursor` and `limit`. `requires_report_work=true` selects unapplied reports that are still actionable for the Site, including stale non-paid reports retained after a paid or processing observation. Resolved payment-conflict history is excluded. The filter does not change payment state or authorize fulfillment.
+
 Verification list responses also expose Order deadlines and verification-required state; see [provider verification](api.md#checkout-expiry-and-provider-verification). Provider credentials and checkout URLs stay on the Site backend.
+
+Payment-attempt detail responses also include `reports` and `issues`. Reports retain source identity, provider references, observed outcome, applied/conflict state, and timestamps. Issues retain open/resolved state and message; resolved issues include the guarded actor, reason, non-secret verification reference, and prior/new attempt versions. These records are Site-scoped and never include provider credentials or buyer access tokens.
 
 ### Provider report fields
 
@@ -708,17 +712,19 @@ The contract also requires refund timestamps/history without enumerating every s
 | `updated_at` | timestamp | Latest update instant. |
 | `requires_verification` | boolean | Verify prior external send before retrying. |
 | `provider_message_reference` | string? | Confirmed provider dispatch/message reference. |
+| `failure_class` | enum? | Explicit failed-dispatch classification: `transient` follows the retry schedule; `permanent` stays failed until a guarded action. Omitted failed reports default to `transient`; HP-OS never infers it from `error_code`. |
 | `payload` | object | Kind-specific operational delivery content. |
 | `claim_id` | string?; claim response | Lease identity; null if no jobs. |
 | `lease_expires_at` | timestamp?; claim response | Lease deadline; null if no jobs. |
 | `lease_fence` | integer; claimed job/outcome input | Monotonically increasing per-job fence; required when reporting a dispatch outcome. |
 | `jobs` | NotificationJob[]; claim response | Claimed work; [] if none. |
-| `dispatch_attempts` | object[]; job detail | Latest attempts with claim ID, fence, attempt number, outcome, safe provider reference, observation time, and error code. |
+| `dispatch_attempts` | object[]; job detail | Latest attempts with claim ID, fence, attempt number, outcome, safe provider reference, observation time, error code, and explicit failure class. |
 | `delivery_reports` | object[]; job detail | Latest provider event reference, message reference, outcome, and observation time. |
 | `delivery_status` | enum?; job detail | Newest delivery observation; null before a provider report. |
 | `outcome` | enum; dispatch input | completed, failed, unknown. |
 | `observed_at` | timestamp; report input | Provider observation instant. |
-| `error_code` | string?; dispatch input | Provider failure reason when available. |
+| `error_code` | string?; dispatch input | Provider failure reason when available. It does not determine retryability. |
+| `failure_class` | enum?; dispatch input | Optional on `failed` only: `transient` or `permanent`; omitted means `transient`. |
 | `provider_event_reference` | string; delivery input | Stable delivery-event identity. |
 | `outcome` | enum; delivery input | delivered or failed. |
 
@@ -755,6 +761,8 @@ All members shown are required. `venue.address` may be `null`; `changed_fields` 
 | `expected_version` | integer; guarded input | Version the client loaded; reject stale changes. |
 | `actor` | Actor; admin writes | Site-asserted user/system attribution, not a credential. |
 
+For `tickets_ready` jobs, an Order's current delivery state is derived from the newest applicable job: `pending` while dispatch is pending or requires verification, `sent` after confirmed dispatch without a delivery report, `delivered` after a successful delivery report, and `failed` after a failed dispatch or delivery report. An unknown result never authorizes a blind resend. Delivery-email correction is accepted for a confirmed failed or delivered latest job; pending, sent without delivery, unknown, missing, and superseded latest jobs return a stable `409` state fence. `recovery_actions` records `reason` and `verification_reference` for delivery-email corrections.
+
 Audit history retains actor, operation, timestamp, prior/new versions, and non-secret evidence references. Exact audit-history wire fields are not enumerated in the contract; use its detailed rules rather than assuming a schema.
 
 ## Request and response bodies
@@ -779,7 +787,7 @@ Each row lists operation-specific body fields/result data. Apply common headers 
 | Manual lookup | `Exactly one of order_reference/email; optional limit/cursor` | `Paginated OrderSummary[]; 200` |
 | Admission | `Exactly one of qr_token/ticket_id` | `Admission; 201` |
 | Retry issuance / resend | `expected_version` | `AdminOrder; 202` |
-| Correct delivery email | `email, reason, verification_reference, expected_version` | `AdminOrder; 200` |
+| Correct delivery email | `email, reason, verification_reference, expected_version` | `AdminOrder; 202` |
 | Create payment attempt | `No operation fields` | `PaymentAttempt; 201` |
 | Register checkout | `connection_id, provider_checkout_reference, provider_can_take_payment:true` | `PaymentAttempt; 200` |
 | Payment report | `connection_id, source_reference, provider_checkout_reference, provider_payment_reference, outcome, observed_at, payment_started_at, provider_can_take_payment; amount/currency required for paid` | `{report_id,applied,attempt,order_id}; new 201 / repeat 200` |
@@ -791,7 +799,7 @@ Each row lists operation-specific body fields/result data. Apply common headers 
 | Fee confirmation | `attempt_id, connection_id, scope_type, scope_reference, category, totals, observed_at` | `{order_id,scope_type,scope_reference,category,reporting_status}; 200` |
 | Claim jobs | `Optional limit, kinds` | `{claim_id,lease_expires_at,jobs}; 200` |
 | Renew claim | `No operation fields` | `{claim_id,lease_expires_at}; 200` |
-| Dispatch outcome | `claim_id, outcome, provider_message_reference, observed_at, error_code` | `NotificationJob; 200` |
+| Dispatch outcome | `claim_id, outcome, provider_message_reference, observed_at, error_code, failure_class` | `NotificationJob; 200` |
 | Delivery outcome | `outcome, provider_message_reference, provider_event_reference, observed_at` | `NotificationJob; 200` |
 
 `OrderSummary` contains order_id, order_reference, buyer_name, delivery_email, the four Order status fields, and tickets using AdminTicket. It omits buyer access tokens. Normal GET requests have no JSON body; list filters go in the query string. Manual lookup puts its pagination in its POST body.
