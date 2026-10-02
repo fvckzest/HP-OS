@@ -1039,7 +1039,9 @@ async function correctDeliveryEmail(client: PoolClient, site: AuthenticatedSite,
     `insert into hpos.buyers (site_id, normalized_email, name)
      values ($1, $2, $3)
      on conflict (site_id, normalized_email)
-     do update set name = excluded.name, updated_at = clock_timestamp()
+     -- The existing Site Buyer profile owns its name; correcting one Order's
+     -- delivery address must not rewrite that profile from checkout data.
+     do update set updated_at = clock_timestamp()
      returning id`,
     [site.siteId, corrected.normalizedEmail, row.buyer_name],
   );

@@ -34,9 +34,9 @@ async function event(a, prefix = 'event', { ended = false, capacity = 8, futureC
   if (auth === 'primary') a.run.privateContext.event = published.data;
   await a.save(); return published.data;
 }
-async function reserve(a, e, prefix = 'purchase', auth = 'primary') {
+async function reserve(a, e, prefix = 'purchase', auth = 'primary', buyerEmail = null) {
   const quote = await a.write(prefix + '-quote', `/v1/public/events/${id(e.event_id)}/quotes`, { quantity: 1 }, [201], { auth });
-  const order = await a.write(prefix + '-order', '/v1/public/orders', { quote_id: quote.data.quote_id, buyer: { name: 'Fake LMNL Buyer', email: a.run.profile === 'sandbox' ? a.config.operatorEmail : 'buyer@fake-lmnl.test' } }, [201], { auth });
+  const order = await a.write(prefix + '-order', '/v1/public/orders', { quote_id: quote.data.quote_id, buyer: { name: 'Fake LMNL Buyer', email: buyerEmail || (a.run.profile === 'sandbox' ? a.config.operatorEmail : 'buyer@fake-lmnl.test') } }, [201], { auth });
   a.check(prefix + ': unpaid Order', order.data.payment_status === 'unpaid' && order.data.tickets.length === 0, 'Unpaid Order with no Tickets', { payment: order.data.payment_status, tickets: order.data.tickets.length });
   if (auth === 'primary') a.run.privateContext.order = order.data;
   await a.save(); return { quote: quote.data, order: order.data };
@@ -104,8 +104,8 @@ async function paid(a, order, at, reference) {
   a.check('no duplicate Ticket', duplicate.data.tickets.length === 1 && duplicate.data.tickets[0].ticket_id === ticket.ticket_id, 'Repeated report preserves the same Ticket', duplicate.data.tickets.map(t => t.ticket_id));
   a.run.privateContext.ticket = ticket; await a.save(); return { ticket, body };
 }
-async function fixture(a) {
-  await configuration(a); const e = await event(a), { order } = await reserve(a, e), at = await attempt(a, order), reference = await checkout(a, at), payment = await paid(a, order, at, reference);
+async function fixture(a, { buyerEmail = null } = {}) {
+  await configuration(a); const e = await event(a), { order } = await reserve(a, e, 'purchase', 'primary', buyerEmail), at = await attempt(a, order), reference = await checkout(a, at), payment = await paid(a, order, at, reference);
   return { e, order, at, reference, ...payment };
 }
 async function deliver(a, f, { unknown = false, overlap = false, failure = false } = {}) {
@@ -182,7 +182,7 @@ async function deliver(a, f, { unknown = false, overlap = false, failure = false
   a.check('delivery observed', after.data.delivery_status === 'delivered', 'Delivery has separate evidence', after.data.delivery_status);
 }
 
-async function deliveryRecovery(a, f) {
+async function deliveryRecovery(a, f, { issue39 = false } = {}) {
   await a.write('admit-before-delivery-correction', `/v1/admin/events/${id(f.e.event_id)}/admissions`, { actor: human, qr_token: f.ticket.qr_payload }, [201]);
   const afterResend = await deliver(a, f, { failure: true });
   const resendJob = afterResend.notification_jobs.filter(item => item.kind === 'tickets_ready').at(-1);
@@ -206,6 +206,24 @@ async function deliveryRecovery(a, f) {
   });
   const failedResend = await a.read('failed-resend-order', `/v1/admin/orders/${id(f.order.order_id)}`, { fresh: true });
   const correctedEmail = `corrected-${a.run.id.slice(0, 8)}@example.test`;
+  let claimedRecovery = null;
+  if (issue39) {
+    await a.write('recovery-request-before-correction', '/v1/public/order-recovery', { email: f.order.delivery_email }, [202]);
+    const recoveryJobs = await a.read('recovery-job-before-correction', '/v1/admin/notification-jobs?kind=order_recovery', { fresh: true });
+    const recoveryJob = recoveryJobs.data.find(item => item.kind === 'order_recovery'
+      && item.payload?.recipient_email?.toLowerCase() === f.order.delivery_email.toLowerCase()
+      && item.payload?.orders?.some(order => order.order_id === f.order.order_id));
+    const recoveryOrder = recoveryJob?.payload?.orders?.find(order => order.order_id === f.order.order_id);
+    if (!recoveryJob || !recoveryOrder) throw new Blocked('The current delivery address did not produce a temporary recovery link for the correction race check.');
+    if (recoveryJobs.data.some(item => item.job_id !== recoveryJob.job_id
+      && item.kind === 'order_recovery' && item.status === 'pending' && !item.is_superseded)) {
+      throw new Blocked('Other Order recovery jobs are pending on this Site. Resolve them before claiming the correction-race fixture.');
+    }
+    const recoveryClaim = await a.write('recovery-email-claim-before-correction', '/v1/admin/notification-jobs/claims', { actor: system, limit: 100, kinds: ['order_recovery'] });
+    claimedRecovery = recoveryClaim.data.jobs.find(item => item.job_id === recoveryJob.job_id);
+    if (!claimedRecovery) throw new Blocked('The temporary recovery email could not be claimed before correction.');
+    claimedRecovery.orderToken = recoveryOrder.order_token;
+  }
   const corrected = await a.write('correct-delivery-email', `/v1/admin/orders/${id(f.order.order_id)}/actions/correct_delivery_email`, {
     actor: human,
     expected_version: failedResend.data.version,
@@ -232,6 +250,27 @@ async function deliveryRecovery(a, f) {
     jobs: jobs.data.length,
     currentRecipient: current?.payload?.recipient_email,
   });
+  if (issue39) {
+    const oldRecoveryPage = await a.read('claimed-recovery-link-revoked', `/v1/public/orders/${id(claimedRecovery.orderToken)}`, { expected: [404], expectedError: 'not_found' });
+    const oldAddressLookup = await a.write('staff-lookup-old-address', `/v1/admin/events/${id(f.e.event_id)}/ticket-lookup`, { email: f.order.delivery_email });
+    const correctedAddressLookup = await a.write('staff-lookup-corrected-address', `/v1/admin/events/${id(f.e.event_id)}/ticket-lookup`, { email: correctedEmail });
+    a.check('Site Buyer lookup follows corrected address', oldAddressLookup.data.length === 0
+      && correctedAddressLookup.data.length === 1
+      && correctedAddressLookup.data[0].order_reference === f.order.order_reference
+      && correctedAddressLookup.data[0].tickets[0].ticket_id === f.ticket.ticket_id,
+    'Staff lookup finds the same Order and Ticket only through the corrected current email', {
+      oldAddressMatches: oldAddressLookup.data.length,
+      correctedAddressMatches: correctedAddressLookup.data.length,
+      ticketId: correctedAddressLookup.data[0]?.tickets[0]?.ticket_id,
+    });
+    a.check('claimed recovery access revoked', oldRecoveryPage.status === 404,
+      'The temporary page link from the claimed old-address email no longer opens after correction', oldRecoveryPage.status);
+    await a.write('claimed-stale-recovery-worker-skipped', `/v1/admin/notification-jobs/${id(claimedRecovery.job_id)}/outcome-reports`, {
+      actor: system, claim_id: claimedRecovery.claim_id, lease_fence: claimedRecovery.lease_fence,
+      outcome: 'failed', provider_message_reference: null, observed_at: iso(a.run.clock + 3500),
+      error_code: 'ORDER_RECOVERY_LINK_UNAVAILABLE', failure_class: 'permanent',
+    });
+  }
   const claim = await a.write('corrected-email-claim', '/v1/admin/notification-jobs/claims', { actor: system, limit: 100, kinds: ['tickets_ready'] });
   const claimed = claim.data.jobs.find(item => item.job_id === current?.job_id);
   if (!claimed) throw new Blocked('The corrected Ticket-email job is not claimable. Resolve its existing claim before testing unknown recovery.');
@@ -262,6 +301,13 @@ async function deliveryRecovery(a, f) {
     admission: replacementPage.data.admission_status,
     oldTicketStatus: oldTicket.status,
   });
+  if (issue39) {
+    const oldQrReplay = await a.write('old-qr-after-correction', `/v1/admin/events/${id(f.e.event_id)}/admissions`, {
+      actor: human, qr_token: f.ticket.qr_payload,
+    }, [409], { expectedError: 'already_admitted' });
+    a.check('old QR keeps Admission history', oldQrReplay.error?.code === 'already_admitted',
+      'The same QR remains subject to its pre-correction Admission record', oldQrReplay.error?.code);
+  }
   a.check('correction audit recorded', unresolved.data.recovery_actions.some(action => action.action === 'correct_delivery_email'
     && action.reason === correctionReason && action.verification_reference === correctionVerification),
   'Delivery-email correction records its reason and verification reference', unresolved.data.recovery_actions);
@@ -475,7 +521,9 @@ export async function execute(a) {
       'Delayed evidence does not create a second Ticket or undo payment', { payment: final.data.payment_status, tickets: final.data.tickets.length });
     return;
   }
-  const f = await fixture(a);
+  const f = await fixture(a, workflow === 'delivery-correction'
+    ? { buyerEmail: `buyer-39-${a.run.id.slice(0, 8)}@example.test` }
+    : {});
   if (workflow === 'issuance-recovery') {
     const staff = await a.read('staff-order-recovery', `/v1/admin/orders/${id(f.order.order_id)}`, { fresh: true });
     a.check('staff Order recovery view', staff.data.payment_status === 'paid'
@@ -504,6 +552,7 @@ export async function execute(a) {
     return;
   }
   if (workflow === 'delivery-recovery') { await deliveryRecovery(a, f); return; }
+  if (workflow === 'delivery-correction') { await deliveryRecovery(a, f, { issue39: true }); return; }
   if (['delivery', 'durable-jobs', 'unknown-email', 'journey'].includes(workflow)) await deliver(a, f, { unknown: workflow === 'unknown-email', overlap: workflow === 'durable-jobs' });
   if (workflow === 'durable-jobs') await a.scheduler('bounded-scheduler');
   if (['admission', 'journey'].includes(workflow)) await admit(a, f, { concurrency: workflow === 'admission' });
