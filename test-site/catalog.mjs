@@ -95,7 +95,7 @@ const reasons = {
   36: 'The local Fake LMNL workflow covers the staff Order read, scheduler recovery boundary, and guarded retry state checks. Deliberate interruption, provider/hosted worker evidence, and cutover testing remain deferred.',
   37: 'Local failed-delivery, guarded resend, verified address correction, and unknown-outcome fencing are runnable; provider, hosted worker, actual email, and cutover testing remain deferred.',
   38: 'Order recovery submission and temporary access generation are not implemented.',
-  39: 'Verified delivery correction and token replacement are not implemented.',
+  39: 'Issue #37 implements the guarded verified delivery-correction and token-replacement path. Issue #39 remains open for recovery-link delivery, stale-worker coordination, Wallet effects, and full end-to-end acceptance.',
   40: 'Event edits exist; per-recipient arrival-change notifications are not implemented.',
   41: 'Cancellation, cancellation notifications, and refund follow-up are not implemented.',
   42: 'Provider refund reports and refund eligibility are not implemented.',
