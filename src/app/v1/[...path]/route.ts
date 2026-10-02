@@ -8,6 +8,7 @@ import { handleAdminOrderActionPost, handleAdminOrderGet, handleAdminOrderPaymen
 import { handlePaymentInvestigationGet, handlePaymentReportPost, handlePaymentResolutionPost } from "@/server/payment-reports";
 import { handleEventActionPost, handleEventGet, handleEventPatch, handleEventPost } from "@/server/events";
 import { handleAdmissionPost } from "@/server/admissions";
+import { handleBuyerOrderRecoveryPost } from "@/server/buyer-order-recovery";
 
 export const dynamic = "force-dynamic";
 
@@ -79,6 +80,9 @@ export async function POST(request: Request, context: RouteContext) {
 
     const adminOrderActionResponse = await handleAdminOrderActionPost(request, authentication.site, path);
     if (adminOrderActionResponse) return adminOrderActionResponse;
+
+    const buyerOrderRecoveryResponse = await handleBuyerOrderRecoveryPost(request, authentication.site, path);
+    if (buyerOrderRecoveryResponse) return buyerOrderRecoveryResponse;
 
     const paymentReportResponse = await handlePaymentReportPost(request, authentication.site, path);
     if (paymentReportResponse) return paymentReportResponse;

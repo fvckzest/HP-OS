@@ -512,7 +512,13 @@ async function readBuyerOrder(site: AuthenticatedSite, token: string): Promise<R
            and job.is_superseded = false
          order by job.created_at desc, job.id desc limit 1
        ) delivery on true
-       where order_row.site_id = $1 and order_row.order_token_hash = $2`,
+       where order_row.site_id = $1
+         and (order_row.order_token_hash = $2 or exists (
+           select 1 from hpos.order_recovery_tokens recovery
+           where recovery.site_id = order_row.site_id and recovery.order_id = order_row.id
+             and recovery.token_hash = $2 and recovery.revoked_at is null
+             and recovery.expires_at > clock_timestamp()
+         ))`,
       [site.siteId, hashToken(token)],
     );
     const order = orderResult.rows[0];
@@ -1048,6 +1054,40 @@ async function correctDeliveryEmail(client: PoolClient, site: AuthenticatedSite,
     [orderId, site.siteId, parsed.version, buyer.rows[0].id, corrected.email, orderToken, hashToken(orderToken)],
   );
   if (updated.rowCount !== 1) throw new ApiOperationError(409, "version_conflict", "The Order changed after you loaded it. Reload it before correcting the delivery email.");
+  await client.query(
+    `update hpos.order_recovery_tokens
+     set revoked_at = clock_timestamp()
+     where site_id = $1 and order_id = $2 and revoked_at is null`,
+    [site.siteId, orderId],
+  );
+  await client.query(
+    `with unsent_recovery_jobs as (
+       select job.id,
+              coalesce(
+                jsonb_agg(entry.order_data order by entry.ordinality)
+                  filter (where entry.order_data ->> 'order_id' <> $2::text),
+                '[]'::jsonb
+              ) as remaining_orders
+       from hpos.notification_jobs job
+       cross join lateral jsonb_array_elements(
+         case when jsonb_typeof(job.payload -> 'orders') = 'array'
+           then job.payload -> 'orders' else '[]'::jsonb end
+       ) with ordinality as entry(order_data, ordinality)
+       where job.site_id = $1 and job.kind = 'order_recovery'
+         and job.status = 'pending' and job.attempt_count = 0
+         and job.requires_verification = false and job.provider_message_reference is null
+         and job.claim_id is null and job.is_superseded = false
+       group by job.id
+       having bool_or(entry.order_data ->> 'order_id' = $2::text)
+     )
+     update hpos.notification_jobs job
+     set payload = jsonb_set(job.payload, '{orders}', unsent_recovery_jobs.remaining_orders),
+         is_superseded = jsonb_array_length(unsent_recovery_jobs.remaining_orders) = 0,
+         updated_at = clock_timestamp()
+     from unsent_recovery_jobs
+     where job.site_id = $1 and job.id = unsent_recovery_jobs.id`,
+    [site.siteId, orderId],
+  );
   for (const ticket of ticketRows.rows) {
     const token = randomBytes(32).toString("base64url");
     await client.query(
