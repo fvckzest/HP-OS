@@ -1074,7 +1074,7 @@ async function correctDeliveryEmail(client: PoolClient, site: AuthenticatedSite,
            then job.payload -> 'orders' else '[]'::jsonb end
        ) with ordinality as entry(order_data, ordinality)
        where job.site_id = $1 and job.kind = 'order_recovery'
-         and job.status = 'pending' and job.attempt_count = 0
+         and job.status = 'pending'
          and job.requires_verification = false and job.provider_message_reference is null
          and job.claim_id is null and job.is_superseded = false
        group by job.id
