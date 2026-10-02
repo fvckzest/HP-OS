@@ -1317,6 +1317,105 @@ async function verifyPaymentReportsAndTicketIssuance(site) {
     "A duplicate provider payment identity issued another usable Ticket.");
 }
 
+async function verifyBuyerOrderRecovery(site, order) {
+  const path = "/v1/public/order-recovery";
+  const matching = await api(site, path, {
+    method: "POST", idempotencyKey: randomUUID(), body: { email: order.deliveryEmail },
+  });
+  assert(matching.status === 202 && matching.data.data?.accepted === true
+    && Object.keys(matching.data.data).length === 1,
+  "A matching recovery request did not return only the generic accepted acknowledgment.");
+  assert(matching.headers.get("cache-control") === "no-store", "A recovery acknowledgment was cacheable.");
+
+  const firstJobs = await api(site, "/v1/admin/notification-jobs?kind=order_recovery");
+  const firstJob = firstJobs.data.data.find((job) => job.kind === "order_recovery"
+    && job.payload?.recipient_email?.toLowerCase() === order.deliveryEmail.toLowerCase());
+  const recoveryToken = firstJob?.payload?.orders?.find((item) => item.order_id === order.orderId)?.order_token;
+  assert(firstJobs.status === 200 && firstJob && typeof recoveryToken === "string",
+    "A matching recovery request did not queue a durable current-address notification.");
+  assert(!JSON.stringify(matching.data).includes(recoveryToken)
+    && !JSON.stringify(matching.data).includes(order.orderReference),
+  "The recovery acknowledgment exposed an Order or access token.");
+
+  const unmatched = await api(site, path, {
+    method: "POST", idempotencyKey: randomUUID(), body: { email: "no-matching-order@example.test" },
+  });
+  assert(unmatched.status === matching.status
+    && JSON.stringify(unmatched.data.data) === JSON.stringify(matching.data.data),
+  "An unmatched email received a different recovery acknowledgment.");
+  const jobsAfterUnmatched = await api(site, "/v1/admin/notification-jobs?kind=order_recovery");
+  assert(!jobsAfterUnmatched.data.data.some((job) => job.kind === "order_recovery"
+    && job.payload?.recipient_email?.toLowerCase() === "no-matching-order@example.test"),
+  "An unmatched email created a recovery notification.");
+
+  const sameMinute = await api(site, path, {
+    method: "POST", idempotencyKey: randomUUID(), body: { email: order.deliveryEmail.toUpperCase() },
+  });
+  assert(sameMinute.status === matching.status
+    && JSON.stringify(sameMinute.data.data) === JSON.stringify(matching.data.data),
+  "A same-minute recovery request did not receive the generic acknowledgment.");
+
+  let recoveryJobs = firstJobs.data.data.filter((job) => job.kind === "order_recovery"
+    && job.payload?.recipient_email?.toLowerCase() === order.deliveryEmail.toLowerCase());
+  assert(recoveryJobs.length === 1, "The Site/email minute limit did not coalesce recovery jobs.");
+  for (let sendNumber = 2; sendNumber <= 5; sendNumber += 1) {
+    await pool.query(
+      `update hpos.notification_jobs
+       set created_at = clock_timestamp() - interval '61 seconds'
+       where site_id = $1 and kind = 'order_recovery'
+         and lower(btrim(payload ->> 'recipient_email')) = lower(btrim($2))`,
+      [site.siteId, order.deliveryEmail],
+    );
+    const allowed = await api(site, path, {
+      method: "POST", idempotencyKey: randomUUID(), body: { email: order.deliveryEmail },
+    });
+    assert(allowed.status === matching.status
+      && JSON.stringify(allowed.data.data) === JSON.stringify(matching.data.data),
+    `Recovery send ${sendNumber} did not return the generic acknowledgment.`);
+  }
+  await pool.query(
+    `update hpos.notification_jobs
+     set created_at = clock_timestamp() - interval '61 seconds'
+     where site_id = $1 and kind = 'order_recovery'
+       and lower(btrim(payload ->> 'recipient_email')) = lower(btrim($2))`,
+    [site.siteId, order.deliveryEmail],
+  );
+  const hourlySuppression = await api(site, path, {
+    method: "POST", idempotencyKey: randomUUID(), body: { email: order.deliveryEmail },
+  });
+  assert(hourlySuppression.status === matching.status
+    && JSON.stringify(hourlySuppression.data.data) === JSON.stringify(matching.data.data),
+  "The hourly recovery limit returned a different acknowledgment.");
+  const jobsAfterLimit = await api(site, "/v1/admin/notification-jobs?kind=order_recovery");
+  recoveryJobs = jobsAfterLimit.data.data.filter((job) => job.kind === "order_recovery"
+    && job.payload?.recipient_email?.toLowerCase() === order.deliveryEmail.toLowerCase());
+  assert(recoveryJobs.length === 5, "The hourly recovery limit did not stop after five jobs.");
+
+  const temporaryRead = await api(site, "/v1/public/orders/" + encodeURIComponent(recoveryToken));
+  const refreshedRead = await api(site, "/v1/public/orders/" + encodeURIComponent(recoveryToken));
+  assert(temporaryRead.status === 200 && refreshedRead.status === 200
+    && temporaryRead.data.data.order_reference === order.orderReference
+    && !Object.hasOwn(temporaryRead.data.data, "order_token"),
+  "A temporary recovery token did not support a repeat Order-page read without revealing the permanent Order token.");
+  const normalRead = await api(site, "/v1/public/orders/" + encodeURIComponent(order.normalOrderToken));
+  assert(normalRead.status === 200 && normalRead.data.data.order_reference === order.orderReference,
+    "Recovery invalidated the normal Order access token.");
+
+  const expiredToken = randomUUID() + randomUUID();
+  await pool.query(
+    `insert into hpos.order_recovery_tokens (id, site_id, order_id, token_hash, created_at, expires_at)
+     values ($1, $2, $3, $4, clock_timestamp() - interval '31 minutes', clock_timestamp() - interval '1 minute')`,
+    [randomUUID(), site.siteId, order.orderId, createHash("sha256").update(expiredToken, "utf8").digest("hex")],
+  );
+  const expiredRead = await api(site, "/v1/public/orders/" + encodeURIComponent(expiredToken));
+  assert(expiredRead.status === 404, "An expired recovery token still opened an Order.");
+  const otherSite = createSiteFixture();
+  const wrongSiteRead = await api(otherSite, "/v1/public/orders/" + encodeURIComponent(recoveryToken));
+  assert(wrongSiteRead.status === 404, "A recovery token opened an Order from another Site.");
+
+  return { recoveryToken };
+}
+
 async function verifyEmailDeliveryRecovery(site) {
   const now = Date.now();
   const event = await createPublishedEvent(site, {
@@ -1362,6 +1461,12 @@ async function verifyEmailDeliveryRecovery(site) {
   const initialRead = await api(site, "/v1/public/orders/" + order.data.data.order_token);
   assert(initialRead.status === 200 && initialRead.data.data.tickets.length === 1, "The Issue #37 fixture did not issue one Ticket.");
   const originalTicket = initialRead.data.data.tickets[0];
+  const recovery = await verifyBuyerOrderRecovery(site, {
+    orderId,
+    orderReference: order.data.data.order_reference,
+    deliveryEmail: "delivery-recovery@example.test",
+    normalOrderToken: order.data.data.order_token,
+  });
   const admission = await api(site, "/v1/admin/events/" + event.event_id + "/admissions", {
     method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "user", reference: "test:issue-37" }, qr_token: originalTicket.qr_payload },
   });
@@ -1559,6 +1664,14 @@ async function verifyEmailDeliveryRecovery(site) {
     && correction.data.data.tickets.length === 1
     && correction.data.data.tickets[0].ticket_id === originalTicket.ticket_id,
   "Verified delivery-email correction did not preserve checkout and Ticket identity.");
+  const revokedRecovery = await api(site, "/v1/public/orders/" + encodeURIComponent(recovery.recoveryToken));
+  assert(revokedRecovery.status === 404, "Delivery-email correction did not revoke temporary recovery access.");
+  const recoveryJobsAfterCorrection = await api(site, "/v1/admin/notification-jobs?kind=order_recovery");
+  const oldAddressRecoveryJobs = recoveryJobsAfterCorrection.data.data.filter((job) => job.kind === "order_recovery"
+    && job.payload?.recipient_email?.toLowerCase() === "delivery-recovery@example.test");
+  assert(oldAddressRecoveryJobs.length === 5
+    && oldAddressRecoveryJobs.every((job) => job.is_superseded && job.payload.orders.length === 0),
+  "Delivery-email correction left an unsent temporary Order link in the old-address queue.");
   const oldOrder = await api(site, "/v1/public/orders/" + order.data.data.order_token);
   assert(oldOrder.status === 404, "The old Order access token remained valid after delivery-email correction.");
   const correctionJobs = await api(site, "/v1/admin/notification-jobs?order_id=" + orderId + "&kind=tickets_ready");
@@ -2429,7 +2542,7 @@ async function main() {
     await stopApp(app);
     await pool.end();
   }
-  console.log("Local Event, checkout, and Admission API verification passed: sales controls with actual Reservations, preserved purchase terms, capacity release, Organization pilot fees, explicit pricing, single-Ticket quotes, payment-attempt idempotency, shared-connection checkout-reference isolation under concurrent registration, verified payment reporting, interrupted issuance recovery, duplicate-safe Tickets and email work, guarded failed-delivery resend, verified delivery-email correction, strict unknown-outcome fencing, separate buyer tokens, manual lookup, Admission rejection precedence, same-key replay, concurrent scans, conflict retention and guarded resolution, provider closure safety, Reservation expiry, and concurrent last-capacity protection.");
+  console.log("Local Event, checkout, and Admission API verification passed: sales controls with actual Reservations, preserved purchase terms, capacity release, Organization pilot fees, explicit pricing, single-Ticket quotes, payment-attempt idempotency, shared-connection checkout-reference isolation under concurrent registration, verified payment reporting, interrupted issuance recovery, duplicate-safe Tickets and email work, guarded failed-delivery resend, verified delivery-email correction, non-enumerating Order recovery, Site/email recovery limits, reusable temporary access, correction revocation, strict unknown-outcome fencing, separate buyer tokens, manual lookup, Admission rejection precedence, same-key replay, concurrent scans, conflict retention and guarded resolution, provider closure safety, Reservation expiry, and concurrent last-capacity protection.");
 }
 
 main().catch((error) => {
