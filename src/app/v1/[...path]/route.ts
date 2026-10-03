@@ -6,6 +6,7 @@ import { handleCheckoutPost } from "@/server/checkout";
 import { handlePaymentAttemptGet, handlePaymentAttemptPost } from "@/server/payment-attempts";
 import { handleAdminOrderActionPost, handleAdminOrderGet, handleAdminOrderPaymentStatusGet, handleBuyerOrderGet, handleBuyerTicketGet } from "@/server/ticket-issuance";
 import { handlePaymentInvestigationGet, handlePaymentReportPost, handlePaymentResolutionPost } from "@/server/payment-reports";
+import { handleRefundReportPost } from "@/server/refunds";
 import { handleEventActionPost, handleEventGet, handleEventPatch, handleEventPost } from "@/server/events";
 import { handleAdmissionPost } from "@/server/admissions";
 import { handleBuyerOrderRecoveryPost } from "@/server/buyer-order-recovery";
@@ -77,6 +78,9 @@ export async function POST(request: Request, context: RouteContext) {
 
     const paymentResolutionResponse = await handlePaymentResolutionPost(request, authentication.site, path);
     if (paymentResolutionResponse) return paymentResolutionResponse;
+
+    const refundReportResponse = await handleRefundReportPost(request, authentication.site, path);
+    if (refundReportResponse) return refundReportResponse;
 
     const adminOrderActionResponse = await handleAdminOrderActionPost(request, authentication.site, path);
     if (adminOrderActionResponse) return adminOrderActionResponse;

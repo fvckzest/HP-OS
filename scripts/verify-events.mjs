@@ -12,6 +12,7 @@ const databaseUrl = process.env.HPOS_DATABASE_URL ?? "postgresql://postgres:post
 const env = { ...process.env, NODE_ENV: "development", HPOS_DATABASE_URL: databaseUrl, NEXT_TELEMETRY_DISABLED: "1" };
 const pool = new pg.Pool({ connectionString: databaseUrl, max: 5, connectionTimeoutMillis: 2_000 });
 const organizationIds = [];
+const siteIds = [];
 let app;
 
 function assert(condition, message) {
@@ -85,6 +86,7 @@ function createSiteFixture(withPilotFee = true) {
   const organization = runOperator(["organization", "create", "--name", "Issue 28 verification " + randomUUID(), ...feeOptions]);
   organizationIds.push(organization.organization_id);
   const site = runOperator(["site", "create", "--organization", organization.organization_id, "--name", "Issue 26 verification Site"]);
+  siteIds.push(site.site_id);
   const connection = runOperator([
     "payment-connection", "create", "--organization", organization.organization_id,
     "--provider", "square", "--environment", "test",
@@ -103,6 +105,7 @@ function createSiteFixture(withPilotFee = true) {
 
 function createSharedConnectionSiteFixture(source) {
   const site = runOperator(["site", "create", "--organization", source.organizationId, "--name", "Issue 80 shared-connection Site"]);
+  siteIds.push(site.site_id);
   runOperator(["site", "assign-connection", "--site", site.site_id, "--connection", source.connectionId]);
   const key = runOperator(["site-key", "issue", "--site", site.site_id]);
   return { organizationId: source.organizationId, siteId: site.site_id, apiKey: key.site_api_key, connectionId: source.connectionId };
@@ -1472,6 +1475,243 @@ async function verifyBuyerOrderRecovery(site, order) {
   assert(wrongSiteRead.status === 404, "A recovery token opened an Order from another Site.");
 
   return { recoveryToken };
+}
+
+async function verifyProviderRefundReports(site) {
+  const now = Date.now();
+  const refundIdentity = randomUUID();
+  const event = await createPublishedEvent(site, {
+    title: "Issue 42 Provider Refund Reporting",
+    startsAt: new Date(now - 60 * 60_000).toISOString(),
+    endsAt: new Date(now + 60 * 60_000).toISOString(),
+    checkInOpensAt: new Date(now - 30 * 60_000).toISOString(),
+    timeZone: "UTC",
+    ticketOffering: { price: { amount: 2500, currency: "USD" }, capacity: 3, tax_amount: 0, buyer_fees: [] },
+  });
+
+  async function createOrder(label, reportPayment = true) {
+    const quote = await api(site, `/v1/public/events/${event.event_id}/quotes`, {
+      method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
+    });
+    assert(quote.status === 201, `The Issue #42 ${label} fixture could not create a quote.`);
+    const order = await api(site, "/v1/public/orders", {
+      method: "POST", idempotencyKey: randomUUID(),
+      body: { quote_id: quote.data.data.quote_id, buyer: {
+        name: `Issue 42 ${label}`,
+        email: `${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}@example.test`,
+      } },
+    });
+    assert(order.status === 201, `The Issue #42 ${label} fixture could not create an Order.`);
+    const attempt = await api(site, `/v1/admin/orders/${order.data.data.order_id}/payment-attempts`, {
+      method: "POST", idempotencyKey: randomUUID(),
+      body: { actor: { type: "system", reference: "test:issue-42" } },
+    });
+    assert(attempt.status === 201, `The Issue #42 ${label} fixture could not create a payment attempt.`);
+    const attemptId = attempt.data.data.attempt_id;
+    const checkoutReference = `square-issue-42-${label}-${randomUUID()}`;
+    const registered = await api(site, `/v1/admin/payment-attempts/${attemptId}/checkout-reference`, {
+      method: "POST", idempotencyKey: randomUUID(), body: {
+        actor: { type: "system", reference: "test:issue-42" },
+        connection_id: site.connectionId,
+        provider_checkout_reference: checkoutReference,
+        provider_can_take_payment: true,
+      },
+    });
+    assert(registered.status === 200, `The Issue #42 ${label} fixture could not register its checkout reference.`);
+    let paidBody = null;
+    if (reportPayment) {
+      const observedAt = new Date().toISOString();
+      paidBody = {
+        connection_id: site.connectionId,
+        source_reference: `square-payment-issue-42-${label}-${randomUUID()}`,
+        provider_checkout_reference: checkoutReference,
+        provider_payment_reference: `square-payment-issue-42-${label}-${randomUUID()}`,
+        outcome: "paid",
+        observed_at: observedAt,
+        payment_started_at: observedAt,
+        provider_can_take_payment: false,
+        amount: 2500,
+        currency: "USD",
+      };
+      const paid = await api(site, `/v1/admin/payment-attempts/${attemptId}/payment-reports`, {
+        method: "POST", idempotencyKey: randomUUID(), body: paidBody,
+      });
+      assert(paid.status === 201 && paid.data.data.attempt.last_outcome === "paid",
+        `The Issue #42 ${label} fixture could not record the verified payment.`);
+    }
+    return { order: order.data.data, attemptId, checkoutReference, paidBody };
+  }
+
+  async function reportRefund(order, attemptId, fields) {
+    return api(site, `/v1/admin/orders/${order.order_id}/refund-reports`, {
+      method: "POST", idempotencyKey: randomUUID(), body: {
+        attempt_id: attemptId,
+        connection_id: site.connectionId,
+        provider_payment_reference: order.provider_payment_reference,
+        ...fields,
+      },
+    });
+  }
+
+  const unadmitted = await createOrder("Unadmitted Refund Buyer");
+  const paymentReference = unadmitted.paidBody.provider_payment_reference;
+  const processingAt = new Date().toISOString();
+  const processingBody = {
+    attempt_id: unadmitted.attemptId,
+    connection_id: site.connectionId,
+    provider_payment_reference: paymentReference,
+    provider_refund_reference: `square-refund-issue-42-${refundIdentity}-partial-a`,
+    source_reference: "square-refund-event-issue-42-processing",
+    outcome: "processing",
+    amount: 1000,
+    currency: "USD",
+    observed_at: processingAt,
+  };
+  const processing = await api(site, `/v1/admin/orders/${unadmitted.order.order_id}/refund-reports`, {
+    method: "POST", idempotencyKey: randomUUID(), body: processingBody,
+  });
+  assert(processing.status === 201 && processing.data.data.applied === true
+    && processing.data.data.refund.outcome === "processing",
+  "A processing refund was not retained without being treated as completed.");
+  const processingBuyer = await api(site, `/v1/public/orders/${unadmitted.order.order_token}`);
+  assert(processingBuyer.status === 200 && processingBuyer.data.data.refund_status === "none"
+    && processingBuyer.data.data.refunds[0]?.outcome === "processing",
+  "The buyer page did not distinguish a processing refund from a completed refund.");
+  const duplicate = await api(site, `/v1/admin/orders/${unadmitted.order.order_id}/refund-reports`, {
+    method: "POST", idempotencyKey: randomUUID(), body: processingBody,
+  });
+  assert(duplicate.status === 200 && duplicate.data.data.report.report_id === processing.data.data.report.report_id,
+    "An exact duplicate provider refund report created a second evidence row.");
+
+  const unknown = await reportRefund(unadmitted.order, unadmitted.attemptId, {
+    provider_payment_reference: paymentReference,
+    provider_refund_reference: `square-refund-issue-42-${refundIdentity}-unknown`,
+    source_reference: "square-refund-event-issue-42-unknown",
+    outcome: "unknown", amount: 500, currency: "USD",
+    observed_at: new Date(Date.now() + 1000).toISOString(),
+  });
+  assert(unknown.status === 201 && unknown.data.data.applied === true
+    && unknown.data.data.refund.outcome === "unknown",
+  "An unknown refund outcome was not retained without changing the completed-refund total.");
+
+  const partialCompletion = await reportRefund(unadmitted.order, unadmitted.attemptId, {
+    provider_payment_reference: paymentReference,
+    provider_refund_reference: `square-refund-issue-42-${refundIdentity}-partial-a`,
+    source_reference: "square-refund-event-issue-42-partial-a-completed",
+    outcome: "completed", amount: 1000, currency: "USD",
+    observed_at: new Date(Date.now() + 2000).toISOString(),
+  });
+  assert(partialCompletion.status === 201 && partialCompletion.data.data.refund.outcome === "completed",
+    "A processing refund did not transition to a later completed provider observation.");
+  const afterPartialBuyer = await api(site, `/v1/public/orders/${unadmitted.order.order_token}`);
+  const afterPartialAdmin = await api(site, `/v1/admin/orders/${unadmitted.order.order_id}`);
+  assert(afterPartialBuyer.status === 200 && afterPartialBuyer.data.data.refund_status === "partial"
+    && afterPartialBuyer.data.data.refunds.some((refund) => refund.outcome === "completed")
+    && afterPartialAdmin.status === 200 && afterPartialAdmin.data.data.refund_reports.length === 3,
+  "The partial refund status or safe buyer and staff refund histories were not exposed.");
+
+  const fullCompletion = await reportRefund(unadmitted.order, unadmitted.attemptId, {
+    provider_payment_reference: paymentReference,
+    provider_refund_reference: `square-refund-issue-42-${refundIdentity}-partial-b`,
+    source_reference: "square-refund-event-issue-42-partial-b-completed",
+    outcome: "completed", amount: 1500, currency: "USD",
+    observed_at: new Date(Date.now() + 3000).toISOString(),
+  });
+  assert(fullCompletion.status === 201 && fullCompletion.data.data.refund.outcome === "completed",
+    "A second completed refund did not return its report result: " + JSON.stringify(fullCompletion));
+  const firstCapacity = await pool.query(
+    `select offering.reserved_quantity,
+            (select count(*)::integer from hpos.tickets ticket
+             where ticket.order_id = $2 and ticket.refund_capacity_released_at is not null) as released_tickets
+     from hpos.orders order_row
+     join hpos.ticket_offerings offering on offering.id = order_row.offering_id and offering.site_id = order_row.site_id
+     where order_row.site_id = $1 and order_row.id = $2`,
+    [site.siteId, unadmitted.order.order_id],
+  );
+  const refundedBuyer = await api(site, `/v1/public/orders/${unadmitted.order.order_token}`);
+  const refundedAdmin = await api(site, `/v1/admin/orders/${unadmitted.order.order_id}`);
+  assert(fullCompletion.status === 201 && refundedBuyer.status === 200
+    && refundedBuyer.data.data.refund_status === "full"
+    && Number(firstCapacity.rows[0]?.reserved_quantity) === 0 && firstCapacity.rows[0]?.released_tickets === 1
+    && refundedAdmin.status === 200 && refundedAdmin.data.data.refunds.length === 3,
+  "Cumulative completed refunds did not block the Order and return capacity for its unadmitted Ticket once.");
+
+  const overRefund = await reportRefund(unadmitted.order, unadmitted.attemptId, {
+    provider_payment_reference: paymentReference,
+    provider_refund_reference: `square-refund-issue-42-${refundIdentity}-over-refund`,
+    source_reference: "square-refund-event-issue-42-over-refund",
+    outcome: "completed", amount: 1, currency: "USD",
+    observed_at: new Date(Date.now() + 4000).toISOString(),
+  });
+  const overRefundEvidence = await pool.query(
+    `select count(*)::integer as reports,
+            (select count(*)::integer from hpos.refund_report_issues
+             where order_id = $1 and code = 'refund_report_conflict' and status = 'open') as issues
+     from hpos.refund_reports where order_id = $1 and conflict_code = 'refund_report_conflict'`,
+    [unadmitted.order.order_id],
+  );
+  assert(overRefund.status === 409 && overRefund.data.error.code === "refund_report_conflict"
+    && overRefundEvidence.rows[0]?.reports === 1 && overRefundEvidence.rows[0]?.issues === 1,
+  "An over-refund was not rejected and retained as a staff-visible conflict.");
+
+  const admitted = await createOrder("Admitted Refund Buyer");
+  const admittedRead = await api(site, `/v1/public/orders/${admitted.order.order_token}`);
+  const admittedTicket = admittedRead.data.data.tickets[0];
+  const admission = await api(site, `/v1/admin/events/${event.event_id}/admissions`, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-42" }, qr_token: admittedTicket.qr_payload },
+  });
+  assert(admittedRead.status === 200 && admittedTicket && admission.status === 201,
+    "The Issue #42 admitted-Ticket fixture could not establish an Admission.");
+  const admittedRefund = await reportRefund(admitted.order, admitted.attemptId, {
+    provider_payment_reference: admitted.paidBody.provider_payment_reference,
+    provider_refund_reference: `square-refund-issue-42-${refundIdentity}-admitted-full`,
+    source_reference: "square-refund-event-issue-42-admitted-full",
+    outcome: "completed", amount: 2500, currency: "USD",
+    observed_at: new Date(Date.now() + 5000).toISOString(),
+  });
+  const admittedCapacity = await pool.query(
+    `select offering.reserved_quantity,
+            (select count(*)::integer from hpos.admissions admission where admission.ticket_id = $2) as admissions,
+            ticket.refund_capacity_released_at
+     from hpos.tickets ticket
+     join hpos.ticket_offerings offering on offering.id = ticket.offering_id and offering.site_id = ticket.site_id
+     where ticket.site_id = $1 and ticket.order_id = $3`,
+    [site.siteId, admittedTicket.ticket_id, admitted.order.order_id],
+  );
+  assert(admittedRefund.status === 201 && Number(admittedCapacity.rows[0]?.reserved_quantity) === 1
+    && admittedCapacity.rows[0]?.admissions === 1 && admittedCapacity.rows[0]?.refund_capacity_released_at === null,
+  "A full refund removed an admitted Ticket's committed Admission or returned its capacity.");
+
+  const lateCharge = await createOrder("Canceled Event Late Charge", false);
+  const canceled = await api(site, `/v1/admin/events/${event.event_id}/actions/cancel`, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-42" }, expected_version: event.version },
+  });
+  assert(canceled.status === 200 && canceled.data.data.is_canceled,
+    "The Issue #42 fixture could not cancel its Event before the late provider charge.");
+  const lateObservedAt = new Date().toISOString();
+  const latePayment = await api(site, `/v1/admin/payment-attempts/${lateCharge.attemptId}/payment-reports`, {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      connection_id: site.connectionId,
+      source_reference: `square-payment-issue-42-late-${randomUUID()}`,
+      provider_checkout_reference: lateCharge.checkoutReference,
+      provider_payment_reference: `square-payment-issue-42-late-${randomUUID()}`,
+      outcome: "paid", observed_at: lateObservedAt, payment_started_at: lateObservedAt,
+      provider_can_take_payment: false, amount: 2500, currency: "USD",
+    },
+  });
+  const lateBuyer = await api(site, `/v1/public/orders/${lateCharge.order.order_token}`);
+  const lateAdmin = await api(site, `/v1/admin/orders/${lateCharge.order.order_id}`);
+  const admittedAfterCancel = await api(site, `/v1/public/orders/${admitted.order.order_token}`);
+  assert(latePayment.status === 201 && lateBuyer.status === 200
+    && lateBuyer.data.data.payment_status === "paid" && lateBuyer.data.data.refund_status === "none"
+    && lateBuyer.data.data.event.is_canceled === true
+    && lateAdmin.status === 200 && lateAdmin.data.data.refund_status === "none"
+    && lateAdmin.data.data.event.is_canceled === true
+    && admittedAfterCancel.status === 200 && admittedAfterCancel.data.data.refund_status === "full"
+    && admittedAfterCancel.data.data.event.is_canceled === true,
+  "Late payment, Event cancellation, and completed refund outcomes were merged instead of retained separately.");
 }
 
 async function verifyEmailDeliveryRecovery(site) {
@@ -3081,6 +3321,11 @@ async function verifyEventCancellation(site) {
 }
 
 async function cleanup() {
+  if (siteIds.length) {
+    await pool.query("delete from hpos.refund_report_issues where site_id = any($1::uuid[])", [siteIds]);
+    await pool.query("delete from hpos.refund_reports where site_id = any($1::uuid[])", [siteIds]);
+    await pool.query("delete from hpos.refunds where site_id = any($1::uuid[])", [siteIds]);
+  }
   if (organizationIds.length) {
     await pool.query("delete from hpos.organizations where id = any($1::uuid[])", [organizationIds]).catch(() => undefined);
   }
@@ -3103,6 +3348,7 @@ async function main() {
     await verifyPublicPaymentAttemptLifecycle(site);
     await verifySharedCheckoutReferenceIsolation(site);
     await verifyPaymentReportsAndTicketIssuance(site);
+    await verifyProviderRefundReports(site);
     await verifyEmailDeliveryRecovery(site);
     await verifyPaymentConflictResolution(site);
     await verifyReservationBackedSalesControls(site);
@@ -3111,7 +3357,7 @@ async function main() {
     await stopApp(app);
     await pool.end();
   }
-  console.log("Local Event, checkout, and Admission API verification passed: sales controls with actual Reservations, preserved purchase terms, capacity release, Organization pilot fees, explicit pricing, single-Ticket quotes, payment-attempt idempotency, shared-connection checkout-reference isolation under concurrent registration, verified payment reporting, interrupted issuance recovery, duplicate-safe Tickets and email work, guarded failed-delivery resend, verified delivery-email correction, non-enumerating Order recovery, Site/email recovery limits, reusable temporary access, correction revocation, strict unknown-outcome fencing, separate buyer tokens, manual lookup, Admission rejection precedence, same-key replay, concurrent scans, conflict retention and guarded resolution, provider closure safety, Reservation expiry, and concurrent last-capacity protection.");
+  console.log("Local Event, checkout, Admission, and refund API verification passed: sales controls with actual Reservations, preserved purchase terms, capacity release, Organization pilot fees, explicit pricing, single-Ticket quotes, payment-attempt idempotency, shared-connection checkout-reference isolation under concurrent registration, verified payment reporting, interrupted issuance recovery, cumulative and duplicate-safe provider refund reporting, refund conflicts and capacity restoration, admission history retention, cancellation/refund separation, duplicate-safe Tickets and email work, guarded failed-delivery resend, verified delivery-email correction, non-enumerating Order recovery, Site/email recovery limits, reusable temporary access, correction revocation, strict unknown-outcome fencing, separate buyer tokens, manual lookup, Admission rejection precedence, same-key replay, concurrent scans, conflict retention and guarded resolution, provider closure safety, Reservation expiry, and concurrent last-capacity protection.");
 }
 
 main().catch((error) => {

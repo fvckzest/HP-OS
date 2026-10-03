@@ -569,6 +569,15 @@ async function readBuyerOrder(site: AuthenticatedSite, token: string): Promise<R
       )
       : { rows: [] as TicketRow[] };
     const tickets = ticketsResult.rows.map((ticket) => publicTicketData(ticket, event, order.refund_status));
+    const refundsResult = await client.query<{
+      outcome: string; amount: string | number; currency: string; observed_at: Date; created_at: Date; updated_at: Date;
+    }>(
+      `select outcome, amount, currency, observed_at, created_at, updated_at
+       from hpos.refunds
+       where site_id = $1 and order_id = $2
+       order by created_at asc, id asc`,
+      [site.siteId, order.order_id],
+    );
     return noStore(apiSuccess({
       order_id: order.order_id,
       order_reference: order.order_reference,
@@ -584,6 +593,14 @@ async function readBuyerOrder(site: AuthenticatedSite, token: string): Promise<R
       issuance_status: order.issuance_status,
       delivery_status: currentDeliveryStatus(order),
       refund_status: order.refund_status,
+      refunds: refundsResult.rows.map((refund) => ({
+        outcome: refund.outcome,
+        amount: safeNumber(refund.amount.toString()),
+        currency: refund.currency,
+        observed_at: refund.observed_at.toISOString(),
+        created_at: refund.created_at.toISOString(),
+        updated_at: refund.updated_at.toISOString(),
+      })),
       event,
       tickets,
     }));
@@ -744,6 +761,33 @@ async function readAdminOrder(site: AuthenticatedSite, orderId: string, existing
        order by attempt.created_at asc, attempt.id asc`,
       [site.siteId, orderId],
     );
+    const refundsResult = await client.query<{
+      id: string; attempt_id: string; connection_id: string; provider: string; environment: string;
+      account_reference: string; provider_payment_reference: string; provider_refund_reference: string;
+      outcome: string; amount: string | number; currency: string; observed_at: Date; created_at: Date; updated_at: Date;
+    }>(
+      `select id, attempt_id, connection_id, provider, environment, account_reference,
+              provider_payment_reference, provider_refund_reference, outcome, amount, currency,
+              observed_at, created_at, updated_at
+       from hpos.refunds
+       where site_id = $1 and order_id = $2
+       order by created_at asc, id asc`,
+      [site.siteId, orderId],
+    );
+    const refundReportsResult = await client.query<{
+      id: string; attempt_id: string; connection_id: string; source_reference: string;
+      provider_payment_reference: string; provider_refund_reference: string; outcome: string;
+      observed_at: Date; amount: string | number; currency: string; evidence: Record<string, unknown>;
+      applied: boolean; stale: boolean; conflict_code: string | null; created_at: Date;
+    }>(
+      `select id, attempt_id, connection_id, source_reference, provider_payment_reference,
+              provider_refund_reference, outcome, observed_at, amount, currency, evidence,
+              applied, stale, conflict_code, created_at
+       from hpos.refund_reports
+       where site_id = $1 and order_id = $2
+       order by observed_at asc, created_at asc, id asc`,
+      [site.siteId, orderId],
+    );
     const jobsResult = await client.query<{
       id: string; kind: string; status: "pending" | "failed" | "completed"; event_id: string | null; order_id: string | null;
       is_superseded: boolean; attempt_count: number; available_at: Date; created_at: Date; updated_at: Date;
@@ -775,7 +819,14 @@ async function readAdminOrder(site: AuthenticatedSite, orderId: string, existing
        left join hpos.payment_report_issue_resolutions resolution
          on resolution.issue_id = issue.id and resolution.site_id = issue.site_id
        where issue.site_id = $1 and issue.order_id = $2
-       order by issue.created_at asc, issue.id asc`,
+       union all
+       select issue.id, issue.code, issue.status, issue.message, issue.created_at, issue.resolved_at,
+              null::uuid as resolution_id, null::text as actor_type, null::text as actor_reference,
+              null::text as reason, null::text as verification_reference,
+              null::integer as previous_version, null::integer as new_version
+       from hpos.refund_report_issues issue
+       where issue.site_id = $1 and issue.order_id = $2
+       order by created_at asc, id asc`,
       [site.siteId, orderId],
     );
     const recoveryActionsResult = await client.query<{
@@ -840,7 +891,39 @@ async function readAdminOrder(site: AuthenticatedSite, orderId: string, existing
         created_at: attempt.created_at.toISOString(),
         updated_at: attempt.updated_at.toISOString(),
       })),
-      refunds: [],
+      refunds: refundsResult.rows.map((refund) => ({
+        refund_id: refund.id,
+        attempt_id: refund.attempt_id,
+        connection_id: refund.connection_id,
+        provider: refund.provider,
+        environment: refund.environment,
+        account_reference: refund.account_reference,
+        provider_payment_reference: refund.provider_payment_reference,
+        provider_refund_reference: refund.provider_refund_reference,
+        outcome: refund.outcome,
+        amount: safeNumber(refund.amount.toString()),
+        currency: refund.currency,
+        observed_at: refund.observed_at.toISOString(),
+        created_at: refund.created_at.toISOString(),
+        updated_at: refund.updated_at.toISOString(),
+      })),
+      refund_reports: refundReportsResult.rows.map((report) => ({
+        report_id: report.id,
+        attempt_id: report.attempt_id,
+        connection_id: report.connection_id,
+        source_reference: report.source_reference,
+        provider_payment_reference: report.provider_payment_reference,
+        provider_refund_reference: report.provider_refund_reference,
+        outcome: report.outcome,
+        observed_at: report.observed_at.toISOString(),
+        amount: safeNumber(report.amount.toString()),
+        currency: report.currency,
+        evidence: report.evidence,
+        applied: report.applied,
+        stale: report.stale,
+        conflict_code: report.conflict_code,
+        created_at: report.created_at.toISOString(),
+      })),
       fee_records: [],
       notification_jobs: jobsResult.rows.map((job) => ({
         job_id: job.id,

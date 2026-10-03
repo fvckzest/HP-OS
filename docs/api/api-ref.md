@@ -477,6 +477,7 @@ Text limits: name/title 200 characters; description 20,000; venue address 1,000;
 | `issuance_status` | enum | not_started, pending, issued, failed, blocked. |
 | `delivery_status` | enum | not_sent, pending, sent, delivered, failed. |
 | `refund_status` | enum | none, partial, full. |
+| `refunds` | Refund[] | Buyer-safe verified refund outcomes and minor-unit amounts; provider references are omitted. |
 | `tickets` | PublicTicket[] | Complete issued set, ordinal order; [] until issued. |
 | `order_token` | string; creation only | Buyer access token; absent from normal Order reads. |
 | `version` | integer; admin | Guarded Order version. |
@@ -488,6 +489,7 @@ Text limits: name/title 200 characters; description 20,000; venue address 1,000;
 | `reservation` | Reservation; admin | Capacity claim. |
 | `payment_attempts` | PaymentAttempt[]; admin | Provider execution history. |
 | `refunds` | Refund[]; admin | Verified refund history. |
+| `refund_reports` | RefundReport[]; admin | Verified observations, including stale reports and conflict flags. |
 | `fee_records` | FeeRecord[]; admin | Verified component fees/revisions. |
 | `notification_jobs` | NotificationJob[]; admin | Related delivery work. |
 | `issues` | Issue[]; admin | Problems needing investigation. |
@@ -616,7 +618,7 @@ Payment-attempt detail responses also include `reports` and `issues`. Reports re
 | `refund` | Refund; refund response | Current refund. |
 | `order_id` | string; response | Owning Order. |
 
-`Refund` retains refund_id, attempt/connection/payment/refund/source references, latest outcome, amount, currency, and timestamps. Provider reports retain history; stale observations do not reverse confirmed payment/refund state.
+Buyer `Refund` objects include only outcome, amount, currency, and observation/creation/update times. Admin `Refund` objects also include the stored refund ID, original attempt/connection, provider payment/refund references, provider/account aliases, and current state. HP-OS does not return provider credentials. `RefundReport` entries retain the source, observation, amount/currency, `applied`, `stale`, and `conflict_code`; raw provider credentials and webhook payloads are not accepted.
 
 ### Refund record
 
@@ -634,6 +636,8 @@ Payment-attempt detail responses also include `reports` and `issues`. Reports re
 | `observed_at` | timestamp | Verified provider observation instant. |
 
 The contract also requires refund timestamps/history without enumerating every stored timestamp field name.
+
+Completed refund amounts accumulate per Order and cannot exceed its confirmed payment amount. Full refund blocks future Admission; capacity is returned per unadmitted Ticket once, while already-admitted Tickets keep their Admission record and do not return capacity. Event cancellation remains a separate Event state.
 
 ### Submission, lookup, and Admission input
 
@@ -795,7 +799,7 @@ Each row lists operation-specific body fields/result data. Apply common headers 
 | Setup failure | `reason, provider_checkout_closed:true, payment_outcome` | `PaymentAttempt; 200` |
 | Closure report | `connection_id, source_reference, provider_checkout_reference, observed_at, provider_checkout_closed:true, payment_outcome` | `PaymentAttempt; 200` |
 | Resolve attempt | `expected_version, reason, verification_reference, report` | `200; guarded verified resolution` |
-| Refund report | `attempt_id, connection_id, provider_payment_reference, provider_refund_reference, source_reference, outcome, amount, currency, observed_at` | `{report_id,applied,refund,order_id}; new 201 / repeat 200` |
+| Refund report | `attempt_id, connection_id, provider_payment_reference, provider_refund_reference, source_reference, outcome, amount, currency, observed_at` | `{report_id,applied,stale,refund,order_id,report}; new 201 / exact replay 200 / conflict 409` |
 | Fee report | `attempt_id, connection_id, scope_type, scope_reference, source_reference, source_revision, category, direction, amount, currency, observed_at` | `{fee_record_id,applied,order_id}; new/revised 201 / repeat 200` |
 | Fee confirmation | `attempt_id, connection_id, scope_type, scope_reference, category, totals, observed_at` | `{order_id,scope_type,scope_reference,category,reporting_status}; 200` |
 | Claim jobs | `Optional limit, kinds` | `{claim_id,lease_expires_at,jobs}; 200` |
