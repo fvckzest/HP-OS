@@ -5,6 +5,7 @@ import { withApiIdempotency } from "./api-idempotency";
 import { ApiOperationError } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
+import { enqueueNotificationJob } from "./notifications";
 import { issuePaidOrder } from "./ticket-issuance";
 import { paymentAttemptData } from "./payment-attempts";
 import type { AttemptRow } from "./payment-attempts";
@@ -30,6 +31,61 @@ interface ReportInput {
 interface LockedAttempt extends AttemptRow {
   issuance_status: "not_started" | "pending" | "issued" | "failed" | "blocked";
   checkout_expired: boolean;
+  event_is_canceled: boolean;
+}
+
+async function enqueueLateCancellationNotice(client: PoolClient, attempt: LockedAttempt): Promise<void> {
+  const details = await client.query<{
+    event_id: string;
+    event_reference: string;
+    title: string;
+    starts_at: Date;
+    ends_at: Date;
+    time_zone: string;
+    venue_name: string;
+    venue_address: string | null;
+    canceled_at: Date;
+    order_reference: string;
+    delivery_email: string;
+  }>(
+    `select event_row.id as event_id, 'event-' || left(event_row.id::text, 8) as event_reference,
+            event_row.title, event_row.starts_at, event_row.ends_at, event_row.time_zone,
+            event_row.venue_name, event_row.venue_address, event_row.canceled_at,
+            order_row.order_reference, order_row.delivery_email
+     from hpos.orders order_row
+     join hpos.events event_row on event_row.id = order_row.event_id and event_row.site_id = order_row.site_id
+     where order_row.site_id = $1 and order_row.id = $2 and event_row.is_canceled`,
+    [attempt.site_id, attempt.order_id],
+  );
+  const row = details.rows[0];
+  if (!row) return;
+  const existing = await client.query(
+    `select id from hpos.notification_jobs
+     where site_id = $1 and event_id = $2 and order_id = $3 and kind = 'event_canceled'
+     limit 1`,
+    [attempt.site_id, row.event_id, attempt.order_id],
+  );
+  if (existing.rows[0]) return;
+  await enqueueNotificationJob(client, {
+    siteId: attempt.site_id,
+    kind: "event_canceled",
+    eventId: row.event_id,
+    orderId: attempt.order_id,
+    payload: {
+      recipient_email: row.delivery_email,
+      order: { order_id: attempt.order_id, order_reference: row.order_reference },
+      event: {
+        event_id: row.event_id,
+        event_reference: row.event_reference,
+        title: row.title,
+        starts_at: row.starts_at.toISOString(),
+        ends_at: row.ends_at.toISOString(),
+        time_zone: row.time_zone,
+        venue: { name: row.venue_name, address: row.venue_address },
+      },
+      canceled_at: row.canceled_at.toISOString(),
+    },
+  });
 }
 
 interface PaymentReportRow {
@@ -286,15 +342,35 @@ async function lockAttempt(client: PoolClient, siteId: string, attemptId: string
     `select attempt.*, order_row.checkout_status, order_row.checkout_expires_at,
             order_row.payment_status, order_row.issuance_status,
             reservation.status as reservation_status,
+            event_row.is_canceled as event_is_canceled,
             order_row.checkout_expires_at <= clock_timestamp() as checkout_expired
      from hpos.payment_attempts attempt
      join hpos.orders order_row on order_row.id = attempt.order_id and order_row.site_id = attempt.site_id
      join hpos.reservations reservation on reservation.order_id = order_row.id and reservation.site_id = order_row.site_id
+     join hpos.events event_row on event_row.id = order_row.event_id and event_row.site_id = order_row.site_id
      where attempt.id = $1 and attempt.site_id = $2
      for update of attempt, order_row, reservation`,
     [attemptId, siteId],
   );
   return result.rows[0] ?? null;
+}
+
+async function lockAttemptEvent(client: PoolClient, siteId: string, attemptId: string): Promise<void> {
+  // Payment reports and cancellation take the Event lock before locking the
+  // attempt, Order, and Reservation. This gives the race one transaction order.
+  const order = await client.query<{ event_id: string }>(
+    `select order_row.event_id
+     from hpos.payment_attempts attempt
+     join hpos.orders order_row on order_row.id = attempt.order_id and order_row.site_id = attempt.site_id
+     where attempt.id = $1 and attempt.site_id = $2`,
+    [attemptId, siteId],
+  );
+  const eventId = order.rows[0]?.event_id;
+  if (!eventId) return;
+  await client.query(
+    `select id from hpos.events where id = $1 and site_id = $2 for update`,
+    [eventId, siteId],
+  );
 }
 
 async function addConflictIssue(client: PoolClient, attempt: LockedAttempt, reportId: string, message: string): Promise<void> {
@@ -378,6 +454,7 @@ async function createPaymentReport(
   input: ReportInput,
   options: { allowOpenConflict?: boolean } = {},
 ): Promise<IdempotentResult> {
+  await lockAttemptEvent(client, site.siteId, attemptId);
   const attempt = await lockAttempt(client, site.siteId, attemptId);
   if (!attempt) throw new ApiOperationError(404, "not_found", "The payment attempt is not available to this Site.");
 
@@ -479,10 +556,14 @@ async function createPaymentReport(
     return reportResult(reportId, false, refreshed ?? attempt, attempt.order_id);
   }
 
+  const confirmedNonPayment = (input.outcome === "failed" || input.outcome === "canceled")
+    && input.provider_can_take_payment === false;
   const nextAttemptStatus = input.outcome === "paid" ? "closed"
-    : input.outcome === "failed" || input.outcome === "canceled"
-      ? input.provider_can_take_payment === false ? "closed" : input.provider_can_take_payment === true ? "open" : "requires_verification"
-      : input.outcome === "processing" && input.provider_can_take_payment === true ? "open" : "requires_verification";
+    : attempt.event_is_canceled
+      ? confirmedNonPayment ? "closed" : "requires_verification"
+      : input.outcome === "failed" || input.outcome === "canceled"
+        ? input.provider_can_take_payment === false ? "closed" : input.provider_can_take_payment === true ? "open" : "requires_verification"
+        : input.outcome === "processing" && input.provider_can_take_payment === true ? "open" : "requires_verification";
   const paymentCanContinue = input.outcome !== "paid" && input.provider_can_take_payment === true;
   const nextProviderCanTakePayment = input.outcome === "paid" ? false : input.provider_can_take_payment;
   const updatedAttempt = await client.query<AttemptRow>(
@@ -496,10 +577,12 @@ async function createPaymentReport(
   const nextPaymentStatus = input.outcome === "paid" ? "paid"
     : input.outcome === "processing" ? "processing"
       : input.outcome === "unknown" ? "unknown" : "failed";
-  const nextCheckoutStatus = input.outcome === "paid" ? "ended"
-    : input.outcome === "failed" || input.outcome === "canceled"
-      ? input.provider_can_take_payment === false ? attempt.checkout_expired ? "expired" : "active" : "awaiting_payment_result"
-      : "awaiting_payment_result";
+  const nextCheckoutStatus = attempt.event_is_canceled
+    ? input.outcome === "paid" || confirmedNonPayment ? "ended" : "awaiting_payment_result"
+    : input.outcome === "paid" ? "ended"
+      : input.outcome === "failed" || input.outcome === "canceled"
+        ? input.provider_can_take_payment === false ? attempt.checkout_expired ? "expired" : "active" : "awaiting_payment_result"
+        : "awaiting_payment_result";
   await client.query(
     `update hpos.orders
      set payment_status = $3, checkout_status = $4,
@@ -512,9 +595,9 @@ async function createPaymentReport(
     `update hpos.reservations
      set awaiting_provider_verification = $3, updated_at = clock_timestamp()
      where order_id = $1 and site_id = $2 and status = 'held'`,
-    [attempt.order_id, site.siteId, input.outcome === "paid" ? false : paymentCanContinue || input.outcome === "processing" || input.outcome === "unknown" || input.provider_can_take_payment === null],
+    [attempt.order_id, site.siteId, input.outcome === "paid" ? false : !confirmedNonPayment && (paymentCanContinue || input.outcome === "processing" || input.outcome === "unknown" || input.provider_can_take_payment === null)],
   );
-  if ((input.outcome === "failed" || input.outcome === "canceled") && input.provider_can_take_payment === false && attempt.checkout_expired) {
+  if (confirmedNonPayment && (attempt.event_is_canceled || attempt.checkout_expired)) {
     await releaseExpiredReservation(client, attempt);
   }
   await client.query(
@@ -523,6 +606,9 @@ async function createPaymentReport(
      where id = $1 and site_id = $2`,
     [reportId, site.siteId],
   );
+  if (input.outcome === "paid" && attempt.event_is_canceled) {
+    await enqueueLateCancellationNotice(client, { ...attempt, ...updatedAttempt.rows[0] });
+  }
   const refreshed = await lockAttempt(client, site.siteId, attempt.id);
   return reportResult(reportId, true, refreshed ?? { ...attempt, ...updatedAttempt.rows[0] }, attempt.order_id);
 }
@@ -533,6 +619,7 @@ async function resolvePaymentConflict(
   attemptId: string,
   input: ResolutionInput,
 ): Promise<IdempotentResult> {
+  await lockAttemptEvent(client, site.siteId, attemptId);
   const attempt = await lockAttempt(client, site.siteId, attemptId);
   if (!attempt) throw new ApiOperationError(404, "not_found", "The payment attempt is not available to this Site.");
   if (attempt.version !== input.expected_version) {

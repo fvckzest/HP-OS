@@ -524,6 +524,127 @@ async function enqueueEventChangeNotifications(
   }
 }
 
+async function terminateCanceledEventCheckouts(client: PoolClient, siteId: string, eventId: string): Promise<void> {
+  // HP-OS can end unpaid checkout permission, but the Site must verify any
+  // provider-capable or uncertain checkout before its Reservation is released.
+  await client.query(
+    `update hpos.payment_attempts attempt
+     set status = 'requires_verification', version = attempt.version + 1, updated_at = clock_timestamp()
+     from hpos.orders order_row
+     where order_row.id = attempt.order_id and order_row.site_id = attempt.site_id
+       and order_row.site_id = $1 and order_row.event_id = $2
+       and order_row.payment_status <> 'paid'
+       and attempt.status in ('creating', 'open', 'requires_verification')
+       and (attempt.last_outcome is null
+         or attempt.last_outcome in ('processing', 'unknown')
+         or attempt.provider_can_take_payment is distinct from false)`,
+    [siteId, eventId],
+  );
+
+  await client.query(
+    `update hpos.orders order_row
+     set checkout_status = case
+           when order_row.payment_status in ('unpaid', 'failed')
+             and not exists (
+               select 1 from hpos.payment_attempts attempt
+               where attempt.site_id = order_row.site_id and attempt.order_id = order_row.id
+                 and attempt.status = 'requires_verification'
+             ) then 'ended'
+           else 'awaiting_payment_result'
+         end,
+         version = version + 1, updated_at = clock_timestamp()
+     where order_row.site_id = $1 and order_row.event_id = $2
+       and order_row.payment_status <> 'paid'`,
+    [siteId, eventId],
+  );
+
+  const released = await client.query<{ offering_id: string; quantity: string }>(
+    `with released as (
+       update hpos.reservations reservation
+       set status = 'released', awaiting_provider_verification = false, updated_at = clock_timestamp()
+       from hpos.orders order_row
+       where order_row.id = reservation.order_id and order_row.site_id = reservation.site_id
+         and reservation.site_id = $1 and reservation.event_id = $2
+         and reservation.status = 'held'
+         and order_row.payment_status in ('unpaid', 'failed')
+         and not exists (
+           select 1 from hpos.payment_attempts attempt
+           where attempt.site_id = order_row.site_id and attempt.order_id = order_row.id
+             and attempt.status = 'requires_verification'
+         )
+       returning reservation.offering_id, reservation.quantity
+     )
+     select offering_id, sum(quantity)::bigint as quantity
+     from released group by offering_id`,
+    [siteId, eventId],
+  );
+  for (const reservation of released.rows) {
+    const updated = await client.query(
+      `update hpos.ticket_offerings
+       set reserved_quantity = reserved_quantity - $3::bigint
+       where id = $1 and site_id = $2 and reserved_quantity >= $3::bigint
+       returning id`,
+      [reservation.offering_id, siteId, reservation.quantity],
+    );
+    if (updated.rowCount !== 1) throw new Error("The canceled Event Reservation could not be released safely.");
+  }
+
+  await client.query(
+    `update hpos.reservations reservation
+     set awaiting_provider_verification = true, updated_at = clock_timestamp()
+     from hpos.orders order_row
+     where order_row.id = reservation.order_id and order_row.site_id = reservation.site_id
+       and reservation.site_id = $1 and reservation.event_id = $2
+       and reservation.status = 'held'
+       and (order_row.payment_status not in ('unpaid', 'failed') or exists (
+         select 1 from hpos.payment_attempts attempt
+         where attempt.site_id = order_row.site_id and attempt.order_id = order_row.id
+           and attempt.status = 'requires_verification'
+       ))`,
+    [siteId, eventId],
+  );
+}
+
+async function enqueueEventCancellationNotifications(
+  client: PoolClient,
+  siteId: string,
+  event: EventRow,
+  canceledAt: Date,
+): Promise<void> {
+  await supersedeUnsentNotificationJobs(client, { siteId, eventId: event.id, kinds: ["event_changed"] });
+  const fullDetails = eventNotificationDetails(event, []);
+  const details = {
+    event_id: fullDetails.event_id,
+    event_reference: fullDetails.event_reference,
+    title: fullDetails.title,
+    starts_at: fullDetails.starts_at,
+    ends_at: fullDetails.ends_at,
+    time_zone: fullDetails.time_zone,
+    venue: fullDetails.venue,
+  };
+  const orders = await client.query<{ id: string; order_reference: string; delivery_email: string }>(
+    `select id, order_reference, delivery_email
+     from hpos.orders
+     where site_id = $1 and event_id = $2 and payment_status = 'paid'
+     order by created_at, id`,
+    [siteId, event.id],
+  );
+  for (const order of orders.rows) {
+    await enqueueNotificationJob(client, {
+      siteId,
+      kind: "event_canceled",
+      eventId: event.id,
+      orderId: order.id,
+      payload: {
+        recipient_email: order.delivery_email,
+        order: { order_id: order.id, order_reference: order.order_reference },
+        event: details,
+        canceled_at: canceledAt.toISOString(),
+      },
+    });
+  }
+}
+
 async function createDraft(client: PoolClient, site: AuthenticatedSite, input: EventInput): Promise<{ status: number; data: unknown }> {
   const eventId = randomUUID();
   const offeringId = randomUUID();
@@ -866,16 +987,21 @@ async function writeEventAction(client: PoolClient, site: AuthenticatedSite, eve
     o.sales_closes_at, o.sales_closes_offset_minutes
     from hpos.events e join hpos.ticket_offerings o on o.id=e.ticket_offering_id
       and o.event_id=e.id and o.site_id=e.site_id where e.site_id=$1 and e.id=$2
-      for update of e, o`, [site.siteId, eventId]);
+      ${action === "cancel" ? "for update of e" : "for update of e, o"}`, [site.siteId, eventId]);
   const current = selected.rows[0];
   if (!current) operationError(404, "not_found", "The Event is not available to this Site.");
   if (current.version !== expected) operationError(409, "version_conflict", "The Event changed after you loaded it. Reload it before taking this action.");
   const now = Date.now();
-  let column: string;
+  let column: string | null = null;
   let value: unknown;
   if (action === "publish") {
     if (current.publication_status !== "draft") operationError(409, "invalid_state", "Only a draft Event can be published.");
     validatePublish(current); column = "publication_status"; value = "published";
+  } else if (action === "cancel") {
+    if (current.publication_status !== "published" || current.is_archived || current.is_canceled
+      || !current.ends_at || current.ends_at.getTime() <= now) {
+      operationError(409, "invalid_state", "Only a current, published Event can be canceled.");
+    }
   } else if (action === "archive") {
     if (current.publication_status !== "published" || current.is_archived || (!current.is_canceled && (!current.ends_at || current.ends_at.getTime() > now))) operationError(409, "invalid_state", "Only an ended or canceled published Event can be archived.");
     column = "is_archived"; value = true;
@@ -904,7 +1030,23 @@ async function writeEventAction(client: PoolClient, site: AuthenticatedSite, eve
     }
     column = "sales_paused"; value = false;
   } else operationError(404, "not_found", "The Event action is unavailable.");
-  await client.query(`update hpos.events set ${column}=$3, version=version+1, updated_at=clock_timestamp(), updated_actor_type=$4, updated_actor_reference=$5 where site_id=$1 and id=$2`, [site.siteId, eventId, value, actor.type, actor.reference]);
+  if (action === "cancel") {
+    const canceled = await client.query<{ canceled_at: Date }>(
+      `update hpos.events
+       set is_canceled = true, sales_paused = true, canceled_at = clock_timestamp(), version = version + 1,
+           updated_at = clock_timestamp(), updated_actor_type = $3, updated_actor_reference = $4
+       where site_id = $1 and id = $2
+       returning canceled_at`,
+      [site.siteId, eventId, actor.type, actor.reference],
+    );
+    const canceledAt = canceled.rows[0]?.canceled_at;
+    if (!canceledAt) throw new Error("The canceled Event timestamp could not be read.");
+    await terminateCanceledEventCheckouts(client, site.siteId, eventId);
+    await enqueueEventCancellationNotifications(client, site.siteId, { ...current, is_canceled: true }, canceledAt);
+  } else {
+    if (column === null) throw new Error("The Event action has no state update.");
+    await client.query(`update hpos.events set ${column}=$3, version=version+1, updated_at=clock_timestamp(), updated_actor_type=$4, updated_actor_reference=$5 where site_id=$1 and id=$2`, [site.siteId, eventId, value, actor.type, actor.reference]);
+  }
   const event = await readAdminEvent(client, site.siteId, eventId);
   if (!event) throw new Error("Changed Event could not be read.");
   return { status: 200, data: event };

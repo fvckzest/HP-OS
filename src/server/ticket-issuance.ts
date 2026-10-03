@@ -253,6 +253,17 @@ async function recordIssuanceFailure(siteId: string, orderId: string): Promise<v
 }
 
 async function readIssuanceRow(client: PoolClient, siteId: string, orderId: string): Promise<IssuanceRow | null> {
+  const orderEvent = await client.query<{ event_id: string }>(
+    `select event_id from hpos.orders where id = $1 and site_id = $2`,
+    [orderId, siteId],
+  );
+  const eventId = orderEvent.rows[0]?.event_id;
+  if (!eventId) return null;
+  await client.query(
+    `select id from hpos.events where id = $1 and site_id = $2 for update`,
+    [eventId, siteId],
+  );
+
   const result = await client.query<IssuanceRow>(
     `select order_row.id as order_id, event_row.id, order_row.buyer_id, order_row.quote_id, order_row.site_id, order_row.event_id,
             order_row.offering_id as ticket_offering_id, order_row.order_reference,
@@ -326,6 +337,26 @@ export async function issuePaidOrder(siteId: string, orderId: string): Promise<{
       blockMessage = "The paid Order has no recoverable buyer access token, so issuance needs staff investigation.";
     }
     if (blockCode) {
+      if (blockCode === "event_canceled" && row.reservation_status === "held") {
+        const released = await client.query<{ quantity: number }>(
+          `update hpos.reservations
+           set status = 'released', awaiting_provider_verification = false, updated_at = clock_timestamp()
+           where id = $1 and site_id = $2 and status = 'held'
+           returning quantity`,
+          [row.reservation_id, siteId],
+        );
+        const quantity = released.rows[0]?.quantity;
+        if (quantity !== undefined) {
+          const capacity = await client.query(
+            `update hpos.ticket_offerings
+             set reserved_quantity = reserved_quantity - $3
+             where id = $1 and site_id = $2 and reserved_quantity >= $3
+             returning id`,
+            [row.ticket_offering_id, siteId, quantity],
+          );
+          if (capacity.rowCount !== 1) throw new Error("The canceled paid Order Reservation could not be released safely.");
+        }
+      }
       await client.query(
         `update hpos.orders
          set issuance_status = 'blocked', version = version + 1, updated_at = clock_timestamp()
