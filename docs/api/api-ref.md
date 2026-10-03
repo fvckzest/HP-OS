@@ -104,7 +104,7 @@ Paths are relative to the base URL. `{...}` identifies a path parameter. All end
 | `GET /v1/admin/events/{event_id}` | Read Event configuration and operational state. |
 | `POST /v1/admin/events` | Create an incomplete draft. |
 | `PATCH /v1/admin/events/{event_id}` | Edit supplied Event/offering fields. |
-| `POST /v1/admin/events/{event_id}/actions/{action}` | Publish a draft or archive an eligible published Event. Other Event actions are later work. |
+| `POST /v1/admin/events/{event_id}/actions/{action}` | Publish, archive, cancel, stop sales, or resume sales using a guarded action. |
 | `PUT /v1/admin/events/{event_id}/provider-mappings/{connection_id}` | Set a verified provider resource mapping. |
 | `DELETE /v1/admin/events/{event_id}/provider-mappings/{connection_id}` | Remove a mapping for future Orders. |
 
@@ -168,6 +168,7 @@ Claims and reports require a Site API key, a UUID `Idempotency-Key`, and a syste
 | --- | --- | --- |
 | Event | `publish` | Make a valid draft publicly discoverable. |
 | Event | `archive` | Archive an ended/canceled Event; retain history. |
+| Event | `cancel` | Stop new Orders and Admission, retain uncertain payment holds, and queue paid-buyer notices; does not refund. |
 | Event | `stop_sales` | Pause new checkout for an eligible published Event. |
 | Event | `resume_sales` | Resume a paused Event when its window and capacity permit sales. |
 | Order | `retry_ticket_issuance` | Retry the complete Ticket set for verified payment. |
@@ -178,7 +179,7 @@ Claims and reports require a Site API key, a UUID `Idempotency-Key`, and a syste
 | Access Request | `undo_decision` | Return to pending; revoke approval access if applicable. |
 | Payment attempt | `resolve` | Apply corrected verified evidence; retain history. |
 
-The local Event handler supports `publish`, `archive`, `stop_sales`, and `resume_sales`. `cancel` remains later contract work and returns `404 not_found`. See the [full contract](api.md#admin-event-endpoints) for local implementation boundaries and action requirements.
+The local Event handler supports `publish`, `archive`, `cancel`, `stop_sales`, and `resume_sales`. Event cancellation does not initiate refunds; the Site worker sends the durable `event_canceled` notifications. See the [full contract](api.md#admin-event-endpoints) for action rules.
 
 ## Parameters
 

@@ -54,6 +54,7 @@ export interface AttemptRow extends QueryResultRow {
   checkout_expires_at: Date;
   payment_status: "unpaid" | "processing" | "paid" | "failed" | "unknown" | "conflicted";
   reservation_status: "held" | "consumed" | "released";
+  event_is_canceled?: boolean;
 }
 
 interface PaymentAttemptListRow extends AttemptRow {
@@ -293,6 +294,8 @@ function rejectCheckoutReferenceConflict(sameSite: boolean): never {
 }
 
 async function createAttempt(client: PoolClient, site: AuthenticatedSite, orderId: string): Promise<IdempotentResult> {
+  const event = await lockOrderEvent(client, site.siteId, orderId);
+  if (event.is_canceled) reject(409, "checkout_ended", "This Event was canceled before provider checkout could start.");
   const orderResult = await client.query<{
     id: string;
     payment_connection_id: string | null;
@@ -400,10 +403,12 @@ async function createAttempt(client: PoolClient, site: AuthenticatedSite, orderI
 async function lockAttempt(client: PoolClient, siteId: string, attemptId: string): Promise<AttemptRow> {
   const result = await client.query<AttemptRow>(
     `select attempt.*, order_row.checkout_status, order_row.checkout_expires_at,
-            order_row.payment_status, reservation.status as reservation_status
+            order_row.payment_status, reservation.status as reservation_status,
+            event_row.is_canceled as event_is_canceled
      from hpos.payment_attempts attempt
      join hpos.orders order_row on order_row.id = attempt.order_id and order_row.site_id = attempt.site_id
      join hpos.reservations reservation on reservation.order_id = order_row.id and reservation.site_id = order_row.site_id
+     join hpos.events event_row on event_row.id = order_row.event_id and event_row.site_id = order_row.site_id
      where attempt.id = $1 and attempt.site_id = $2
      for update of attempt, order_row, reservation`,
     [attemptId, siteId],
@@ -411,6 +416,43 @@ async function lockAttempt(client: PoolClient, siteId: string, attemptId: string
   const row = result.rows[0];
   if (!row) reject(404, "not_found", "The payment attempt is not available to this Site.");
   return row;
+}
+
+async function lockOrderEvent(
+  client: PoolClient,
+  siteId: string,
+  orderId: string,
+): Promise<{ id: string; is_canceled: boolean }> {
+  const eventId = await client.query<{ event_id: string }>(
+    `select event_id from hpos.orders where id = $1 and site_id = $2`,
+    [orderId, siteId],
+  );
+  const id = eventId.rows[0]?.event_id;
+  if (!id) reject(404, "not_found", "The Order is not available to this Site.");
+  const locked = await client.query<{ id: string; is_canceled: boolean }>(
+    `select id, is_canceled from hpos.events where id = $1 and site_id = $2 for update`,
+    [id, siteId],
+  );
+  const row = locked.rows[0];
+  if (!row) reject(404, "not_found", "The Order is not available to this Site.");
+  return row;
+}
+
+async function lockAttemptEvent(client: PoolClient, siteId: string, attemptId: string): Promise<void> {
+  const order = await client.query<{ event_id: string }>(
+    `select order_row.event_id
+     from hpos.payment_attempts attempt
+     join hpos.orders order_row on order_row.id = attempt.order_id and order_row.site_id = attempt.site_id
+     where attempt.id = $1 and attempt.site_id = $2`,
+    [attemptId, siteId],
+  );
+  const eventId = order.rows[0]?.event_id;
+  if (!eventId) reject(404, "not_found", "The payment attempt is not available to this Site.");
+  const locked = await client.query(
+    `select id from hpos.events where id = $1 and site_id = $2 for update`,
+    [eventId, siteId],
+  );
+  if (!locked.rows[0]) reject(404, "not_found", "The payment attempt is not available to this Site.");
 }
 
 function validateAttemptConnection(attempt: AttemptRow, connectionId: unknown): void {
@@ -436,6 +478,7 @@ async function registerCheckoutReference(
     const payload = await actor.json() as { error?: { details?: Array<{ field: string; code: string; message: string }> } };
     reject(422, "validation_failed", "Provide a valid actor reference.", payload.error?.details ?? []);
   }
+  await lockAttemptEvent(client, site.siteId, attemptId);
   const attempt = await lockAttempt(client, site.siteId, attemptId);
   validateAttemptConnection(attempt, body.connection_id);
   if (attempt.checkout_status === "ended") {
@@ -490,10 +533,11 @@ async function registerCheckoutReference(
     const updated = await client.query<AttemptRow>(
       `update hpos.payment_attempts
        set provider_checkout_reference = $3, provider_can_take_payment = true,
-           status = 'open', version = version + 1, updated_at = clock_timestamp()
+           status = case when $4::boolean then 'requires_verification' else 'open' end,
+           version = version + 1, updated_at = clock_timestamp()
        where id = $1 and site_id = $2
        returning *`,
-      [attemptId, site.siteId, checkoutReference],
+      [attemptId, site.siteId, checkoutReference, attempt.event_is_canceled === true],
     );
     await client.query("release savepoint checkout_reference_registration");
     return { status: 200, data: paymentAttemptData(updated.rows[0]) };
@@ -608,6 +652,7 @@ async function reportSetupFailure(
       { field: "payment_outcome", code: "invalid_outcome", message: "Uncertain or processing payments cannot release capacity." },
     ]);
   }
+  await lockAttemptEvent(client, site.siteId, attemptId);
   const attempt = await lockAttempt(client, site.siteId, attemptId);
   if (attempt.provider_checkout_reference === null && body.payment_outcome !== "not_started") {
     reject(409, "provider_reference_missing", "A payment outcome requires a recorded provider checkout reference.");
@@ -617,8 +662,9 @@ async function reportSetupFailure(
      from hpos.orders where id = $1 and site_id = $2`,
     [attempt.order_id, site.siteId],
   );
-  const expired = deadline.rows[0]?.expired || attempt.checkout_status === "expired" || attempt.checkout_status === "ended";
-  const updated = await closeAttempt(client, site.siteId, attempt, body.payment_outcome, true, expired ? "expired" : "ended");
+  const expired = deadline.rows[0]?.expired || attempt.checkout_status === "expired" || attempt.checkout_status === "ended" || attempt.event_is_canceled;
+  const nextCheckoutStatus = attempt.event_is_canceled ? "ended" : expired ? "expired" : "ended";
+  const updated = await closeAttempt(client, site.siteId, attempt, body.payment_outcome, true, nextCheckoutStatus);
   return { status: 200, data: paymentAttemptData(updated) };
 }
 
@@ -652,6 +698,7 @@ async function reportClosure(
     reject(422, "validation_failed", "A closure report requires a verified not_started, failed, or canceled outcome.");
   }
 
+  await lockAttemptEvent(client, site.siteId, attemptId);
   const attempt = await lockAttempt(client, site.siteId, attemptId);
   validateAttemptConnection(attempt, body.connection_id);
   const checkoutReference = body.provider_checkout_reference.trim();
@@ -695,7 +742,7 @@ async function reportClosure(
     `select $1::timestamptz <= clock_timestamp() as expired`,
     [attempt.checkout_expires_at],
   );
-  const expired = clock.rows[0].expired || attempt.checkout_status === "expired" || attempt.checkout_status === "ended";
+  const expired = clock.rows[0].expired || attempt.checkout_status === "expired" || attempt.checkout_status === "ended" || attempt.event_is_canceled === true;
   if (!attempt.provider_checkout_reference) {
     await client.query(
       `update hpos.payment_attempts
@@ -704,8 +751,10 @@ async function reportClosure(
       [attempt.id, site.siteId, checkoutReference],
     );
   }
-  const updated = await closeAttempt(client, site.siteId, attempt, body.payment_outcome, expired,
-    expired ? attempt.checkout_status === "ended" ? "ended" : "expired" : "active");
+  const nextCheckoutStatus = attempt.event_is_canceled
+    ? "ended"
+    : expired ? attempt.checkout_status === "ended" ? "ended" : "expired" : "active";
+  const updated = await closeAttempt(client, site.siteId, attempt, body.payment_outcome, expired, nextCheckoutStatus);
   if (!attempt.provider_checkout_reference) {
     const reloaded = await client.query<AttemptRow>(
       `select * from hpos.payment_attempts where id = $1 and site_id = $2`,

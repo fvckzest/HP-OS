@@ -1063,13 +1063,13 @@ async function verifyPaymentReportsAndTicketIssuance(site) {
     "A fully refunded paid Order accepted a Ticket-issuance retry.");
   await pool.query(`update hpos.orders set refund_status = 'none' where site_id = $1 and id = $2`, [site.siteId, guardedOrderId]);
 
-  await pool.query(`update hpos.events set is_canceled = true where site_id = $1 and id = (select event_id from hpos.orders where id = $2)`, [site.siteId, guardedOrderId]);
+  await pool.query(`update hpos.events set is_canceled = true, canceled_at = clock_timestamp() where site_id = $1 and id = (select event_id from hpos.orders where id = $2)`, [site.siteId, guardedOrderId]);
   const canceledRetry = await api(site, `/v1/admin/orders/${guardedOrderId}/actions/retry_ticket_issuance`, {
     method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "user", reference: "test:issue-36" }, expected_version: guardedVersion },
   });
   assert(canceledRetry.status === 409 && canceledRetry.data?.error?.code === "invalid_state",
     "A canceled Event accepted a Ticket-issuance retry.");
-  await pool.query(`update hpos.events set is_canceled = false where site_id = $1 and id = (select event_id from hpos.orders where id = $2)`, [site.siteId, guardedOrderId]);
+  await pool.query(`update hpos.events set is_canceled = false, canceled_at = null where site_id = $1 and id = (select event_id from hpos.orders where id = $2)`, [site.siteId, guardedOrderId]);
 
   const guardedRetry = await api(site, `/v1/admin/orders/${guardedOrderId}/actions/retry_ticket_issuance`, {
     method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "user", reference: "test:issue-36" }, expected_version: guardedVersion },
@@ -1190,12 +1190,12 @@ async function verifyPaymentReportsAndTicketIssuance(site) {
     && tooEarlyReplay.status === 409 && tooEarlyReplay.data.error.code === "check_in_not_open",
     "An early Admission was not rejected or replayed consistently.");
 
-  await pool.query("update hpos.events set check_in_opens_at = clock_timestamp() - interval '30 minutes', check_in_opens_offset_minutes = 0, is_canceled = true where id = $1", [event.event_id]);
+  await pool.query("update hpos.events set check_in_opens_at = clock_timestamp() - interval '30 minutes', check_in_opens_offset_minutes = 0, is_canceled = true, canceled_at = clock_timestamp() where id = $1", [event.event_id]);
   await pool.query("update hpos.orders set refund_status = 'full' where id = $1", [orderId]);
   const canceled = await api(site, `/v1/admin/events/${event.event_id}/admissions`, {
     method: "POST", idempotencyKey: randomUUID(), body: tooEarlyBody,
   });
-  await pool.query("update hpos.events set is_canceled = false where id = $1", [event.event_id]);
+  await pool.query("update hpos.events set is_canceled = false, canceled_at = null where id = $1", [event.event_id]);
   const refunded = await api(site, `/v1/admin/events/${event.event_id}/admissions`, {
     method: "POST", idempotencyKey: randomUUID(), body: tooEarlyBody,
   });
@@ -2471,7 +2471,7 @@ async function verifySalesControlsAndCapacity(site) {
   });
   assert(resumeWithCapacity.status === 200 && resumeWithCapacity.data.data.sales_status === "open",
     "Sales did not resume after capacity became available.");
-  await pool.query("update hpos.events set is_canceled=true, sales_paused=true where id=$1", [open.event_id]);
+  await pool.query("update hpos.events set is_canceled=true, canceled_at=clock_timestamp(), sales_paused=true where id=$1", [open.event_id]);
   const canceled = await api(site, "/v1/public/events/" + open.event_id);
   assert(canceled.data.data.sales_status === "canceled", "Canceled status did not take precedence over a manual stop.");
 }
@@ -2636,6 +2636,9 @@ async function verifyEventLifecycleAndDiscovery(site) {
   assert(archived.status === 200 && archived.data.data.is_archived, "Archiving an ended Event failed.");
   const archivedDetail = await api(site, "/v1/public/events/" + past.event_id);
   assert(archivedDetail.status === 200 && archivedDetail.data.data.is_archived, "Published archived Event detail was not retained.");
+  const archivedPastList = await api(site, "/v1/public/events?period=past");
+  assert(archivedPastList.status === 200 && archivedPastList.data.data.some((event) => event.event_id === past.event_id),
+    "Archiving an ended Event removed it from public past-event discovery.");
 
   const other = createSiteFixture();
   const crossSite = await api(other, "/v1/public/events/" + draft.event_id);
@@ -2826,6 +2829,257 @@ async function verifyEventChangeNotifications(site) {
   "Rescheduling an Event changed its explicitly configured check-in opening.");
 }
 
+async function verifyEventCancellation(site) {
+  const now = Date.now();
+  const event = await createPublishedEvent(site, {
+    title: "Issue 41 Event Cancellation Verification",
+    startsAt: new Date(now + 24 * 60 * 60_000).toISOString(),
+    endsAt: new Date(now + 48 * 60 * 60_000).toISOString(),
+    timeZone: "UTC",
+    ticketOffering: { price: { amount: 2500, currency: "USD" }, capacity: 8, tax_amount: 0, buyer_fees: [] },
+  });
+  const paidBuyer = await createPaidOrderForEventChange(site, event, "issue41-paid");
+
+  async function createProviderCheckout(label) {
+    const quote = await api(site, `/v1/public/events/${event.event_id}/quotes`, {
+      method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
+    });
+    assert(quote.status === 201, `The Issue #41 ${label} buyer could not get a quote.`);
+    const order = await api(site, "/v1/public/orders", {
+      method: "POST", idempotencyKey: randomUUID(),
+      body: { quote_id: quote.data.data.quote_id, buyer: { name: `Issue 41 ${label}`, email: `${label}-${randomUUID()}@example.test` } },
+    });
+    assert(order.status === 201, `The Issue #41 ${label} Order could not be created.`);
+    const attempt = await api(site, `/v1/admin/orders/${order.data.data.order_id}/payment-attempts`, {
+      method: "POST", idempotencyKey: randomUUID(),
+      body: { actor: { type: "system", reference: "test:issue-41" } },
+    });
+    assert(attempt.status === 201, `The Issue #41 ${label} payment attempt could not be created.`);
+    const checkoutReference = `square-issue41-${label}-${randomUUID()}`;
+    const registered = await api(site, `/v1/admin/payment-attempts/${attempt.data.data.attempt_id}/checkout-reference`, {
+      method: "POST", idempotencyKey: randomUUID(), body: {
+        actor: { type: "system", reference: "test:issue-41" },
+        connection_id: site.connectionId,
+        provider_checkout_reference: checkoutReference,
+        provider_can_take_payment: true,
+      },
+    });
+    assert(registered.status === 200, `The Issue #41 ${label} provider checkout could not be registered.`);
+    return { order: order.data.data, attempt: attempt.data.data, checkoutReference };
+  }
+
+  const unpaidQuote = await api(site, `/v1/public/events/${event.event_id}/quotes`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
+  });
+  const unpaid = await api(site, "/v1/public/orders", {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { quote_id: unpaidQuote.data.data.quote_id, buyer: { name: "Issue 41 Unpaid Buyer", email: "issue41-unpaid@example.test" } },
+  });
+  assert(unpaidQuote.status === 201 && unpaid.status === 201, "The Issue #41 unpaid Order fixture could not be created.");
+  const verifiedCheckout = await createProviderCheckout("verify");
+  const racingCheckout = await createProviderCheckout("race");
+
+  const cancelKey = randomUUID();
+  const cancelBody = { actor: { type: "user", reference: "test:issue-41-staff" }, expected_version: event.version };
+  const cancelUrl = `/v1/admin/events/${event.event_id}/actions/cancel`;
+  const suffix = randomUUID().replaceAll("-", "");
+  const sequenceName = `hpos.issue41_event_jobs_${suffix}`;
+  const functionName = `hpos.issue41_fail_event_job_${suffix}`;
+  const triggerName = `issue41_fail_event_job_${suffix}`;
+  await pool.query(`create sequence ${sequenceName}`);
+  await pool.query(`create function ${functionName}() returns trigger language plpgsql as $$
+    begin
+      if new.kind = 'event_canceled' then
+        raise exception 'injected Issue #41 cancellation fan-out interruption';
+      end if;
+      return new;
+    end;
+  $$`);
+  await pool.query(`create trigger ${triggerName} before insert on hpos.notification_jobs
+    for each row execute function ${functionName}()`);
+  let interrupted;
+  try {
+    interrupted = await api(site, cancelUrl, { method: "POST", idempotencyKey: cancelKey, body: cancelBody });
+  } finally {
+    await pool.query(`drop trigger ${triggerName} on hpos.notification_jobs`);
+    await pool.query(`drop function ${functionName}()`);
+    await pool.query(`drop sequence ${sequenceName}`);
+  }
+  const afterInterruptedCancel = await pool.query(
+    `select is_canceled, sales_paused, version from hpos.events where site_id = $1 and id = $2`,
+    [site.siteId, event.event_id],
+  );
+  const interruptedJobs = await pool.query(
+    `select count(*)::integer as count from hpos.notification_jobs
+     where site_id = $1 and event_id = $2 and kind = 'event_canceled'`,
+    [site.siteId, event.event_id],
+  );
+  assert(interrupted.status === 503 && interrupted.data.error.code === "service_unavailable"
+    && afterInterruptedCancel.rows[0]?.is_canceled === false
+    && afterInterruptedCancel.rows[0]?.sales_paused === false
+    && afterInterruptedCancel.rows[0]?.version === event.version
+    && interruptedJobs.rows[0]?.count === 0,
+  "An interrupted cancellation notification fan-out left partial cancellation state or jobs.");
+
+  const paymentObservedAt = new Date().toISOString();
+  const racingPaymentBody = {
+    connection_id: site.connectionId,
+    source_reference: `square-issue41-payment-${randomUUID()}`,
+    provider_checkout_reference: racingCheckout.checkoutReference,
+    provider_payment_reference: `square-payment-issue41-${randomUUID()}`,
+    outcome: "paid",
+    observed_at: paymentObservedAt,
+    payment_started_at: paymentObservedAt,
+    provider_can_take_payment: false,
+    amount: 2500,
+    currency: "USD",
+  };
+  const [canceled, racingPayment] = await Promise.all([
+    api(site, cancelUrl, { method: "POST", idempotencyKey: cancelKey, body: cancelBody }),
+    api(site, `/v1/admin/payment-attempts/${racingCheckout.attempt.attempt_id}/payment-reports`, {
+      method: "POST", idempotencyKey: randomUUID(), body: racingPaymentBody,
+    }),
+  ]);
+  assert(canceled.status === 200 && canceled.data.data.is_canceled && canceled.data.data.sales_status === "canceled"
+    && racingPayment.status === 201 && racingPayment.data.data.attempt.last_outcome === "paid",
+  "Concurrent Event cancellation and verified payment did not serialize to committed outcomes: "
+    + JSON.stringify({ canceled: canceled.data, racingPayment: racingPayment.data }));
+
+  const endedUnpaid = await api(site, `/v1/public/orders/${unpaid.data.data.order_token}`);
+  const unpaidReservation = await pool.query(
+    `select reservation.status, reservation.awaiting_provider_verification,
+            order_row.checkout_status, offering.reserved_quantity
+     from hpos.reservations reservation
+     join hpos.orders order_row on order_row.id = reservation.order_id and order_row.site_id = reservation.site_id
+     join hpos.ticket_offerings offering on offering.id = reservation.offering_id and offering.site_id = reservation.site_id
+     where reservation.site_id = $1 and reservation.order_id = $2`,
+    [site.siteId, unpaid.data.data.order_id],
+  );
+  assert(endedUnpaid.status === 200 && endedUnpaid.data.data.checkout_status === "ended"
+    && unpaidReservation.rows[0]?.status === "released"
+    && unpaidReservation.rows[0]?.awaiting_provider_verification === false,
+  "Cancellation did not end an unpaid checkout without a provider attempt and release its Reservation.");
+
+  const verificationFrontier = await api(site, `/v1/admin/payment-attempts?requires_verification=true&event_id=${event.event_id}`);
+  assert(verificationFrontier.status === 200
+    && verificationFrontier.data.data.some((attempt) => attempt.attempt_id === verifiedCheckout.attempt.attempt_id),
+  "Cancellation did not keep the provider-capable checkout in the Site verification frontier.");
+  const heldReservation = await pool.query(
+    `select attempt.status, reservation.status as reservation_status, reservation.awaiting_provider_verification,
+            order_row.checkout_status
+     from hpos.payment_attempts attempt
+     join hpos.reservations reservation on reservation.order_id = attempt.order_id and reservation.site_id = attempt.site_id
+     join hpos.orders order_row on order_row.id = attempt.order_id and order_row.site_id = attempt.site_id
+     where attempt.id = $1 and attempt.site_id = $2`,
+    [verifiedCheckout.attempt.attempt_id, site.siteId],
+  );
+  assert(heldReservation.rows[0]?.status === "requires_verification"
+    && heldReservation.rows[0]?.reservation_status === "held"
+    && heldReservation.rows[0]?.awaiting_provider_verification === true
+    && heldReservation.rows[0]?.checkout_status === "awaiting_payment_result",
+  "Cancellation released capacity while the Site still had to verify a provider-capable checkout.");
+
+  const closedCheckout = await api(site, `/v1/admin/payment-attempts/${verifiedCheckout.attempt.attempt_id}/closure-reports`, {
+    method: "POST", idempotencyKey: randomUUID(), body: {
+      actor: { type: "system", reference: "test:issue-41" },
+      connection_id: site.connectionId,
+      source_reference: `square-issue41-closed-${randomUUID()}`,
+      provider_checkout_reference: verifiedCheckout.checkoutReference,
+      observed_at: new Date().toISOString(),
+      provider_checkout_closed: true,
+      payment_outcome: "canceled",
+    },
+  });
+  const releasedReservation = await pool.query(
+    `select attempt.status, reservation.status as reservation_status, reservation.awaiting_provider_verification,
+            order_row.checkout_status
+     from hpos.payment_attempts attempt
+     join hpos.reservations reservation on reservation.order_id = attempt.order_id and reservation.site_id = attempt.site_id
+     join hpos.orders order_row on order_row.id = attempt.order_id and order_row.site_id = attempt.site_id
+     where attempt.id = $1 and attempt.site_id = $2`,
+    [verifiedCheckout.attempt.attempt_id, site.siteId],
+  );
+  assert(closedCheckout.status === 200 && closedCheckout.data.data.status === "closed"
+    && releasedReservation.rows[0]?.status === "closed"
+    && releasedReservation.rows[0]?.reservation_status === "released"
+    && releasedReservation.rows[0]?.awaiting_provider_verification === false
+    && releasedReservation.rows[0]?.checkout_status === "ended",
+  "Verified provider closure after cancellation did not close the attempt and safely release capacity.");
+
+  const paidRaceOrder = await api(site, `/v1/public/orders/${racingCheckout.order.order_token}`);
+  const raceAdminOrder = await api(site, `/v1/admin/orders/${racingCheckout.order.order_id}`);
+  assert(paidRaceOrder.status === 200 && paidRaceOrder.data.data.payment_status === "paid"
+    && paidRaceOrder.data.data.refund_status === "none"
+    && paidRaceOrder.data.data.tickets.length <= 1
+    && raceAdminOrder.status === 200,
+  "The verified late charge was lost, misreported as refunded, or issued duplicate Tickets.");
+  if (paidRaceOrder.data.data.tickets.length === 0) {
+    assert(raceAdminOrder.data.data.issues.some((issue) => issue.code === "event_canceled" && issue.status === "open"),
+      "A paid Order without Tickets after cancellation did not create an actionable staff issue.");
+  } else {
+    assert(paidRaceOrder.data.data.tickets.length === 1
+      && paidRaceOrder.data.data.tickets[0].admission_blockers.includes("event_canceled"),
+    "A Ticket issued just before cancellation remained eligible for Admission.");
+  }
+
+  const existingBuyerOrder = await api(site, `/v1/public/orders/${paidBuyer.orderToken}`);
+  const existingBuyerTicket = await api(site, `/v1/public/tickets/${paidBuyer.ticketToken}`);
+  const blockedAdmission = await api(site, `/v1/admin/events/${event.event_id}/admissions`, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-41-door" }, qr_token: existingBuyerTicket.data.data.qr_payload },
+  });
+  assert(existingBuyerOrder.status === 200 && existingBuyerOrder.data.data.payment_status === "paid"
+    && existingBuyerOrder.data.data.refund_status === "none"
+    && existingBuyerOrder.data.data.tickets.length === 1
+    && existingBuyerTicket.status === 200 && existingBuyerTicket.data.data.can_admit === false
+    && existingBuyerTicket.data.data.admission_blockers.includes("event_canceled")
+    && blockedAdmission.status === 409 && blockedAdmission.data.error.code === "event_canceled",
+  "Cancellation did not block Admission while retaining paid Order and Ticket history separately from refund status.");
+
+  const publicEvent = await api(site, `/v1/public/events/${event.event_id}`);
+  const canceledQuote = await api(site, `/v1/public/events/${event.event_id}/quotes`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
+  });
+  assert(publicEvent.status === 200 && publicEvent.data.data.is_canceled
+    && publicEvent.data.data.sales_status === "canceled"
+    && canceledQuote.status === 409,
+  "The canceled Event page disappeared or new checkout remained possible.");
+
+  const cancellationJobs = await api(site, `/v1/admin/notification-jobs?event_id=${event.event_id}&kind=event_canceled&limit=50`);
+  const paidOrders = await pool.query(
+    `select id, order_reference, delivery_email from hpos.orders
+     where site_id = $1 and event_id = $2 and payment_status = 'paid'`,
+    [site.siteId, event.event_id],
+  );
+  assert(cancellationJobs.status === 200 && cancellationJobs.data.data.length === paidOrders.rows.length,
+    "Cancellation and late payment did not leave exactly one durable notice per paid Order.");
+  for (const job of cancellationJobs.data.data) {
+    const buyer = paidOrders.rows.find((order) => order.id === job.order_id);
+    assert(buyer && job.kind === "event_canceled" && job.status === "pending"
+      && job.payload.recipient_email === buyer.delivery_email
+      && job.payload.order.order_id === buyer.id
+      && job.payload.order.order_reference === buyer.order_reference
+      && job.payload.event.event_id === event.event_id
+      && job.payload.canceled_at
+      && !JSON.stringify(job.payload).includes(paidBuyer.orderToken)
+      && !JSON.stringify(job.payload).includes(paidBuyer.ticketToken),
+    "A cancellation notification was not durable, recipient-correct, or free of buyer tokens.");
+  }
+  assert(!cancellationJobs.data.data.some((job) => job.order_id === unpaid.data.data.order_id),
+    "An unpaid Order received a paid-buyer cancellation notification.");
+
+  const archived = await api(site, cancelUrl.replace("/actions/cancel", "/actions/archive"), {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { actor: { type: "user", reference: "test:issue-41-staff" }, expected_version: canceled.data.data.version },
+  });
+  const archivedPublicEvent = await api(site, `/v1/public/events/${event.event_id}`);
+  const retainedOrder = await api(site, `/v1/public/orders/${paidBuyer.orderToken}`);
+  assert(archived.status === 200 && archived.data.data.is_archived
+    && archivedPublicEvent.status === 200 && archivedPublicEvent.data.data.is_archived
+    && retainedOrder.status === 200 && retainedOrder.data.data.tickets.length === 1,
+  "Archiving a canceled Event removed its direct page or its paid Order and Ticket history.");
+}
+
 async function cleanup() {
   if (organizationIds.length) {
     await pool.query("delete from hpos.organizations where id = any($1::uuid[])", [organizationIds]).catch(() => undefined);
@@ -2843,6 +3097,7 @@ async function main() {
     await verifyPreconfiguredDraftCannotClearSales(site);
     await verifyEventLifecycleAndDiscovery(site);
     await verifyEventChangeNotifications(site);
+    await verifyEventCancellation(site);
     await verifySalesControlsAndCapacity(site);
     await verifyPublicSingleTicketCheckout(site);
     await verifyPublicPaymentAttemptLifecycle(site);
