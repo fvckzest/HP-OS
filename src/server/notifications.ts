@@ -15,6 +15,14 @@ export const NOTIFICATION_KINDS = [
   "wallet_update",
 ] as const;
 
+const EVENT_ARRIVAL_FIELDS = new Set([
+  "starts_at",
+  "ends_at",
+  "time_zone",
+  "venue.name",
+  "venue.address",
+]);
+
 export type NotificationKind = typeof NOTIFICATION_KINDS[number];
 export type DispatchOutcome = "completed" | "failed" | "unknown";
 export type DeliveryOutcome = "delivered" | "failed";
@@ -114,7 +122,9 @@ function validateEventDetails(value: unknown, includeChangedFields: boolean): va
   if (!validTimestamp(value.starts_at) || !validTimestamp(value.ends_at) || !validText(value.time_zone, 100)) return false;
   if (!object(value.venue) || !hasOnlyKeys(value.venue, ["name", "address"]) || !validText(value.venue.name, 200)) return false;
   if (value.venue.address !== null && !validText(value.venue.address, 1000)) return false;
-  if (includeChangedFields && (!Array.isArray(value.changed_fields) || value.changed_fields.length === 0 || value.changed_fields.some((field) => !validText(field, 100)))) return false;
+  if (includeChangedFields && (!Array.isArray(value.changed_fields) || value.changed_fields.length === 0
+    || value.changed_fields.some((field) => typeof field !== "string" || !EVENT_ARRIVAL_FIELDS.has(field))
+    || new Set(value.changed_fields).size !== value.changed_fields.length)) return false;
   return true;
 }
 
@@ -196,18 +206,20 @@ export async function enqueueNotificationJob(client: PoolClient, input: NewNotif
 }
 
 /** Supersede only unsent work; unknown or completed provider effects stay visible. */
-export async function supersedeUnsentNotificationJobs(client: PoolClient, input: { siteId: string; kinds: NotificationKind[]; orderId?: string; accessRequestId?: string }): Promise<number> {
-  if (!UUID_PATTERN.test(input.siteId) || input.kinds.length === 0) return 0;
+export async function supersedeUnsentNotificationJobs(client: PoolClient, input: { siteId: string; kinds: NotificationKind[]; orderId?: string; accessRequestId?: string; eventId?: string }): Promise<number> {
+  if (!UUID_PATTERN.test(input.siteId) || input.kinds.length === 0
+    || (!input.orderId && !input.accessRequestId && !input.eventId)) return 0;
   const result = await client.query(
     `update hpos.notification_jobs
        set is_superseded = true, updated_at = clock_timestamp()
      where site_id = $1 and kind = any($2::text[])
        and ($3::uuid is null or order_id = $3)
        and ($4::uuid is null or access_request_id = $4)
+       and ($5::uuid is null or event_id = $5)
        and status = 'pending' and attempt_count = 0
        and requires_verification = false and provider_message_reference is null and claim_id is null
      returning id`,
-    [input.siteId, input.kinds, input.orderId ?? null, input.accessRequestId ?? null],
+    [input.siteId, input.kinds, input.orderId ?? null, input.accessRequestId ?? null, input.eventId ?? null],
   );
   return result.rowCount ?? 0;
 }

@@ -30,8 +30,9 @@ These rules prevent overselling, release abandoned capacity, and keep purchase t
 
 ## Event changes and cancellation
 
-- After sales begin, staff may change the start or end date and time or venue. HP-OS notifies existing buyers, and Order pages show the current details.
-- Each Event has a check-in opening time, defaulting to its start time; staff may set it earlier. Admission is available through the Event's end time. Scans outside that window create no Admission.
+- After sales begin, staff may change the start or end date and time, time zone, or venue. HP-OS validates the complete Event timing and sales window, then creates one durable `event_changed` job per paid Order in the same transaction as the edit. If job creation fails partway through, the Event edit and inserted jobs all roll back. A later arrival change supersedes only earlier jobs that have never been attempted or claimed. See the exact payload in the [API contract](../api/api.md#notification-job-schema-and-recovery), settled in [issue #40](https://github.com/fvckzest/HP-OS/issues/40).
+- Order and individual Ticket pages show current Event details from HP-OS, so a later visit reflects an accepted time or venue change. The Site worker sends each durable change job using Site-owned credentials; HP-OS does not send email.
+- Each Event has a check-in opening time, defaulting to its current start time. Rescheduling updates that default automatically; an explicit saved opening remains at its saved time. Admission is available through the Event's end time. Scans outside that window create no Admission.
 - Cancellation immediately stops new sales, ends buyer checkout, and prevents Ticket Admission. Reservations with a possible provider payment remain held until the Site verifies closure or the payment result; other unpaid Reservations release. HP-OS keeps the Event and purchase history. It emails buyers immediately and shows cancellation separately from refund status on their Order pages.
 - Cancellation does not initiate a refund. Staff refund through the payment provider's dashboard; HP-OS reflects the resulting status. A charge confirmed after cancellation is recorded as paid and requiring a refund, with no usable Tickets, and alerts staff.
 

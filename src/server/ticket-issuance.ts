@@ -1099,7 +1099,7 @@ async function correctDeliveryEmail(client: PoolClient, site: AuthenticatedSite,
       [ticket.id, site.siteId, token, hashToken(token)],
     );
   }
-  await supersedeUnsentNotificationJobs(client, { siteId: site.siteId, orderId, kinds: ["tickets_ready"] });
+  await supersedeUnsentNotificationJobs(client, { siteId: site.siteId, orderId, kinds: ["tickets_ready", "event_changed"] });
   const correctedRow = { ...row, delivery_email: corrected.email, order_token: orderToken } as IssuanceRow;
   await enqueueNotificationJob(client, { siteId: site.siteId, kind: "tickets_ready", eventId: row.event_id, orderId, payload: ticketEmailPayload(correctedRow) });
   await recordRecoveryAction(client, site, orderId, "correct_delivery_email", parsed.actor, parsed.version, updated.rows[0].version, body.reason.trim(), body.verification_reference.trim());
