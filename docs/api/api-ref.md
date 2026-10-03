@@ -405,7 +405,7 @@ Text limits: name/title 200 characters; description 20,000; venue address 1,000;
 | `starts_at` | timestamp? | Event start. |
 | `ends_at` | timestamp? | Event end; must follow start. |
 | `time_zone` | string? | Event local display zone. |
-| `check_in_opens_at` | timestamp? | Effective opening; null input defaults to Event start. |
+| `check_in_opens_at` | timestamp? | Effective opening; null follows the current Event start after edits, while an explicit time stays fixed. |
 | `visibility` | enum? | public or private; fixed after publication. |
 | `purchase_mode` | enum | public_checkout or access_request. |
 | `sales_status` | enum | canceled, closed, not_configured, scheduled, paused, sold_out, open. |
@@ -735,11 +735,11 @@ The contract also requires refund timestamps/history without enumerating every s
 | `access_approved` | `{ attendee: { name, email }, approval_token }`. |
 | `tickets_ready` | `{ recipient_email, buyer_name, event: { event_id, event_reference, title, starts_at, ends_at, time_zone, venue: { name, address } }, order: { order_id, order_reference, order_token } }`. |
 | `order_recovery` | `{ recipient_email, orders: [{ order_id, order_reference, order_token, expires_at }] }`. |
-| `event_changed` | `{ recipient_email, order: { order_id, order_reference }, event: { event_id, event_reference, title, starts_at, ends_at, time_zone, venue: { name, address }, changed_fields: [...] } }`. |
+| `event_changed` | `{ recipient_email, order: { order_id, order_reference }, event: { event_id, event_reference, title, starts_at, ends_at, time_zone, venue: { name, address }, changed_fields: [...] } }`; `changed_fields` lists changed values from `starts_at`, `ends_at`, `time_zone`, `venue.name`, and `venue.address`. |
 | `event_canceled` | `{ recipient_email, order: { order_id, order_reference }, event: { event_id, event_reference, title, starts_at, ends_at, time_zone, venue: { name, address } }, canceled_at }`. |
 | `wallet_update` | `{ ticket_id, data_version }`. |
 
-All members shown are required. `venue.address` may be `null`; `changed_fields` and `orders` are nonempty arrays. Nested IDs match the related job IDs, and all timestamps include a UTC offset. Templates, URLs, provider credentials, and Apple device/signing credentials belong to LMNL.
+All members shown are required. `venue.address` may be `null`; `changed_fields` is nonempty and duplicate-free, and `orders` is nonempty. Nested IDs match the related job IDs, and all timestamps include a UTC offset. Published arrival edits create one durable `event_changed` job per paid Order in the same transaction; older unsent, unattempted, unclaimed jobs for that Event are superseded, and a fan-out failure rolls back the edit and new jobs. Order and Ticket APIs return the current Event details. Templates, URLs, provider credentials, and Apple device/signing credentials belong to LMNL.
 
 ### Wallet data, issues, and audit metadata
 
