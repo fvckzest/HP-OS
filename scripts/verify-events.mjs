@@ -237,6 +237,64 @@ async function createPendingPaymentAttempt(site, event, reference) {
   return attempt.data.data;
 }
 
+async function createPaidOrderForEventChange(site, event, label) {
+  const quote = await api(site, `/v1/public/events/${event.event_id}/quotes`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
+  });
+  assert(quote.status === 201, `The Issue #40 ${label} buyer could not get a quote: ` + JSON.stringify(quote.data));
+  const email = `${label}-${randomUUID()}@example.test`;
+  const created = await api(site, "/v1/public/orders", {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { quote_id: quote.data.data.quote_id, buyer: { name: `Issue 40 ${label}`, email } },
+  });
+  assert(created.status === 201, `The Issue #40 ${label} Order could not be created: ` + JSON.stringify(created.data));
+  const order = created.data.data;
+  const attempt = await api(site, `/v1/admin/orders/${order.order_id}/payment-attempts`, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { actor: { type: "system", reference: "test:issue-40" } },
+  });
+  assert(attempt.status === 201, `The Issue #40 ${label} payment attempt could not be created: ` + JSON.stringify(attempt.data));
+  const checkoutReference = `square-issue40-${randomUUID()}`;
+  const registered = await api(site, `/v1/admin/payment-attempts/${attempt.data.data.attempt_id}/checkout-reference`, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: {
+      actor: { type: "system", reference: "test:issue-40" },
+      connection_id: site.connectionId,
+      provider_checkout_reference: checkoutReference,
+      provider_can_take_payment: true,
+    },
+  });
+  assert(registered.status === 200, `The Issue #40 ${label} checkout reference could not be saved: ` + JSON.stringify(registered.data));
+  const observedAt = new Date().toISOString();
+  const paid = await api(site, `/v1/admin/payment-attempts/${attempt.data.data.attempt_id}/payment-reports`, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: {
+      connection_id: site.connectionId,
+      source_reference: `square-event-change-${label}-${randomUUID()}`,
+      provider_checkout_reference: checkoutReference,
+      provider_payment_reference: `square-payment-event-change-${randomUUID()}`,
+      outcome: "paid",
+      observed_at: observedAt,
+      payment_started_at: observedAt,
+      provider_can_take_payment: false,
+      amount: 2500,
+      currency: "USD",
+    },
+  });
+  assert(paid.status === 201 && paid.data.data.attempt.last_outcome === "paid",
+    `The Issue #40 ${label} payment could not be confirmed through the Site report boundary: ` + JSON.stringify(paid.data));
+  const buyerPage = await api(site, `/v1/public/orders/${order.order_token}`);
+  assert(buyerPage.status === 200 && buyerPage.data.data.tickets.length === 1,
+    `The Issue #40 ${label} paid Order did not receive its Ticket: ` + JSON.stringify(buyerPage.data));
+  return {
+    orderId: order.order_id,
+    orderReference: order.order_reference,
+    orderToken: order.order_token,
+    ticketToken: buyerPage.data.data.tickets[0].ticket_token,
+    email,
+  };
+}
+
 async function verifyPublicSingleTicketCheckout(site) {
   const now = Date.now();
   const event = await createPublishedEvent(site, {
@@ -2587,6 +2645,187 @@ async function verifyEventLifecycleAndDiscovery(site) {
   assert(second.publication_status === "published", "The second cursor fixture was not published.");
 }
 
+async function verifyEventChangeNotifications(site) {
+  const now = Date.now();
+  const event = await createPublishedEvent(site, {
+    title: "Issue 40 Arrival Change Verification",
+    startsAt: new Date(now + 24 * 60 * 60_000).toISOString(),
+    endsAt: new Date(now + 48 * 60 * 60_000).toISOString(),
+    timeZone: "UTC",
+    ticketOffering: { price: { amount: 2500, currency: "USD" }, capacity: 10 },
+  });
+  const buyers = [];
+  for (const label of ["one", "two", "three"]) {
+    buyers.push(await createPaidOrderForEventChange(site, event, label));
+  }
+  const unpaidQuote = await api(site, `/v1/public/events/${event.event_id}/quotes`, {
+    method: "POST", idempotencyKey: randomUUID(), body: { quantity: 1 },
+  });
+  assert(unpaidQuote.status === 201, "The Issue #40 unpaid buyer could not get a quote.");
+  const unpaidOrder = await api(site, "/v1/public/orders", {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: { quote_id: unpaidQuote.data.data.quote_id, buyer: { name: "Unpaid Issue 40 Buyer", email: "unpaid-issue40@example.test" } },
+  });
+  assert(unpaidOrder.status === 201 && unpaidOrder.data.data.payment_status === "unpaid",
+    "The Issue #40 unpaid buyer fixture was not left unpaid.");
+
+  const tooEarlyEnd = new Date(now + 36 * 60 * 60_000).toISOString();
+  const invalidWindow = await api(site, `/v1/admin/events/${event.event_id}`, {
+    method: "PATCH", idempotencyKey: randomUUID(),
+    body: {
+      actor: { type: "user", reference: "test:issue-40" },
+      expected_version: event.version,
+      ends_at: tooEarlyEnd,
+    },
+  });
+  assert(invalidWindow.status === 422 && invalidWindow.data.error.code === "validation_failed"
+    && invalidWindow.data.error.details?.some((detail) => detail.code === "after_event_end"),
+  "An Event edit that moved the end before the saved sales close was accepted.");
+  const unchanged = await api(site, `/v1/admin/events/${event.event_id}`);
+  assert(unchanged.status === 200 && unchanged.data.data.version === event.version
+    && unchanged.data.data.ends_at === event.ends_at,
+  "A rejected timing-window edit changed the Event.");
+
+  const newStartsAt = new Date(now + 72 * 60 * 60_000).toISOString().replace(/\.000Z$/, "Z");
+  const newEndsAt = new Date(now + 96 * 60 * 60_000).toISOString().replace(/\.000Z$/, "Z");
+  const patchKey = randomUUID();
+  const patchBody = {
+    actor: { type: "user", reference: "test:issue-40" },
+    expected_version: event.version,
+    starts_at: newStartsAt,
+    ends_at: newEndsAt,
+    venue: { name: "Updated LMNL Space", address: "40 Arrival Way" },
+  };
+  const suffix = randomUUID().replaceAll("-", "");
+  const sequenceName = `hpos.issue40_event_jobs_${suffix}`;
+  const functionName = `hpos.issue40_fail_event_job_${suffix}`;
+  const triggerName = `issue40_fail_event_job_${suffix}`;
+  await pool.query(`create sequence ${sequenceName}`);
+  await pool.query(`create function ${functionName}() returns trigger language plpgsql as $$
+    begin
+      if new.kind = 'event_changed' then
+        if nextval('${sequenceName}') = 2 then
+          raise exception 'injected Issue #40 fan-out interruption';
+        end if;
+      end if;
+      return new;
+    end;
+  $$`);
+  await pool.query(`create trigger ${triggerName} before insert on hpos.notification_jobs
+    for each row execute function ${functionName}()`);
+  let interrupted;
+  try {
+    interrupted = await api(site, `/v1/admin/events/${event.event_id}`, {
+      method: "PATCH", idempotencyKey: patchKey, body: patchBody,
+    });
+  } finally {
+    await pool.query(`drop trigger ${triggerName} on hpos.notification_jobs`);
+    await pool.query(`drop function ${functionName}()`);
+    await pool.query(`drop sequence ${sequenceName}`);
+  }
+  assert(interrupted.status === 503 && interrupted.data.error.code === "service_unavailable",
+    "An interrupted Event notification fan-out did not fail safely.");
+  const rolledBack = await pool.query(
+    `select version, starts_at, ends_at, venue_name, venue_address
+     from hpos.events where site_id = $1 and id = $2`,
+    [site.siteId, event.event_id],
+  );
+  const rolledBackJobs = await pool.query(
+    `select count(*)::integer as count from hpos.notification_jobs
+     where site_id = $1 and event_id = $2 and kind = 'event_changed'`,
+    [site.siteId, event.event_id],
+  );
+  assert(rolledBack.rows[0]?.version === event.version
+    && rolledBack.rows[0]?.starts_at.toISOString() === new Date(event.starts_at).toISOString()
+    && rolledBack.rows[0]?.ends_at.toISOString() === new Date(event.ends_at).toISOString()
+    && rolledBack.rows[0]?.venue_name === "LMNL Space"
+    && rolledBack.rows[0]?.venue_address === null
+    && rolledBackJobs.rows[0]?.count === 0,
+  "The interrupted broad Event change left partial Event or buyer-notification state.");
+
+  const changed = await api(site, `/v1/admin/events/${event.event_id}`, {
+    method: "PATCH", idempotencyKey: patchKey, body: patchBody,
+  });
+  assert(changed.status === 200 && changed.data.data.starts_at === newStartsAt
+    && changed.data.data.ends_at === newEndsAt
+    && changed.data.data.venue.name === "Updated LMNL Space"
+    && changed.data.data.venue.address === "40 Arrival Way"
+    && changed.data.data.check_in_opens_at === newStartsAt
+    && changed.data.data.check_in_uses_event_start,
+  "A published Event change did not preserve the default check-in opening or update arrival details.");
+  const jobs = await api(site, `/v1/admin/notification-jobs?event_id=${event.event_id}&kind=event_changed&limit=50`);
+  assert(jobs.status === 200 && jobs.data.data.length === buyers.length,
+    "The Event change did not create one notification for every paid Order and none for the unpaid Order.");
+  const jobOrders = new Set(jobs.data.data.map((job) => job.order_id));
+  assert(jobOrders.size === buyers.length && buyers.every((buyer) => jobOrders.has(buyer.orderId))
+    && !jobOrders.has(unpaidOrder.data.data.order_id),
+  "The Event change notifications did not match the paid recipient set.");
+  for (const job of jobs.data.data) {
+    const buyer = buyers.find((candidate) => candidate.orderId === job.order_id);
+    assert(job.kind === "event_changed" && job.status === "pending" && !job.is_superseded
+      && job.payload.recipient_email === buyer.email
+      && job.payload.order.order_id === buyer.orderId
+      && job.payload.event.starts_at === newStartsAt
+      && job.payload.event.ends_at === newEndsAt
+      && job.payload.event.venue.name === "Updated LMNL Space"
+      && job.payload.event.venue.address === "40 Arrival Way"
+      && job.payload.event.changed_fields.join(",") === "starts_at,ends_at,venue.name,venue.address"
+      && !JSON.stringify(job.payload).includes(buyer.orderToken)
+      && !JSON.stringify(job.payload).includes(buyer.ticketToken),
+    "An Event change notification did not use the current, minimal, agreed payload.");
+  }
+  for (const buyer of buyers) {
+    const orderPage = await api(site, `/v1/public/orders/${buyer.orderToken}`);
+    const ticketPage = await api(site, `/v1/public/tickets/${buyer.ticketToken}`);
+    assert(orderPage.status === 200 && orderPage.data.data.event.starts_at === newStartsAt
+      && orderPage.data.data.event.venue.name === "Updated LMNL Space"
+      && orderPage.data.data.event.venue.address === "40 Arrival Way"
+      && ticketPage.status === 200 && ticketPage.data.data.event.starts_at === newStartsAt
+      && ticketPage.data.data.event.venue.name === "Updated LMNL Space"
+      && ticketPage.data.data.event.venue.address === "40 Arrival Way",
+    "The current Order or Ticket page data did not reflect the latest Event arrival details.");
+  }
+
+  const revisedAddress = await api(site, `/v1/admin/events/${event.event_id}`, {
+    method: "PATCH", idempotencyKey: randomUUID(),
+    body: {
+      actor: { type: "user", reference: "test:issue-40" },
+      expected_version: changed.data.data.version,
+      venue: { address: "41 Arrival Way" },
+    },
+  });
+  assert(revisedAddress.status === 200, "A second published Event arrival change failed.");
+  const afterSecondChange = await api(site, `/v1/admin/notification-jobs?event_id=${event.event_id}&kind=event_changed&limit=50`);
+  const currentJobs = afterSecondChange.data.data.filter((job) => !job.is_superseded);
+  const oldJobs = afterSecondChange.data.data.filter((job) => job.is_superseded);
+  assert(currentJobs.length === buyers.length && oldJobs.length === buyers.length
+    && currentJobs.every((job) => job.payload.event.venue.address === "41 Arrival Way")
+    && oldJobs.every((job) => job.payload.event.venue.address === "40 Arrival Way"),
+  "A newer Event change did not supersede stale unsent notifications while preserving their history.");
+
+  const explicitOpen = new Date(now + 60 * 60_000).toISOString().replace(/\.000Z$/, "Z");
+  const explicitEvent = await createPublishedEvent(site, {
+    title: "Issue 40 Explicit Check-In Verification",
+    startsAt: new Date(now + 24 * 60 * 60_000).toISOString(),
+    endsAt: new Date(now + 48 * 60 * 60_000).toISOString(),
+    checkInOpensAt: explicitOpen,
+    timeZone: "UTC",
+  });
+  const changedExplicit = await api(site, `/v1/admin/events/${explicitEvent.event_id}`, {
+    method: "PATCH", idempotencyKey: randomUUID(),
+    body: {
+      actor: { type: "user", reference: "test:issue-40" },
+      expected_version: explicitEvent.version,
+      starts_at: newStartsAt,
+      ends_at: newEndsAt,
+    },
+  });
+  assert(changedExplicit.status === 200 && changedExplicit.data.data.starts_at === newStartsAt
+    && changedExplicit.data.data.check_in_opens_at === explicitOpen
+    && !changedExplicit.data.data.check_in_uses_event_start,
+  "Rescheduling an Event changed its explicitly configured check-in opening.");
+}
+
 async function cleanup() {
   if (organizationIds.length) {
     await pool.query("delete from hpos.organizations where id = any($1::uuid[])", [organizationIds]).catch(() => undefined);
@@ -2603,6 +2842,7 @@ async function main() {
     const site = createSiteFixture();
     await verifyPreconfiguredDraftCannotClearSales(site);
     await verifyEventLifecycleAndDiscovery(site);
+    await verifyEventChangeNotifications(site);
     await verifySalesControlsAndCapacity(site);
     await verifyPublicSingleTicketCheckout(site);
     await verifyPublicPaymentAttemptLifecycle(site);

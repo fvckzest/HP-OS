@@ -4,6 +4,8 @@ import { apiFailure, apiSuccess } from "./api-response";
 import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
+import { enqueueNotificationJob, supersedeUnsentNotificationJobs } from "./notifications";
+import type { EventNotificationDetails } from "./notifications";
 import type { AuthenticatedSite } from "./site-auth";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -461,6 +463,67 @@ async function readAdminEvent(client: PoolClient, siteId: string, eventId: strin
   return row ? eventData(row, true) : null;
 }
 
+function changedArrivalFields(before: EventRow, after: EventRow): string[] {
+  const changed: string[] = [];
+  if (before.starts_at?.getTime() !== after.starts_at?.getTime()
+    || before.starts_at_offset_minutes !== after.starts_at_offset_minutes) changed.push("starts_at");
+  if (before.ends_at?.getTime() !== after.ends_at?.getTime()
+    || before.ends_at_offset_minutes !== after.ends_at_offset_minutes) changed.push("ends_at");
+  if (before.time_zone !== after.time_zone) changed.push("time_zone");
+  if (before.venue_name !== after.venue_name) changed.push("venue.name");
+  if (before.venue_address !== after.venue_address) changed.push("venue.address");
+  return changed;
+}
+
+function eventNotificationDetails(row: EventRow, changedFields: string[]): EventNotificationDetails {
+  const startsAt = iso(row.starts_at, row.starts_at_offset_minutes);
+  const endsAt = iso(row.ends_at, row.ends_at_offset_minutes);
+  if (!row.title || !startsAt || !endsAt || !row.time_zone || !row.venue_name) {
+    throw new Error("A published Event is missing required buyer notification details.");
+  }
+  return {
+    event_id: row.id,
+    event_reference: `event-${row.id.slice(0, 8)}`,
+    title: row.title,
+    starts_at: startsAt,
+    ends_at: endsAt,
+    time_zone: row.time_zone,
+    venue: { name: row.venue_name, address: row.venue_address },
+    changed_fields: changedFields,
+  };
+}
+
+async function enqueueEventChangeNotifications(
+  client: PoolClient,
+  siteId: string,
+  event: EventRow,
+  changedFields: string[],
+): Promise<void> {
+  if (changedFields.length === 0) return;
+  await supersedeUnsentNotificationJobs(client, { siteId, eventId: event.id, kinds: ["event_changed"] });
+  const details = eventNotificationDetails(event, changedFields);
+  const orders = await client.query<{ id: string; order_reference: string; delivery_email: string }>(
+    `select id, order_reference, delivery_email
+     from hpos.orders
+     where site_id = $1 and event_id = $2 and payment_status = 'paid'
+     order by created_at, id`,
+    [siteId, event.id],
+  );
+  for (const order of orders.rows) {
+    await enqueueNotificationJob(client, {
+      siteId,
+      kind: "event_changed",
+      eventId: event.id,
+      orderId: order.id,
+      payload: {
+        recipient_email: order.delivery_email,
+        order: { order_id: order.id, order_reference: order.order_reference },
+        event: details,
+      },
+    });
+  }
+}
+
 async function createDraft(client: PoolClient, site: AuthenticatedSite, input: EventInput): Promise<{ status: number; data: unknown }> {
   const eventId = randomUUID();
   const offeringId = randomUUID();
@@ -779,6 +842,9 @@ async function writeEventPatch(client: PoolClient, site: AuthenticatedSite, even
   const result = await client.query(`update hpos.events set version=version+1, updated_at=clock_timestamp(), updated_actor_type=$3, updated_actor_reference=$4 where site_id=$1 and id=$2`, [site.siteId, eventId, input.actor.type, input.actor.reference]);
   void result;
   await client.query(`update hpos.ticket_offerings set sales_ever_configured=(sales_ever_configured or (price_amount is not null and capacity is not null and sales_opens_at is not null and sales_closes_at is not null)) where event_id=$1`, [eventId]);
+  if (merged.publication_status === "published") {
+    await enqueueEventChangeNotifications(client, site.siteId, merged, changedArrivalFields(current, merged));
+  }
   const event = await readAdminEvent(client, site.siteId, eventId);
   if (!event) throw new Error("Updated Event could not be read.");
   return { status: 200, data: event };
