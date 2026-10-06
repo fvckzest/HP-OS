@@ -59,6 +59,7 @@ interface PaymentConnectionRow extends QueryResultRow {
   location_reference: string | null;
   account_eligibility_status: "pending_validation" | "eligible" | "ineligible";
   platform_fee_eligibility_status: "pending_validation" | "eligible" | "ineligible";
+  provider_mapping: Record<string, unknown> | null;
 }
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -266,14 +267,25 @@ async function createOrder(
   const selectedConnection = await client.query<PaymentConnectionRow>(
     `select connection.id, connection.provider, connection.environment,
             connection.account_reference, connection.location_reference,
-            connection.account_eligibility_status, connection.platform_fee_eligibility_status
+            connection.account_eligibility_status, connection.platform_fee_eligibility_status,
+            case when mapping.connection_id is null then null else jsonb_build_object(
+              'connection_id', mapping.connection_id,
+              'resource_type', mapping.resource_type,
+              'resource_reference', mapping.resource_reference,
+              'verified_at', mapping.verified_at
+            ) end as provider_mapping
      from hpos.site_payment_connection_assignments assignment
      join hpos.payment_connections connection
        on connection.id = assignment.connection_id
       and connection.organization_id = assignment.organization_id
+     left join hpos.ticket_offering_provider_mappings mapping
+       on mapping.site_id = assignment.site_id
+      and mapping.offering_id = $2
+      and mapping.event_id = $3
+      and mapping.connection_id = connection.id
      where assignment.site_id = $1 and assignment.unassigned_at is null
      for update of assignment, connection`,
-    [site.siteId],
+    [site.siteId, quote.offering_id, quote.event_id],
   );
   const connection = selectedConnection.rows[0];
   if (!connection
@@ -312,11 +324,11 @@ async function createOrder(
     `insert into hpos.orders (
        id, site_id, event_id, offering_id, buyer_id, quote_id, order_reference,
        buyer_name, delivery_email, checkout_identity, accepted_quote,
-       checkout_expires_at, order_token_hash, payment_connection_id, order_token
+       checkout_expires_at, order_token_hash, payment_connection_id, provider_mapping, order_token
      )
      select
        $1, $2, $3, $4, $5, quote_row.id, $7, $8, $9, $10::jsonb, $11::jsonb,
-       clock_timestamp() + interval '15 minutes', $12, $13, $14
+       clock_timestamp() + interval '15 minutes', $12, $13, $14::jsonb, $15
      from hpos.public_quotes quote_row
      where quote_row.id = $6 and quote_row.site_id = $2
        and quote_row.expires_at > clock_timestamp()
@@ -335,7 +347,9 @@ async function createOrder(
         platform_fee: money(quote.platform_fee_amount, quote.currency),
         platform_fee_basis_points: quote.platform_fee_basis_points,
       }),
-      orderTokenHash, connection.id, orderToken],
+      orderTokenHash, connection.id,
+      connection.provider_mapping ? JSON.stringify(connection.provider_mapping) : null,
+      orderToken],
   );
   if (insertedOrder.rowCount !== 1) {
     operationError(409, "quote_expired", "This quote expired. Request a new quote and show its total before checkout.");

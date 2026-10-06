@@ -19,6 +19,7 @@
     "verify:local": "node scripts/verify-local.mjs",
     "verify:notifications": "node scripts/verify-notifications.mjs",
     "verify:events": "node scripts/verify-events.mjs",
+    "verify:historical-connections": "node scripts/verify-historical-connections.mjs",
     "verify:fees": "node scripts/verify-fee-reporting.mjs"
   },
   "dependencies": {

@@ -10,6 +10,7 @@ import { handleRefundReportPost } from "@/server/refunds";
 import { handleEventActionPost, handleEventGet, handleEventPatch, handleEventPost } from "@/server/events";
 import { handleAdmissionPost } from "@/server/admissions";
 import { handleBuyerOrderRecoveryPost } from "@/server/buyer-order-recovery";
+import { handleProviderMappingDelete, handleProviderMappingPut } from "@/server/provider-mappings";
 import { handleFeeReportPost } from "@/server/fee-reports";
 import { handleAdminReportingGet } from "@/server/admin-reporting";
 
@@ -111,6 +112,30 @@ export async function POST(request: Request, context: RouteContext) {
 
     const notificationResponse = await handleNotificationPost(request, authentication.site, path);
     return notificationResponse ?? apiFailure(404, "not_found", "The requested API operation is unavailable.");
+  } catch {
+    return apiFailure(503, "service_unavailable", "The requested API operation is temporarily unavailable.", { retryAfter: 1 });
+  }
+}
+
+export async function PUT(request: Request, context: RouteContext) {
+  const authentication = await authenticateSiteRequest(request);
+  if (authentication.error) return authentication.error;
+  const { path } = await context.params;
+  try {
+    const response = await handleProviderMappingPut(request, authentication.site, path);
+    return response ?? apiFailure(404, "not_found", "The requested API operation is unavailable.");
+  } catch {
+    return apiFailure(503, "service_unavailable", "The requested API operation is temporarily unavailable.", { retryAfter: 1 });
+  }
+}
+
+export async function DELETE(request: Request, context: RouteContext) {
+  const authentication = await authenticateSiteRequest(request);
+  if (authentication.error) return authentication.error;
+  const { path } = await context.params;
+  try {
+    const response = await handleProviderMappingDelete(request, authentication.site, path);
+    return response ?? apiFailure(404, "not_found", "The requested API operation is unavailable.");
   } catch {
     return apiFailure(503, "service_unavailable", "The requested API operation is temporarily unavailable.", { retryAfter: 1 });
   }

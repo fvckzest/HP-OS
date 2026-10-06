@@ -299,12 +299,13 @@ async function createAttempt(client: PoolClient, site: AuthenticatedSite, orderI
   const orderResult = await client.query<{
     id: string;
     payment_connection_id: string | null;
+    provider_mapping: Record<string, unknown> | null;
     accepted_quote: Record<string, unknown>;
     checkout_status: AttemptRow["checkout_status"];
     checkout_expired: boolean;
     payment_status: AttemptRow["payment_status"];
   }>(
-    `select id, payment_connection_id, accepted_quote, checkout_status,
+    `select id, payment_connection_id, provider_mapping, accepted_quote, checkout_status,
             checkout_expires_at <= clock_timestamp() as checkout_expired, payment_status
      from hpos.orders
      where id = $1 and site_id = $2
@@ -373,11 +374,12 @@ async function createAttempt(client: PoolClient, site: AuthenticatedSite, orderI
        location_reference, account_eligibility_status, platform_fee_eligibility_status,
        currency, total_amount, platform_fee_amount, provider_mapping,
        status, provider_can_take_payment
-     ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, null, 'creating', null)
+     ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, 'creating', null)
      returning *`,
     [attemptId, site.siteId, order.id, connection.id, connection.provider, connection.environment,
       connection.account_reference, connection.location_reference, connection.account_eligibility_status,
-      connection.platform_fee_eligibility_status, total.currency, total.amount, platformFee.amount],
+      connection.platform_fee_eligibility_status, total.currency, total.amount, platformFee.amount,
+      order.provider_mapping ? JSON.stringify(order.provider_mapping) : null],
   );
   const held = await client.query(
     `update hpos.reservations
