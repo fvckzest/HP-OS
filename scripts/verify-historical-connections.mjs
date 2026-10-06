@@ -194,6 +194,13 @@ async function main() {
     const newOrder = await orderFor(fixtureData.site, event.event_id, `issue44-new-${randomUUID()}@example.test`);
     const newAttempt = await paidAttempt(fixtureData.site, newOrder, fixtureData.replacement, "new");
     assert(newAttempt.connection?.connection_id === fixtureData.replacement, "A new Order did not use the replacement connection.");
+    assert(newAttempt.provider_mapping?.connection_id === fixtureData.replacement, "The new payment attempt did not retain the replacement mapping snapshot.");
+    const removedReplacement = await api(fixtureData.site, `/v1/admin/events/${event.event_id}/provider-mappings/${fixtureData.replacement}`, {
+      method: "DELETE", body: { actor, expected_version: mapReplacement.data.data.version },
+    });
+    assert(removedReplacement.response.status === 200
+      && !removedReplacement.data.data.ticket_offering.provider_mappings.some((mapping) => mapping.connection_id === fixtureData.replacement),
+    "Removing the replacement mapping did not update the current Event mapping list.");
 
     const oldRead = await api(fixtureData.site, `/v1/admin/payment-attempts/${oldAttempt.attempt_id}`);
     assert(oldRead.response.status === 200 && oldRead.data.data.connection.connection_id === fixtureData.original

@@ -29,21 +29,15 @@ function hasOnlyKeys(value: Record<string, unknown>, allowed: string[]): boolean
   return Object.keys(value).every((key) => allowed.includes(key));
 }
 
-function fieldError(field: string, code: string, message: string): Response {
-  return apiFailure(422, "validation_failed", message, {
-    details: [{ field, code, message }],
-  });
-}
-
 function operationError(status: number, code: string, message: string, details: Array<{ field: string; code: string; message: string }> = []): never {
   throw new ApiOperationError(status, code, message, details);
 }
 
-function actorFrom(value: unknown): Actor | Response {
+function actorFrom(value: unknown): Actor | null {
   if (!object(value) || !hasOnlyKeys(value, ["type", "reference"])
     || (value.type !== "user" && value.type !== "system")
     || typeof value.reference !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(value.reference.trim())) {
-    return fieldError("actor", "invalid_actor", "Include a user or system actor with a non-secret Site-local reference.");
+    return null;
   }
   return { type: value.type, reference: value.reference.trim() };
 }
@@ -105,6 +99,49 @@ async function readCurrentMapping(client: PoolClient, siteId: string, offeringId
   return result.rows[0] ?? null;
 }
 
+interface MappingGuard {
+  actor: Actor;
+  expectedVersion: number;
+}
+
+function parseMappingGuard(body: Record<string, unknown>, allowedKeys: string[], unsupportedMessage: string): MappingGuard {
+  if (!hasOnlyKeys(body, allowedKeys)) {
+    operationError(422, "validation_failed", unsupportedMessage);
+  }
+  const actor = actorFrom(body.actor);
+  if (!actor) {
+    operationError(422, "validation_failed", "Include a valid actor reference.", [{
+      field: "actor",
+      code: "invalid_actor",
+      message: "Include a user or system actor with a non-secret Site-local reference.",
+    }]);
+  }
+  const expectedVersion = numericVersion(body.expected_version);
+  if (!expectedVersion) {
+    operationError(422, "validation_failed", "Provide expected_version.", [{
+      field: "expected_version",
+      code: "required",
+      message: "Use the Event version you loaded.",
+    }]);
+  }
+  return { actor, expectedVersion };
+}
+
+async function lockMappingTarget(
+  client: PoolClient,
+  site: AuthenticatedSite,
+  eventId: string,
+  connectionId: string,
+  expectedVersion: number,
+): Promise<{ event: { id: string; ticket_offering_id: string; version: number }; provider: "square" | "stripe" }> {
+  const event = await lockEvent(client, site.siteId, eventId);
+  if (event.version !== expectedVersion) {
+    operationError(409, "version_conflict", "The Event changed after you loaded it. Reload it before changing provider mappings.");
+  }
+  const provider = await assertAssignedConnection(client, site.siteId, connectionId);
+  return { event, provider };
+}
+
 async function writeMapping(
   client: PoolClient,
   site: AuthenticatedSite,
@@ -112,16 +149,11 @@ async function writeMapping(
   connectionId: string,
   body: Record<string, unknown>,
 ): Promise<IdempotentResult> {
-  if (!hasOnlyKeys(body, ["actor", "expected_version", "resource_type", "resource_reference", "verified_at"])) {
-    operationError(422, "validation_failed", "A provider mapping accepts actor, expected_version, resource_type, resource_reference, and verified_at only.");
-  }
-  const actor = actorFrom(body.actor);
-  if (actor instanceof Response) {
-    const payload = await actor.json() as { error?: { details?: Array<{ field: string; code: string; message: string }> } };
-    operationError(422, "validation_failed", "Include a valid actor reference.", payload.error?.details ?? []);
-  }
-  const expected = numericVersion(body.expected_version);
-  if (!expected) operationError(422, "validation_failed", "Provide expected_version.", [{ field: "expected_version", code: "required", message: "Use the Event version you loaded." }]);
+  const { actor, expectedVersion } = parseMappingGuard(
+    body,
+    ["actor", "expected_version", "resource_type", "resource_reference", "verified_at"],
+    "A provider mapping accepts actor, expected_version, resource_type, resource_reference, and verified_at only.",
+  );
   if (typeof body.resource_type !== "string" || !RESOURCE_TYPES.has(body.resource_type.trim())
     || /[\u0000-\u001f\u007f]/.test(body.resource_type)) {
     operationError(422, "validation_failed", "resource_type must be a supported provider resource type.", [{ field: "resource_type", code: "invalid_reference", message: "Use square_item_variation or stripe_price." }]);
@@ -134,10 +166,8 @@ async function writeMapping(
     operationError(422, "validation_failed", "verified_at must be an RFC 3339 timestamp with an explicit offset.", [{ field: "verified_at", code: "invalid_timestamp", message: "Use an RFC 3339 timestamp with an explicit offset." }]);
   }
 
-  const event = await lockEvent(client, site.siteId, eventId);
-  if (event.version !== expected) operationError(409, "version_conflict", "The Event changed after you loaded it. Reload it before changing provider mappings.");
+  const { event, provider } = await lockMappingTarget(client, site, eventId, connectionId, expectedVersion);
   const resourceType = body.resource_type.trim();
-  const provider = await assertAssignedConnection(client, site.siteId, connectionId);
   const expectedResourceType = provider === "square" ? "square_item_variation" : "stripe_price";
   if (resourceType !== expectedResourceType) {
     operationError(422, "validation_failed", "resource_type must match the provider for this payment connection.", [{ field: "resource_type", code: "provider_mismatch", message: `Use ${expectedResourceType} for this connection.` }]);
@@ -174,20 +204,12 @@ async function deleteMapping(
   connectionId: string,
   body: Record<string, unknown>,
 ): Promise<IdempotentResult> {
-  if (!hasOnlyKeys(body, ["actor", "expected_version"])) {
-    operationError(422, "validation_failed", "Removing a provider mapping accepts actor and expected_version only.");
-  }
-  const actor = actorFrom(body.actor);
-  if (actor instanceof Response) {
-    const payload = await actor.json() as { error?: { details?: Array<{ field: string; code: string; message: string }> } };
-    operationError(422, "validation_failed", "Include a valid actor reference.", payload.error?.details ?? []);
-  }
-  const expected = numericVersion(body.expected_version);
-  if (!expected) operationError(422, "validation_failed", "Provide expected_version.", [{ field: "expected_version", code: "required", message: "Use the Event version you loaded." }]);
-
-  const event = await lockEvent(client, site.siteId, eventId);
-  if (event.version !== expected) operationError(409, "version_conflict", "The Event changed after you loaded it. Reload it before changing provider mappings.");
-  await assertAssignedConnection(client, site.siteId, connectionId);
+  const { actor, expectedVersion } = parseMappingGuard(
+    body,
+    ["actor", "expected_version"],
+    "Removing a provider mapping accepts actor and expected_version only.",
+  );
+  const { event } = await lockMappingTarget(client, site, eventId, connectionId, expectedVersion);
   const removed = await client.query(
     `delete from hpos.ticket_offering_provider_mappings
      where site_id = $1 and offering_id = $2 and connection_id = $3`,
@@ -210,28 +232,39 @@ function validIds(eventId: string, connectionId: string): boolean {
   return UUID_PATTERN.test(eventId) && UUID_PATTERN.test(connectionId);
 }
 
-export async function handleProviderMappingPut(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
-  if (request.method !== "PUT" || path.length !== 5 || path[0] !== "admin" || path[1] !== "events" || path[3] !== "provider-mappings") return null;
+function mapMappingDatabaseError(error: unknown): Response | null {
+  if (object(error) && error.code === "23503") {
+    return apiFailure(404, "not_found", "The Event or payment connection is not available to this Site.");
+  }
+  return null;
+}
+
+async function handleMappingMutation(
+  request: Request,
+  site: AuthenticatedSite,
+  path: string[],
+  method: "PUT" | "DELETE",
+  action: (client: PoolClient, site: AuthenticatedSite, eventId: string, connectionId: string, body: Record<string, unknown>) => Promise<IdempotentResult>,
+): Promise<Response | null> {
+  if (request.method !== method || path.length !== 5 || path[0] !== "admin" || path[1] !== "events" || path[3] !== "provider-mappings") return null;
   const eventId = path[2];
   const connectionId = path[4];
   if (!validIds(eventId, connectionId)) return apiFailure(404, "not_found", "The Event or payment connection is not available to this Site.");
   const body = await readJsonBody(request);
   if (body instanceof Response) return body;
-  return withApiIdempotency(request, site, body, (client) => writeMapping(client, site, eventId, connectionId, body), (error) => {
-    if (object(error) && error.code === "23503") return apiFailure(404, "not_found", "The Event or payment connection is not available to this Site.");
-    return null;
-  });
+  return withApiIdempotency(
+    request,
+    site,
+    body,
+    (client) => action(client, site, eventId, connectionId, body),
+    mapMappingDatabaseError,
+  );
+}
+
+export async function handleProviderMappingPut(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
+  return handleMappingMutation(request, site, path, "PUT", writeMapping);
 }
 
 export async function handleProviderMappingDelete(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
-  if (request.method !== "DELETE" || path.length !== 5 || path[0] !== "admin" || path[1] !== "events" || path[3] !== "provider-mappings") return null;
-  const eventId = path[2];
-  const connectionId = path[4];
-  if (!validIds(eventId, connectionId)) return apiFailure(404, "not_found", "The Event or payment connection is not available to this Site.");
-  const body = await readJsonBody(request);
-  if (body instanceof Response) return body;
-  return withApiIdempotency(request, site, body, (client) => deleteMapping(client, site, eventId, connectionId, body), (error) => {
-    if (object(error) && error.code === "23503") return apiFailure(404, "not_found", "The Event or payment connection is not available to this Site.");
-    return null;
-  });
+  return handleMappingMutation(request, site, path, "DELETE", deleteMapping);
 }
