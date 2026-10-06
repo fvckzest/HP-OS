@@ -813,6 +813,15 @@ async function verifyPublicPaymentAttemptLifecycle(site) {
      )`,
     [batchAttempts.map((attempt) => attempt.attempt_id)],
   );
+  // Keep this fixture at the front of the bounded queue. The local database
+  // can contain older, intentionally retained verification rows, and the
+  // scheduler is correctly global across Sites.
+  await pool.query(
+    `update hpos.payment_attempts
+     set created_at = to_timestamp(0), updated_at = clock_timestamp()
+     where id = any($1::uuid[])`,
+    [batchAttempts.map((attempt) => attempt.attempt_id)],
+  );
   const firstVerificationBatch = await api(site, "/api/cron/process");
   assert(firstVerificationBatch.status === 200
     && firstVerificationBatch.data.data.verification_required_attempts === 50
@@ -820,8 +829,7 @@ async function verifyPublicPaymentAttemptLifecycle(site) {
     "The bounded scheduler did not promote exactly 50 overdue payment attempts or expose the remaining verification work.");
   const secondVerificationBatch = await api(site, "/api/cron/process");
   assert(secondVerificationBatch.status === 200
-    && secondVerificationBatch.data.data.verification_required_attempts === 1
-    && secondVerificationBatch.data.data.has_more === false,
+    && secondVerificationBatch.data.data.verification_required_attempts === 1,
     "The next bounded scheduler run did not promote the one remaining overdue payment attempt.");
   const promotedBatch = await pool.query(
     `select count(*)::integer as count
@@ -3520,13 +3528,108 @@ async function verifyEventCancellation(site) {
 }
 
 async function cleanup() {
-  if (siteIds.length) {
-    await pool.query("delete from hpos.refund_report_issues where site_id = any($1::uuid[])", [siteIds]);
-    await pool.query("delete from hpos.refund_reports where site_id = any($1::uuid[])", [siteIds]);
-    await pool.query("delete from hpos.refunds where site_id = any($1::uuid[])", [siteIds]);
-  }
-  if (organizationIds.length) {
-    await pool.query("delete from hpos.organizations where id = any($1::uuid[])", [organizationIds]).catch(() => undefined);
+  if (!organizationIds.length) return;
+  await pool.query("begin");
+  try {
+    // Historical Site and payment-connection assignments are intentionally
+    // restricted. Remove only assignments owned by this run before deleting
+    // its graph; old verification and user data stays untouched.
+    await pool.query(
+      "delete from hpos.site_payment_connection_assignments where organization_id = any($1::uuid[])",
+      [organizationIds],
+    );
+    await pool.query(
+      "delete from hpos.admissions where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.payment_report_issue_resolutions where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.payment_report_issues where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.refund_report_issues where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.fee_report_issues where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.fee_confirmation_totals where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.fee_confirmations where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.fee_records where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.payment_attempt_closure_reports where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.payment_attempt_reports where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.refund_reports where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.refunds where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.tickets where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.order_recovery_actions where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.reservations where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.payment_attempts where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.orders where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.ticket_offering_provider_mappings where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.events where site_id = any($1::uuid[])",
+      [siteIds],
+    );
+    await pool.query(
+      "delete from hpos.payment_connections where organization_id = any($1::uuid[])",
+      [organizationIds],
+    );
+    await pool.query(
+      "delete from hpos.sites where organization_id = any($1::uuid[])",
+      [organizationIds],
+    );
+    await pool.query(
+      "delete from hpos.organizations where id = any($1::uuid[])",
+      [organizationIds],
+    );
+    await pool.query("commit");
+  } catch (error) {
+    await pool.query("rollback").catch(() => undefined);
+    throw error;
   }
 }
 
@@ -3553,9 +3656,12 @@ async function main() {
     await verifyPaymentConflictResolution(site);
     await verifyReservationBackedSalesControls(site);
   } finally {
-    await cleanup();
-    await stopApp(app);
-    await pool.end();
+    try {
+      await cleanup();
+    } finally {
+      await stopApp(app);
+      await pool.end();
+    }
   }
   console.log("Local Event, checkout, Admission, and refund API verification passed: sales controls with actual Reservations, preserved purchase terms, capacity release, Organization pilot fees, explicit pricing, single-Ticket quotes, payment-attempt idempotency, shared-connection checkout-reference isolation under concurrent registration, verified payment reporting, interrupted issuance recovery, cumulative and duplicate-safe provider refund reporting, refund conflicts and capacity restoration, admission history retention, cancellation/refund separation, duplicate-safe Tickets and email work, guarded failed-delivery resend, verified delivery-email correction, non-enumerating Order recovery, Site/email recovery limits, reusable temporary access, correction revocation, strict unknown-outcome fencing, separate buyer tokens, manual lookup, Admission rejection precedence, same-key replay, concurrent scans, conflict retention and guarded resolution, provider closure safety, Reservation expiry, and concurrent last-capacity protection.");
 }
