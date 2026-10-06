@@ -217,12 +217,12 @@ async function verify() {
 
   const firstPaymentFee = await api(paymentPath, {
     method: "POST", idempotencyKey: randomUUID(),
-    body: feeReport("payment", paymentScope, "issue43-fee-source", 1, 50, "USD", "2030-01-02T10:00:00Z"),
+    body: feeReport("payment", paymentScope, "issue43-fee-source", 1, 50, "USD", "2030-01-02T12:00:00Z"),
   });
   assert(firstPaymentFee.status === 201, `A paid payment fee report failed: ${JSON.stringify(firstPaymentFee.data)}`);
   const newerPaymentFee = await api(paymentPath, {
     method: "POST", idempotencyKey: randomUUID(),
-    body: feeReport("payment", paymentScope, "issue43-fee-source", 2, 75, "USD", "2030-01-02T12:00:00Z"),
+    body: feeReport("payment", paymentScope, "issue43-fee-source", 2, 75, "USD", "2030-01-02T10:00:00Z"),
   });
   assert(newerPaymentFee.status === 201, `A newer payment fee revision failed: ${JSON.stringify(newerPaymentFee.data)}`);
   const refundFee = await api(paymentPath, {
@@ -231,9 +231,28 @@ async function verify() {
   });
   assert(refundFee.status === 201, `A completed refund fee report failed: ${JSON.stringify(refundFee.data)}`);
 
+  const currentRevisionConfirmation = await api(confirmationPath, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: confirmation("payment", paymentScope, "processing", [{ currency: "USD", charged: 75, returned: 0 }], "2030-01-02T11:00:00Z"),
+  });
+  assert(currentRevisionConfirmation.status === 200, `A confirmation for the highest source revision failed: ${JSON.stringify(currentRevisionConfirmation.data)}`);
+  const refundProcessingConfirmation = await api(confirmationPath, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: confirmation("refund", refundScope, "processing", [{ currency: "EUR", charged: 0, returned: 0 }], "2030-01-02T14:00:00Z"),
+  });
+  assert(refundProcessingConfirmation.status === 200, `The completed refund confirmation failed: ${JSON.stringify(refundProcessingConfirmation.data)}`);
+  const currentRevisionTotals = await api(totalsPath);
+  assert(currentRevisionTotals.status === 200 && currentRevisionTotals.data.data.sales.find((row) => row.currency === "USD")?.processing_fees.reporting_status === "complete",
+    `A higher source revision was incorrectly ignored because its provider observation was earlier than the superseded revision: ${JSON.stringify(currentRevisionTotals.data)}`);
+
+  const latestPaymentFee = await api(paymentPath, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: feeReport("payment", paymentScope, "issue43-fee-source", 3, 80, "USD", "2030-01-02T13:00:00Z"),
+  });
+  assert(latestPaymentFee.status === 201, `A later payment fee revision failed: ${JSON.stringify(latestPaymentFee.data)}`);
   const stalePaymentConfirmation = await api(confirmationPath, {
     method: "POST", idempotencyKey: randomUUID(),
-    body: confirmation("payment", paymentScope, "processing", [{ currency: "USD", charged: 75, returned: 0 }], "2030-01-02T09:00:00Z"),
+    body: confirmation("payment", paymentScope, "processing", [{ currency: "USD", charged: 80, returned: 0 }], "2030-01-02T11:00:00Z"),
   });
   assert(stalePaymentConfirmation.status === 200, `A stale confirmation was not retained: ${JSON.stringify(stalePaymentConfirmation.data)}`);
   const pendingTotals = await api(totalsPath);
@@ -242,14 +261,9 @@ async function verify() {
 
   const currentPaymentConfirmation = await api(confirmationPath, {
     method: "POST", idempotencyKey: randomUUID(),
-    body: confirmation("payment", paymentScope, "processing", [{ currency: "USD", charged: 75, returned: 0 }], "2030-01-02T14:00:00Z"),
+    body: confirmation("payment", paymentScope, "processing", [{ currency: "USD", charged: 80, returned: 0 }], "2030-01-02T14:00:00Z"),
   });
   assert(currentPaymentConfirmation.status === 200, `The current payment confirmation failed: ${JSON.stringify(currentPaymentConfirmation.data)}`);
-  const refundProcessingConfirmation = await api(confirmationPath, {
-    method: "POST", idempotencyKey: randomUUID(),
-    body: confirmation("refund", refundScope, "processing", [{ currency: "EUR", charged: 0, returned: 0 }], "2030-01-02T14:00:00Z"),
-  });
-  assert(refundProcessingConfirmation.status === 200, `The completed refund confirmation failed: ${JSON.stringify(refundProcessingConfirmation.data)}`);
 
   const missingPaymentCurrency = await api(confirmationPath, {
     method: "POST", idempotencyKey: randomUUID(),
@@ -275,7 +289,7 @@ async function verify() {
   const totals = await api(totalsPath);
   const sales = new Map(totals.data?.data?.sales?.map((row) => [row.currency, row]) ?? []);
   assert(totals.status === 200 && sales.get("USD")?.processing_fees.reporting_status === "complete"
-    && sales.get("USD")?.processing_fees.charged?.amount === 75
+    && sales.get("USD")?.processing_fees.charged?.amount === 80
     && sales.get("USD")?.platform_fees.reporting_status === "complete"
     && sales.get("EUR")?.processing_fees.reporting_status === "complete"
     && sales.get("EUR")?.platform_fees.reporting_status === "complete",
