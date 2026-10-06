@@ -145,7 +145,7 @@ Paths are relative to the base URL. `{...}` identifies a path parameter. All end
 | `POST /v1/admin/payment-attempts/{attempt_id}/setup-failure` | Report verified setup failure and safe closure. |
 | `POST /v1/admin/payment-attempts/{attempt_id}/closure-reports` | Confirm provider checkout cannot take payment. |
 | `POST /v1/admin/payment-attempts/{attempt_id}/actions/resolve` | Resolve conflicting payment evidence with guarded verification. |
-| `POST /v1/admin/orders/{order_id}/refund-reports` | Report a provider refund; does not initiate it. |
+| `POST /v1/admin/orders/{order_id}/refund-reports` | Report a provider refund; does not initiate it. Returns `503 payment_not_confirmed` without saving evidence while the original payment is still unresolved. |
 | `POST /v1/admin/orders/{order_id}/fee-reports` | Report actual processing/platform fee components. |
 | `POST /v1/admin/orders/{order_id}/fee-confirmations` | Confirm complete fee amounts, including verified zero. |
 
@@ -303,6 +303,7 @@ Use `error.code` for program logic; use `error.message` for explanation. Retry n
 | `checkout_ended` | Checkout permission terminated. |
 | `provider_reference_conflict` | Provider reference conflicts with another attempt in the same Site. |
 | `payment_report_conflict` | Payment evidence contradicts the recorded attempt. |
+| `payment_not_confirmed` | Refund report must wait for the original payment outcome; retry with the same key. |
 | `refund_report_conflict` | Refund evidence/amount contradicts the ledger. |
 | `fee_report_conflict` | Fee revision or confirmation contradicts records. |
 | `delivery_report_conflict` | Same provider delivery event has contradictory data. |
@@ -639,7 +640,7 @@ Buyer `Refund` objects include only outcome, amount, currency, and observation/c
 
 The contract also requires refund timestamps/history without enumerating every stored timestamp field name.
 
-Completed refund amounts accumulate per Order and cannot exceed its confirmed payment amount. Full refund blocks future Admission; capacity is returned per unadmitted Ticket once, while already-admitted Tickets keep their Admission record and do not return capacity. Event cancellation remains a separate Event state.
+Completed refund amounts accumulate per Order and cannot exceed its confirmed payment amount. Full refund blocks future Admission; capacity is returned per unadmitted Ticket once, while already-admitted Tickets keep their Admission record and do not return capacity. A full refund before issuance releases the held Reservation and prevents a later issuance retry. Event cancellation remains a separate Event state.
 
 ### Submission, lookup, and Admission input
 
@@ -801,7 +802,7 @@ Each row lists operation-specific body fields/result data. Apply common headers 
 | Setup failure | `reason, provider_checkout_closed:true, payment_outcome` | `PaymentAttempt; 200` |
 | Closure report | `connection_id, source_reference, provider_checkout_reference, observed_at, provider_checkout_closed:true, payment_outcome` | `PaymentAttempt; 200` |
 | Resolve attempt | `expected_version, reason, verification_reference, report` | `200; guarded verified resolution` |
-| Refund report | `attempt_id, connection_id, provider_payment_reference, provider_refund_reference, source_reference, outcome, amount, currency, observed_at` | `{report_id,applied,stale,refund,order_id,report}; new 201 / exact replay 200 / conflict 409` |
+| Refund report | `attempt_id, connection_id, provider_payment_reference, provider_refund_reference, source_reference, outcome, amount, currency, observed_at` | `{report_id,applied,stale,refund,order_id,report}; new 201 / exact replay 200 / conflict 409 / payment_not_confirmed 503 with retry` |
 | Fee report | `attempt_id, connection_id, scope_type, scope_reference, source_reference, source_revision, category, direction, amount, currency, observed_at` | `{fee_record_id,applied,order_id}; new/revised 201 / repeat 200` |
 | Fee confirmation | `attempt_id, connection_id, scope_type, scope_reference, category, totals, observed_at` | `{order_id,scope_type,scope_reference,category,reporting_status}; 200` |
 | Claim jobs | `Optional limit, kinds` | `{claim_id,lease_expires_at,jobs}; 200` |
