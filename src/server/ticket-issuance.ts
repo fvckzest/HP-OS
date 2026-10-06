@@ -6,6 +6,7 @@ import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
 import { publicEventData } from "./events";
 import { enqueueNotificationJob, supersedeUnsentNotificationJobs } from "./notifications";
+import { readFeeRecords } from "./fee-reports";
 import type { AuthenticatedSite } from "./site-auth";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -821,16 +822,24 @@ async function readAdminOrder(site: AuthenticatedSite, orderId: string, existing
        left join hpos.payment_report_issue_resolutions resolution
          on resolution.issue_id = issue.id and resolution.site_id = issue.site_id
        where issue.site_id = $1 and issue.order_id = $2
-       union all
+      union all
        select issue.id, issue.code, issue.status, issue.message, issue.created_at, issue.resolved_at,
               null::uuid as resolution_id, null::text as actor_type, null::text as actor_reference,
               null::text as reason, null::text as verification_reference,
               null::integer as previous_version, null::integer as new_version
        from hpos.refund_report_issues issue
        where issue.site_id = $1 and issue.order_id = $2
+       union all
+       select issue.id, issue.code, issue.status, issue.message, issue.created_at, issue.resolved_at,
+              null::uuid as resolution_id, null::text as actor_type, null::text as actor_reference,
+              null::text as reason, null::text as verification_reference,
+              null::integer as previous_version, null::integer as new_version
+       from hpos.fee_report_issues issue
+       where issue.site_id = $1 and issue.order_id = $2
        order by created_at asc, id asc`,
       [site.siteId, orderId],
     );
+    const feeRecords = await readFeeRecords(client, site.siteId, orderId);
     const recoveryActionsResult = await client.query<{
       id: string; action: string; actor_type: string; actor_reference: string;
       previous_version: number; new_version: number; created_at: Date;
@@ -927,7 +936,7 @@ async function readAdminOrder(site: AuthenticatedSite, orderId: string, existing
         conflict_code: report.conflict_code,
         created_at: report.created_at.toISOString(),
       })),
-      fee_records: [],
+      fee_records: feeRecords,
       notification_jobs: jobsResult.rows.map((job) => ({
         job_id: job.id,
         kind: job.kind,

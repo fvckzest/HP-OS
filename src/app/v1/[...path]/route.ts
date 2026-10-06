@@ -11,6 +11,8 @@ import { handleEventActionPost, handleEventGet, handleEventPatch, handleEventPos
 import { handleAdmissionPost } from "@/server/admissions";
 import { handleBuyerOrderRecoveryPost } from "@/server/buyer-order-recovery";
 import { handleProviderMappingDelete, handleProviderMappingPut } from "@/server/provider-mappings";
+import { handleFeeReportPost } from "@/server/fee-reports";
+import { handleAdminReportingGet } from "@/server/admin-reporting";
 
 export const dynamic = "force-dynamic";
 
@@ -35,6 +37,9 @@ export async function GET(request: Request, context: RouteContext) {
 
     const adminOrderResponse = await handleAdminOrderGet(authentication.site, path);
     if (adminOrderResponse) return adminOrderResponse;
+
+    const adminReportingResponse = await handleAdminReportingGet(request, authentication.site, path);
+    if (adminReportingResponse) return adminReportingResponse;
 
     const eventResponse = await handleEventGet(request, authentication.site, path);
     if (eventResponse) return eventResponse;
@@ -82,6 +87,9 @@ export async function POST(request: Request, context: RouteContext) {
 
     const refundReportResponse = await handleRefundReportPost(request, authentication.site, path);
     if (refundReportResponse) return refundReportResponse;
+
+    const feeReportResponse = await handleFeeReportPost(request, authentication.site, path);
+    if (feeReportResponse) return feeReportResponse;
 
     const adminOrderActionResponse = await handleAdminOrderActionPost(request, authentication.site, path);
     if (adminOrderActionResponse) return adminOrderActionResponse;
