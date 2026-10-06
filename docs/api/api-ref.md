@@ -306,6 +306,7 @@ Use `error.code` for program logic; use `error.message` for explanation. Retry n
 | `payment_not_confirmed` | Refund report must wait for the original payment outcome; retry with the same key. |
 | `refund_report_conflict` | Refund evidence/amount contradicts the ledger. |
 | `fee_report_conflict` | Fee revision or confirmation contradicts records. |
+| `planned_platform_fee_discrepancy` | Confirmed platform fee differs from the planned checkout fee; the actual report remains authoritative. |
 | `delivery_report_conflict` | Same provider delivery event has contradictory data. |
 | `event_canceled` | Canceled Event blocks the operation. |
 | `ticket_refunded` | Full refund prevents future Admission. |
@@ -657,12 +658,13 @@ Completed refund amounts accumulate per Order and cannot exceed its confirmed pa
 
 | Field | Type | Meaning |
 | --- | --- | --- |
+| `actor` | Actor; admin write | Site-asserted user/system attribution for the verified report. |
 | `attempt_id` | string | Owning payment attempt. |
 | `connection_id` | string | Provider connection. |
 | `scope_type` | enum | payment or refund. |
 | `scope_reference` | string | Provider payment/refund reference. |
 | `source_reference` | string; component | Stable provider fee-component source. |
-| `source_revision` | positive integer; component | Verified revision; newer revisions replace aggregation value. |
+| `source_revision` | positive safe integer; component | Verified provider revision (including LMNL observation timestamps); newer revisions replace aggregation value. |
 | `category` | enum | processing or platform. |
 | `direction` | enum; component | charge or return. |
 | `amount` | integer; component | Nonnegative actual fee component, not an estimate. |
@@ -801,11 +803,13 @@ Each row lists operation-specific body fields/result data. Apply common headers 
 | Closure report | `connection_id, source_reference, provider_checkout_reference, observed_at, provider_checkout_closed:true, payment_outcome` | `PaymentAttempt; 200` |
 | Resolve attempt | `expected_version, reason, verification_reference, report` | `200; guarded verified resolution` |
 | Refund report | `attempt_id, connection_id, provider_payment_reference, provider_refund_reference, source_reference, outcome, amount, currency, observed_at` | `{report_id,applied,stale,refund,order_id,report}; new 201 / exact replay 200 / conflict 409 / payment_not_confirmed 503 with retry` |
-| Fee report | `attempt_id, connection_id, scope_type, scope_reference, source_reference, source_revision, category, direction, amount, currency, observed_at` | `{fee_record_id,applied,order_id}; new/revised 201 / repeat 200` |
-| Fee confirmation | `attempt_id, connection_id, scope_type, scope_reference, category, totals, observed_at` | `{order_id,scope_type,scope_reference,category,reporting_status}; 200` |
+| Fee report | `actor, attempt_id, connection_id, scope_type, scope_reference, source_reference, source_revision, category, direction, amount, currency, observed_at` | `{fee_record_id,applied,order_id}; new/revised 201 / repeat 200 / scope conflict 409` |
+| Fee confirmation | `actor, attempt_id, connection_id, scope_type, scope_reference, category, totals, observed_at` | `{order_id,scope_type,scope_reference,category,reporting_status}; 200 / scope conflict 409` |
 | Claim jobs | `Optional limit, kinds` | `{claim_id,lease_expires_at,jobs}; 200` |
 | Renew claim | `No operation fields` | `{claim_id,lease_expires_at}; 200` |
 | Dispatch outcome | `claim_id, outcome, provider_message_reference, observed_at, error_code, failure_class` | `NotificationJob; 200` |
 | Delivery outcome | `outcome, provider_message_reference, provider_event_reference, observed_at` | `NotificationJob; 200` |
+
+Refund-scoped fee reports and confirmations require a completed refund whose Order and payment attempt are still confirmed paid; otherwise HP-OS returns `409 fee_report_conflict`.
 
 `OrderSummary` contains order_id, order_reference, buyer_name, delivery_email, the four Order status fields, and tickets using AdminTicket. It omits buyer access tokens. Normal GET requests have no JSON body; list filters go in the query string. Manual lookup puts its pagination in its POST body.
