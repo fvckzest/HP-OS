@@ -1,5 +1,7 @@
 # Ticketing
 
+Issue #43 implements Site-scoped Order and Ticket lists, one-snapshot Event totals, and actual processing/platform fee reporting. Fee components retain provider source revisions and conflicts; explicit confirmations are required before aggregate fee values become complete, so missing information stays pending. LMNL presentation and provider settlement remain cutover proof.
+
 ## Purpose and ownership
 
 HP-OS owns each Site's Buyers, Orders, Reservations, Tickets, Admissions, and sales totals. LMNL is the first Site. The first-release jobs were selected in [ticket #6](https://github.com/fvckzest/HP-OS/issues/6); the journey rules below were settled in [ticket #8](https://github.com/fvckzest/HP-OS/issues/8). See [ownership](../ownership.md) and the [domain glossary](../../CONTEXT.md).
