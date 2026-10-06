@@ -74,6 +74,7 @@ interface ScopeRow extends QueryResultRow {
   attempt_id: string;
   connection_id: string;
   provider_payment_reference: string | null;
+  payment_currency: string | null;
   payment_status: string;
   refund_id: string | null;
   refund_outcome: string | null;
@@ -232,24 +233,40 @@ function feeRecordData(row: FeeRecordRow, current = false) {
 }
 
 async function scopeRow(client: PoolClient, siteId: string, orderId: string, input: Pick<FeeInput, "attempt_id" | "connection_id" | "scope_type" | "scope_reference">): Promise<ScopeRow | null> {
-  const result = await client.query<ScopeRow>(
-    `select order_row.id as order_id, attempt.id as attempt_id, attempt.connection_id,
-            attempt.provider_payment_reference, order_row.payment_status,
-            refund.id as refund_id, refund.outcome as refund_outcome,
-            refund.amount as refund_amount, refund.currency as refund_currency
-     from hpos.orders order_row
-     join hpos.payment_attempts attempt on attempt.order_id = order_row.id and attempt.site_id = order_row.site_id
-     left join hpos.refunds refund
-       on refund.order_id = order_row.id and refund.site_id = order_row.site_id
-      and refund.attempt_id = attempt.id and refund.connection_id = attempt.connection_id
-      and refund.provider_refund_reference = $6
-     where order_row.site_id = $1 and order_row.id = $2
-       and attempt.id = $3 and attempt.connection_id = $4
-       and (($5 = 'payment' and attempt.provider_payment_reference = $6 and attempt.last_outcome = 'paid' and order_row.payment_status = 'paid')
-         or ($5 = 'refund' and refund.provider_refund_reference = $6 and refund.outcome = 'completed'))
-     for update of order_row, attempt, refund`,
-    [siteId, orderId, input.attempt_id, input.connection_id, input.scope_type, input.scope_reference],
-  );
+  const result = input.scope_type === "payment"
+    ? await client.query<ScopeRow>(
+      `select order_row.id as order_id, attempt.id as attempt_id, attempt.connection_id,
+              attempt.provider_payment_reference, attempt.currency as payment_currency,
+              order_row.payment_status,
+              null::uuid as refund_id, null::text as refund_outcome,
+              null::bigint as refund_amount, null::text as refund_currency
+       from hpos.orders order_row
+       join hpos.payment_attempts attempt on attempt.order_id = order_row.id and attempt.site_id = order_row.site_id
+       where order_row.site_id = $1 and order_row.id = $2
+         and attempt.id = $3 and attempt.connection_id = $4
+         and attempt.provider_payment_reference = $5
+         and attempt.last_outcome = 'paid' and order_row.payment_status = 'paid'
+       for update of order_row, attempt`,
+      [siteId, orderId, input.attempt_id, input.connection_id, input.scope_reference],
+    )
+    : await client.query<ScopeRow>(
+      `select order_row.id as order_id, attempt.id as attempt_id, attempt.connection_id,
+              attempt.provider_payment_reference, attempt.currency as payment_currency,
+              order_row.payment_status,
+              refund.id as refund_id, refund.outcome as refund_outcome,
+              refund.amount as refund_amount, refund.currency as refund_currency
+       from hpos.orders order_row
+       join hpos.payment_attempts attempt on attempt.order_id = order_row.id and attempt.site_id = order_row.site_id
+       join hpos.refunds refund
+         on refund.order_id = order_row.id and refund.site_id = order_row.site_id
+        and refund.attempt_id = attempt.id and refund.connection_id = attempt.connection_id
+        and refund.provider_refund_reference = $5
+       where order_row.site_id = $1 and order_row.id = $2
+         and attempt.id = $3 and attempt.connection_id = $4
+         and refund.outcome = 'completed'
+       for update of order_row, attempt, refund`,
+      [siteId, orderId, input.attempt_id, input.connection_id, input.scope_reference],
+    );
   return result.rows[0] ?? null;
 }
 
@@ -402,10 +419,10 @@ async function feeConfirmationAction(client: PoolClient, site: AuthenticatedSite
   const rows = await currentComponents(client, site.siteId, input);
   const calculated = componentTotals(rows);
   const expected = new Map(input.totals.map((row) => [row.currency, { charged: row.charged, returned: row.returned }]));
-  if (input.scope_type === "payment" && scope.payment_currency && !expected.has(scope.payment_currency)) {
+  if (input.scope_type === "payment" && (!scope.payment_currency || !expected.has(scope.payment_currency))) {
     throw new ApiOperationError(409, "fee_report_conflict", "A payment confirmation must include its payment currency, including when the confirmed fee is zero.");
   }
-  if (input.scope_type === "refund" && scope.refund_currency && !expected.has(scope.refund_currency)) {
+  if (input.scope_type === "refund" && (!scope.refund_currency || !expected.has(scope.refund_currency))) {
     throw new ApiOperationError(409, "fee_report_conflict", "A refund confirmation must include its refund currency, including when the confirmed fee is zero.");
   }
   for (const [currency, value] of calculated) {

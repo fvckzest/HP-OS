@@ -1,6 +1,6 @@
 # Ticketing
 
-Issue #43 implements Site-scoped Order and Ticket lists, one-snapshot Event totals, and actual processing/platform fee reporting. Fee components retain provider source revisions and conflicts; explicit confirmations are required before aggregate fee values become complete, so missing information stays pending. LMNL presentation and provider settlement remain cutover proof.
+Issue #43 implements Site-scoped Order and Ticket lists, one-snapshot Event totals, and actual processing/platform fee reporting. Fee components retain provider source revisions and conflicts; explicit confirmations are required before aggregate fee values become complete, so missing information stays pending. Completeness follows provider observation time, so a late-submitted stale confirmation cannot close a newer fee revision. LMNL presentation and provider settlement remain cutover proof.
 
 ## Purpose and ownership
 

@@ -66,7 +66,9 @@ interface CurrentFeeRow extends QueryResultRow {
   direction: "charge" | "return";
   amount: string | number;
   currency: string;
+  id: string;
   created_at: Date;
+  observed_at: Date;
   attempt_id: string;
   connection_id: string;
   scope_type: "payment" | "refund";
@@ -127,6 +129,17 @@ function addSafe(left: number, right: number): number {
   const result = left + right;
   if (!Number.isSafeInteger(result)) throw new ApiOperationError(503, "service_unavailable", "A totals amount exceeds the supported safe integer range.");
   return result;
+}
+
+function observationComesBefore(
+  left: { observed_at: Date; created_at: Date; id: string },
+  right: { observed_at: Date; created_at: Date; id: string },
+): boolean {
+  const observed = left.observed_at.getTime() - right.observed_at.getTime();
+  if (observed !== 0) return observed < 0;
+  const created = left.created_at.getTime() - right.created_at.getTime();
+  if (created !== 0) return created < 0;
+  return left.id < right.id;
 }
 
 function admissionBlockers(row: Pick<TicketRow, "event_canceled" | "refund_status" | "admission_id" | "check_in_opens_at" | "starts_at" | "ends_at">, now: Date): string[] {
@@ -333,7 +346,7 @@ async function readTotals(site: AuthenticatedSite, eventId: string): Promise<Res
     }
     const feeRows = await client.query<CurrentFeeRow>(
       `select distinct on (fee.connection_id, fee.source_reference, fee.category, fee.direction)
-              fee.category, fee.direction, fee.amount, fee.currency, fee.created_at,
+              fee.id, fee.category, fee.direction, fee.amount, fee.currency, fee.created_at, fee.observed_at,
               fee.attempt_id, fee.connection_id, fee.scope_type, fee.scope_reference
        from hpos.fee_records fee join hpos.orders order_row on order_row.id = fee.order_id and order_row.site_id = fee.site_id
        where fee.site_id = $1 and order_row.event_id = $2 and fee.conflict_code is null
@@ -365,11 +378,11 @@ async function readTotals(site: AuthenticatedSite, eventId: string): Promise<Res
        select refund.attempt_id, refund.connection_id, 'refund'::text, refund.provider_refund_reference, refund.currency
        from hpos.refunds refund join hpos.orders order_row on order_row.id = refund.order_id and order_row.site_id = refund.site_id
        where refund.site_id = $1 and order_row.event_id = $2 and refund.outcome = 'completed'`, [site.siteId, eventId]);
-    const confirmations = await client.query<{ attempt_id: string; connection_id: string; scope_type: "payment" | "refund"; scope_reference: string; category: "processing" | "platform"; created_at: Date }>(
+    const confirmations = await client.query<{ id: string; attempt_id: string; connection_id: string; scope_type: "payment" | "refund"; scope_reference: string; category: "processing" | "platform"; observed_at: Date; created_at: Date }>(
       `select distinct on (attempt_id, connection_id, scope_type, scope_reference, category)
-              attempt_id, connection_id, scope_type, scope_reference, category, created_at
+              id, attempt_id, connection_id, scope_type, scope_reference, category, observed_at, created_at
        from hpos.fee_confirmations where site_id = $1
-       order by attempt_id, connection_id, scope_type, scope_reference, category, created_at desc, id desc`, [site.siteId]);
+       order by attempt_id, connection_id, scope_type, scope_reference, category, observed_at desc, created_at desc, id desc`, [site.siteId]);
     const latestConfirmations = new Map(confirmations.rows.map((row) => [`${row.attempt_id}|${row.connection_id}|${row.scope_type}|${row.scope_reference}|${row.category}`, row]));
     const feeConflicts = await client.query<{ attempt_id: string; connection_id: string; scope_type: "payment" | "refund"; scope_reference: string; category: "processing" | "platform" }>(
       `select distinct fee.attempt_id, fee.connection_id, fee.scope_type, fee.scope_reference, fee.category
@@ -382,8 +395,8 @@ async function readTotals(site: AuthenticatedSite, eventId: string): Promise<Res
       for (const scope of scopes.rows) {
         const key = `${scope.attempt_id}|${scope.connection_id}|${scope.scope_type}|${scope.scope_reference}|${category}`;
         const confirmation = latestConfirmations.get(key);
-        const changed = await client.query<{ latest_fee: Date | null }>(
-          `select max(fee.created_at) as latest_fee
+        const changed = await client.query<{ latest_fee_observed_at: Date; latest_fee_created_at: Date; latest_fee_id: string }>(
+          `select fee.observed_at as latest_fee_observed_at, fee.created_at as latest_fee_created_at, fee.id as latest_fee_id
            from hpos.fee_records fee
            where fee.site_id = $1 and fee.attempt_id = $2 and fee.connection_id = $3
              and fee.scope_type = $4 and fee.scope_reference = $5 and fee.category = $6
@@ -395,9 +408,17 @@ async function readTotals(site: AuthenticatedSite, eventId: string): Promise<Res
                  and newer.scope_reference = fee.scope_reference and newer.category = fee.category
                  and newer.source_reference = fee.source_reference and newer.direction = fee.direction
                  and newer.conflict_code is null and newer.source_revision > fee.source_revision
-             )`,
+             )
+           order by fee.observed_at desc, fee.created_at desc, fee.id desc
+           limit 1`,
           [site.siteId, scope.attempt_id, scope.connection_id, scope.scope_type, scope.scope_reference, category]);
-        if (!confirmation || conflictKeys.has(key) || (changed.rows[0]?.latest_fee && confirmation.created_at < changed.rows[0].latest_fee)) { complete = false; break; }
+        const latestFee = changed.rows[0];
+        if (!confirmation || conflictKeys.has(key)
+          || (latestFee && observationComesBefore(confirmation, {
+            observed_at: latestFee.latest_fee_observed_at,
+            created_at: latestFee.latest_fee_created_at,
+            id: latestFee.latest_fee_id,
+          }))) { complete = false; break; }
       }
       feeComplete.set(category, complete);
     }

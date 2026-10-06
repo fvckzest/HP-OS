@@ -18,7 +18,8 @@
     "test": "node scripts/verify-local.mjs",
     "verify:local": "node scripts/verify-local.mjs",
     "verify:notifications": "node scripts/verify-notifications.mjs",
-    "verify:events": "node scripts/verify-events.mjs"
+    "verify:events": "node scripts/verify-events.mjs",
+    "verify:fees": "node scripts/verify-fee-reporting.mjs"
   },
   "dependencies": {
     "next": "16.3.6",
