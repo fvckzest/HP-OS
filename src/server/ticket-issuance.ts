@@ -338,7 +338,7 @@ export async function issuePaidOrder(siteId: string, orderId: string): Promise<{
       blockMessage = "The paid Order has no recoverable buyer access token, so issuance needs staff investigation.";
     }
     if (blockCode) {
-      if (blockCode === "event_canceled" && row.reservation_status === "held") {
+      if ((blockCode === "event_canceled" || blockCode === "order_fully_refunded") && row.reservation_status === "held") {
         const released = await client.query<{ quantity: number }>(
           `update hpos.reservations
            set status = 'released', awaiting_provider_verification = false, updated_at = clock_timestamp()
@@ -355,7 +355,7 @@ export async function issuePaidOrder(siteId: string, orderId: string): Promise<{
              returning id`,
             [row.ticket_offering_id, siteId, quantity],
           );
-          if (capacity.rowCount !== 1) throw new Error("The canceled paid Order Reservation could not be released safely.");
+          if (capacity.rowCount !== 1) throw new Error("The blocked paid Order Reservation could not be released safely.");
         }
       }
       await client.query(
