@@ -28,6 +28,9 @@ interface LockedRefundOrder {
   site_id: string;
   event_id: string;
   offering_id: string;
+  reservation_id: string;
+  reservation_status: "held" | "consumed" | "released";
+  reservation_offering_id: string;
   payment_status: string;
   refund_status: "none" | "partial" | "full";
   is_canceled: boolean;
@@ -331,7 +334,9 @@ async function lookupOrderForRefund(
             event_row.is_canceled, attempt.id as attempt_id, attempt.connection_id,
             attempt.provider, attempt.environment, attempt.account_reference,
             attempt.provider_payment_reference, attempt.last_outcome,
-            attempt.total_amount, attempt.currency
+            attempt.total_amount, attempt.currency,
+            reservation.id as reservation_id, reservation.status as reservation_status,
+            reservation.offering_id as reservation_offering_id
      from hpos.payment_attempts attempt
      join hpos.orders order_row on order_row.id = attempt.order_id and order_row.site_id = attempt.site_id
      join hpos.events event_row on event_row.id = order_row.event_id and event_row.site_id = order_row.site_id
@@ -363,6 +368,13 @@ async function addRefundReport(
     throw new ApiOperationError(404, "not_found", "The refund report connection is not available.");
   }
   const order = await lookupOrderForRefund(client, site.siteId, routeOrderId, input);
+
+  // Refund reports lock in Event -> source-reference -> provider-refund order.
+  // The source lock must precede every deduplication read so two Orders in the
+  // same Site cannot both accept one provider event concurrently.
+  await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [
+    `refund-source:${site.siteId}:${input.connection_id}:${input.source_reference}`,
+  ]);
   const reportFingerprint = fingerprint(input);
   const conflict = (message: string) => retainReport(client, order, input, reportFingerprint, message);
 
@@ -426,12 +438,35 @@ async function addRefundReport(
   if (input.connection_id !== order.connection_id) {
     return conflict("The refund report must use the payment connection frozen on the original attempt.");
   }
-  if (input.provider_payment_reference !== order.provider_payment_reference || order.last_outcome !== "paid"
-    || order.payment_status !== "paid") {
-    return conflict("The refund report does not match a verified paid provider payment on this Order.");
-  }
   if (input.currency !== order.currency) {
     return conflict("The refund currency does not match the verified payment currency.");
+  }
+  if (order.provider_payment_reference !== null
+    && input.provider_payment_reference !== order.provider_payment_reference) {
+    return conflict("The refund report does not match a verified paid provider payment on this Order.");
+  }
+
+  const paymentPending = order.last_outcome === null
+    || order.last_outcome === "processing"
+    || order.last_outcome === "unknown"
+    || order.payment_status === "unpaid"
+    || order.payment_status === "processing"
+    || order.payment_status === "unknown";
+  if (order.last_outcome !== "paid" || order.payment_status !== "paid") {
+    if (paymentPending) {
+      // This exception rolls back the idempotency insert and all report work.
+      // The same source and Idempotency-Key can therefore be retried after the
+      // payment worker records a verified outcome.
+      throw new ApiOperationError(
+        503,
+        "payment_not_confirmed",
+        "The original payment is still being confirmed; retry this refund report after the payment outcome is verified.",
+      );
+    }
+    return conflict("The refund report does not match a verified paid provider payment on this Order.");
+  }
+  if (input.provider_payment_reference !== order.provider_payment_reference) {
+    return conflict("The refund report does not match a verified paid provider payment on this Order.");
   }
 
   const sameSource = await client.query<{ attempt_id: string; report_fingerprint: string }>(
@@ -596,6 +631,26 @@ async function addRefundReport(
           [offeringId, site.siteId, quantity],
         );
         if (capacity.rowCount !== 1) throw new Error("Refunded Ticket capacity could not be restored safely.");
+      }
+    }
+    if (order.reservation_status === "held") {
+      const releasedReservation = await client.query<{ quantity: number }>(
+        `update hpos.reservations
+         set status = 'released', awaiting_provider_verification = false, updated_at = clock_timestamp()
+         where id = $1 and site_id = $2 and status = 'held'
+         returning quantity`,
+        [order.reservation_id, site.siteId],
+      );
+      const quantity = releasedReservation.rows[0]?.quantity;
+      if (quantity !== undefined) {
+        const capacity = await client.query(
+          `update hpos.ticket_offerings
+           set reserved_quantity = reserved_quantity - $3
+           where id = $1 and site_id = $2 and reserved_quantity >= $3
+           returning id`,
+          [order.reservation_offering_id, site.siteId, quantity],
+        );
+        if (capacity.rowCount !== 1) throw new Error("Refunded Order Reservation capacity could not be restored safely.");
       }
     }
   }
