@@ -382,6 +382,18 @@ async function verify() {
   });
   assert(conflictingPayment.status === 409 && conflictingPayment.data?.error?.code === "payment_report_conflict",
     `A contradictory payment report was not retained as a payment conflict: ${JSON.stringify(conflictingPayment.data)}`);
+  const feeForConflictedRefund = await api(paymentPath, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: feeReport("refund", secondRefundScope, "issue43-conflicted-refund-source", 1, 1, "USD", "2030-01-02T21:00:00Z"),
+  });
+  assert(feeForConflictedRefund.status === 409,
+    `A fee report for a completed refund remained eligible after its payment became conflicted: ${JSON.stringify(feeForConflictedRefund.data)}`);
+  const confirmationForConflictedRefund = await api(confirmationPath, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: confirmation("refund", secondRefundScope, "processing", [{ currency: "USD", charged: 0, returned: 0 }], "2030-01-02T21:01:00Z"),
+  });
+  assert(confirmationForConflictedRefund.status === 409,
+    `A fee confirmation for a completed refund remained eligible after its payment became conflicted: ${JSON.stringify(confirmationForConflictedRefund.data)}`);
   const excludedScopeTotals = await api(totalsPath);
   const excludedScopeSales = new Map(excludedScopeTotals.data?.data?.sales?.map((row) => [row.currency, row]) ?? []);
   assert(excludedScopeTotals.status === 200 && !excludedScopeSales.has("JPY")
@@ -446,7 +458,7 @@ async function main() {
     app = startApp();
     await waitForReady(app);
     await verify();
-    console.log("Issue 43 fee-reporting verification passed: PostgreSQL row locking, transaction currencies for explicit zero confirmations, stale confirmation ordering, completed refund scopes, and overlapping Ticket totals.");
+    console.log("Issue 43 fee-reporting verification passed: PostgreSQL row locking, transaction currencies for explicit zero confirmations, stale confirmation ordering, paid-payment fencing for refund fee reports, and overlapping Ticket totals.");
   } catch (caught) {
     error = caught;
     console.error(caught instanceof Error ? caught.message : "Fee verification failed.");

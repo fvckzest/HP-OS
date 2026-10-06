@@ -263,6 +263,7 @@ async function scopeRow(client: PoolClient, siteId: string, orderId: string, inp
         and refund.provider_refund_reference = $5
        where order_row.site_id = $1 and order_row.id = $2
          and attempt.id = $3 and attempt.connection_id = $4
+         and attempt.last_outcome = 'paid' and order_row.payment_status = 'paid'
          and refund.outcome = 'completed'
        for update of order_row, attempt, refund`,
       [siteId, orderId, input.attempt_id, input.connection_id, input.scope_reference],

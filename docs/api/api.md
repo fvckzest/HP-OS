@@ -343,6 +343,8 @@ Each currency's sales entry contains `processing_fees` and `platform_fees`. Each
 
 `POST /v1/admin/orders/{order_id}/fee-reports` accepts verified fee reports from the Site backend. Each report identifies the recorded payment attempt and connection, a stable provider source reference, a positive safe-integer source revision, the fee category (processing or platform), whether it is a charge or return, and its amount and currency. It requires `Idempotency-Key`. HP-OS also deduplicates the source reference so the same fee cannot be counted twice under different request keys. Fee reporting is independent of Ticket issuance: a confirmed payment can issue Tickets while its fee information remains pending. These requirements were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
 
+A refund-scoped fee report or confirmation is accepted only while its Order and payment attempt remain confirmed as paid and the refund is completed. A completed refund on an unpaid or conflicted payment cannot add fee evidence.
+
 For the current snapshot, a fee category becomes complete only after the Site explicitly confirms its fees for every paid Order and confirmed refund included in that snapshot. No fee, or no fee returned, must be explicitly confirmed as zero; a missing report remains pending. The Event category is complete when all relevant Orders are complete. A new payment or refund makes the affected fee reporting pending again until verified. Complete describes the current snapshot and does not prevent later provider adjustments from updating it. These completeness criteria were settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
 
 ## Notification jobs
