@@ -12,6 +12,7 @@ const databaseUrl = process.env.HPOS_DATABASE_URL ?? "postgresql://postgres:post
 const env = { ...process.env, NODE_ENV: "development", HPOS_DATABASE_URL: databaseUrl, NEXT_TELEMETRY_DISABLED: "1" };
 const pool = new pg.Pool({ connectionString: databaseUrl, max: 5, connectionTimeoutMillis: 2_000 });
 let server = null;
+let fixtureOrganizationId = null;
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -85,6 +86,7 @@ async function api(site, pathname, { method = "GET", body, idempotencyKey = meth
 
 function fixture() {
   const organization = runOperator(["organization", "create", "--name", `Issue 44 ${randomUUID()}`, "--pilot-fee-rate-basis-points", "1000"]);
+  fixtureOrganizationId = organization.organization_id;
   const site = runOperator(["site", "create", "--organization", organization.organization_id, "--name", "Issue 44 primary Site"]);
   const otherSite = runOperator(["site", "create", "--organization", organization.organization_id, "--name", "Issue 44 isolation Site"]);
   const original = runOperator(["payment-connection", "create", "--organization", organization.organization_id, "--provider", "square", "--environment", "test", "--account-reference", `ref:issue44-original-${randomUUID()}`, "--location-reference", "ref:issue44-original-location"]);
@@ -103,6 +105,58 @@ function fixture() {
     original: original.connection_id,
     replacement: replacement.connection_id,
   };
+}
+
+async function cleanupFixture(organizationId) {
+  if (!organizationId) return;
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    const sites = await client.query("select id from hpos.sites where organization_id = $1", [organizationId]);
+    const siteIds = sites.rows.map((row) => row.id);
+    if (siteIds.length > 0) {
+      const siteScopedTables = [
+        "notification_delivery_events",
+        "notification_dispatch_attempts",
+        "notification_jobs",
+        "notification_claims",
+        "api_idempotency_records",
+        "admissions",
+        "payment_report_issue_resolutions",
+        "refund_report_issues",
+        "payment_report_issues",
+        "refund_reports",
+        "refunds",
+        "payment_attempt_reports",
+        "payment_attempt_closure_reports",
+        "order_recovery_actions",
+        "order_recovery_tokens",
+        "tickets",
+        "payment_attempts",
+        "reservations",
+        "orders",
+        "public_quotes",
+        "ticket_offering_provider_mappings",
+        "events",
+        "buyers",
+        "site_api_keys",
+        "site_request_windows",
+      ];
+      for (const table of siteScopedTables) {
+        await client.query(`delete from hpos.${table} where site_id = any($1::uuid[])`, [siteIds]);
+      }
+    }
+    await client.query("delete from hpos.site_payment_connection_assignments where organization_id = $1", [organizationId]);
+    await client.query("delete from hpos.payment_connections where organization_id = $1", [organizationId]);
+    await client.query("delete from hpos.sites where organization_id = $1", [organizationId]);
+    await client.query("delete from hpos.organizations where id = $1", [organizationId]);
+    await client.query("commit");
+  } catch (error) {
+    await client.query("rollback").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function createEvent(site) {
@@ -229,7 +283,20 @@ async function main() {
 
     const foreignConnection = await api(fixtureData.otherSite, `/v1/admin/payment-connections/${fixtureData.original}`);
     const foreignAttempt = await api(fixtureData.otherSite, `/v1/admin/payment-attempts/${oldAttempt.attempt_id}`);
-    assert(foreignConnection.response.status === 404 && foreignAttempt.response.status === 404, "A different Site could read historical connection or attempt data.");
+    const foreignEvent = await api(fixtureData.otherSite, `/v1/admin/events/${event.event_id}`);
+    const foreignMappingPut = await api(fixtureData.otherSite, `/v1/admin/events/${event.event_id}/provider-mappings/${fixtureData.original}`, {
+      method: "PUT", body: {
+        actor, expected_version: replacementEvent.version, resource_type: "square_item_variation",
+        resource_reference: `issue44-cross-site-${randomUUID()}`, verified_at: new Date().toISOString(),
+      },
+    });
+    const foreignMappingDelete = await api(fixtureData.otherSite, `/v1/admin/events/${event.event_id}/provider-mappings/${fixtureData.original}`, {
+      method: "DELETE", body: { actor, expected_version: replacementEvent.version },
+    });
+    assert(foreignConnection.response.status === 404 && foreignAttempt.response.status === 404
+      && foreignEvent.response.status === 404 && foreignMappingPut.response.status === 404
+      && foreignMappingDelete.response.status === 404,
+    "A different Site could read or mutate historical Event, mapping, connection, or attempt data.");
 
     await stopApp(server);
     server = null;
@@ -246,10 +313,14 @@ async function main() {
     } finally {
       await stopApp(restarted);
     }
-    console.log("Issue #44 local synthetic verification passed: replacement Orders used the new connection, historical mapping/payment/refund data stayed on the original connection, restart preserved recovery visibility, and cross-Site reads were rejected. Provider credentials, historical provider recovery, email, hosted, and cutover proof remain external.");
+    console.log("Issue #44 local synthetic verification passed: replacement Orders used the new connection, historical mapping/payment/refund data stayed on the original connection, restart preserved recovery visibility, and cross-Site reads plus mapping writes/deletes were rejected. Provider credentials, historical provider recovery, email, hosted, and cutover proof remain external.");
   } finally {
     await stopApp(server);
-    await pool.end();
+    try {
+      await cleanupFixture(fixtureOrganizationId);
+    } finally {
+      await pool.end();
+    }
   }
 }
 
