@@ -386,6 +386,7 @@ async function readTotals(site: AuthenticatedSite, eventId: string): Promise<Res
       [site.siteId, eventId]);
     const conflictKeys = new Set(scopes.rows.flatMap((scope) =>
       scope.conflict_categories.map((category) => `${scopeKey(scope)}|${category}`)));
+    const currentScopeKeys = new Set(scopes.rows.map(scopeKey));
     const feeRows = await client.query<CurrentFeeRow>(
       `select distinct on (fee.connection_id, fee.source_reference, fee.category, fee.direction)
               fee.id, fee.category, fee.direction, fee.amount, fee.currency, fee.created_at, fee.observed_at,
@@ -396,7 +397,7 @@ async function readTotals(site: AuthenticatedSite, eventId: string): Promise<Res
       [site.siteId, eventId]);
     const feeAmounts = new Map<string, { charged: number; returned: number }>();
     for (const row of feeRows.rows) {
-      if (conflictKeys.has(`${scopeKey(row)}|${row.category}`)) continue;
+      if (!currentScopeKeys.has(scopeKey(row)) || conflictKeys.has(`${scopeKey(row)}|${row.category}`)) continue;
       currencies.add(row.currency);
       const key = `${row.category}|${row.currency}`;
       const current = feeAmounts.get(key) ?? { charged: 0, returned: 0 };
@@ -431,7 +432,7 @@ async function readTotals(site: AuthenticatedSite, eventId: string): Promise<Res
        join hpos.orders order_row on order_row.id = confirmation.order_id and order_row.site_id = confirmation.site_id
        where totals.site_id = $1 and order_row.event_id = $2`, [site.siteId, eventId]);
     for (const row of confirmationCurrencies.rows) {
-      if (!conflictKeys.has(`${scopeKey(row)}|${row.category}`)) currencies.add(row.currency);
+      if (currentScopeKeys.has(scopeKey(row)) && !conflictKeys.has(`${scopeKey(row)}|${row.category}`)) currencies.add(row.currency);
     }
     const confirmations = await client.query<{ id: string; attempt_id: string; connection_id: string; scope_type: "payment" | "refund"; scope_reference: string; category: "processing" | "platform"; observed_at: Date; created_at: Date }>(
       `select distinct on (attempt_id, connection_id, scope_type, scope_reference, category)

@@ -359,6 +359,43 @@ async function verify() {
   assert(totals.data.data.tickets.issued === 1 && totals.data.data.tickets.valid === 0 && totals.data.data.tickets.admitted === 1,
     `Issued, valid, and admitted Ticket totals did not reflect the cumulative full refund: ${JSON.stringify(totals.data)}`);
 
+  // A payment conflict can remove a scope from the reportable paid set without
+  // creating a fee conflict row. Fee evidence for that old scope must not leak
+  // into the Event totals while the payment investigation is open.
+  await pool.query(
+    `update hpos.orders set issuance_status = 'pending', updated_at = clock_timestamp()
+     where id = $1 and site_id = $2`, [fixture.orderId, fixture.siteId]);
+  const conflictingPayment = await api(`/v1/admin/payment-attempts/${fixture.attemptId}/payment-reports`, {
+    method: "POST", idempotencyKey: randomUUID(),
+    body: {
+      connection_id: fixture.connectionId,
+      source_reference: `issue43-payment-conflict-${randomUUID()}`,
+      provider_checkout_reference: "issue43-fee-checkout",
+      provider_payment_reference: `issue43-payment-conflict-ref-${randomUUID()}`,
+      outcome: "paid",
+      observed_at: "2030-01-02T20:00:00Z",
+      payment_started_at: "2030-01-02T20:00:00Z",
+      provider_can_take_payment: false,
+      amount: 2499,
+      currency: "USD",
+    },
+  });
+  assert(conflictingPayment.status === 409 && conflictingPayment.data?.error?.code === "payment_report_conflict",
+    `A contradictory payment report was not retained as a payment conflict: ${JSON.stringify(conflictingPayment.data)}`);
+  const excludedScopeTotals = await api(totalsPath);
+  const excludedScopeSales = new Map(excludedScopeTotals.data?.data?.sales?.map((row) => [row.currency, row]) ?? []);
+  assert(excludedScopeTotals.status === 200 && !excludedScopeSales.has("JPY")
+    && excludedScopeSales.get("USD")?.processing_fees.charged?.amount === 0
+    && excludedScopeSales.get("USD")?.platform_fees.charged?.amount === 0,
+  `A conflicted payment scope without a fee conflict retained fee amounts or currency: ${JSON.stringify(excludedScopeTotals.data)}`);
+  await pool.query(
+    `update hpos.orders
+     set payment_status = 'paid', issuance_status = 'issued', checkout_status = 'ended', updated_at = clock_timestamp()
+     where id = $1 and site_id = $2`, [fixture.orderId, fixture.siteId]);
+  await pool.query(
+    `update hpos.payment_attempts set status = 'closed', updated_at = clock_timestamp()
+     where id = $1 and site_id = $2`, [fixture.attemptId, fixture.siteId]);
+
   const conflictingJpyFee = await api(paymentPath, {
     method: "POST", idempotencyKey: randomUUID(),
     body: feeReport("payment", paymentScope, "issue43-jpy-source", 1, 11, "JPY", "2030-01-02T19:00:00Z"),
