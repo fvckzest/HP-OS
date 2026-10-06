@@ -440,6 +440,8 @@ Text limits: name/title 200 characters; description 20,000; venue address 1,000;
 | `ProviderMapping.resource_reference` | string | Non-secret verified provider resource ID. |
 | `ProviderMapping.verified_at` | timestamp | When the Site verified the resource. |
 
+Mapping writes are guarded by the Event `expected_version`, increment its version and audit actor, and are scoped to a Site-assigned connection. Order creation copies the active connection's mapping into the accepted purchase snapshot; later replacement or removal leaves older Orders and payment attempts unchanged.
+
 ### Quote and accepted pricing
 
 | Field | Type | Meaning |
@@ -781,8 +783,8 @@ Each row lists operation-specific body fields/result data. Apply common headers 
 | Create draft | `Event/offering fields; may all be omitted` | `AdminEvent; 201` |
 | Edit Event | `Changed Event/offering fields + expected_version` | `AdminEvent; 200` |
 | Event action | `expected_version` | `AdminEvent; 200` |
-| Set mapping | `resource_type, resource_reference, verified_at, expected_version` | `AdminEvent; 200` |
-| Delete mapping | `expected_version` | `AdminEvent; 200` |
+| Set mapping | `actor, resource_type, resource_reference, verified_at, expected_version` | `AdminEvent; 200` |
+| Delete mapping | `actor, expected_version` | `AdminEvent; 200` |
 | Quote | `quantity` | `Quote; 201` |
 | Create Order | Current public path: `quote_id, buyer {name,email}` | One unpaid public Order + Reservation + order_token; 201 |
 | Submit Access Request | `name, email` | `{received:true}; 201` |

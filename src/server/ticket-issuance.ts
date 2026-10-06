@@ -746,6 +746,7 @@ async function readAdminOrder(site: AuthenticatedSite, orderId: string, existing
       id: string; connection_id: string; provider: string; environment: string;
       account_reference: string; location_reference: string | null; currency: string;
       total_amount: string | number; platform_fee_amount: string | number;
+      provider_mapping: Record<string, unknown> | null;
       provider_checkout_reference: string | null; provider_payment_reference: string | null;
       last_outcome: string | null; provider_can_take_payment: boolean | null;
       status: string; version: number; created_at: Date; updated_at: Date;
@@ -753,6 +754,7 @@ async function readAdminOrder(site: AuthenticatedSite, orderId: string, existing
       `select attempt.id, attempt.connection_id, attempt.provider, attempt.environment,
               attempt.account_reference, attempt.location_reference, attempt.currency,
               attempt.total_amount, attempt.platform_fee_amount,
+              attempt.provider_mapping,
               attempt.provider_checkout_reference, attempt.provider_payment_reference,
               attempt.last_outcome, attempt.provider_can_take_payment, attempt.status,
               attempt.version, attempt.created_at, attempt.updated_at
@@ -882,6 +884,7 @@ async function readAdminOrder(site: AuthenticatedSite, orderId: string, existing
         currency: attempt.currency,
         total: { amount: safeNumber(attempt.total_amount.toString()), currency: attempt.currency },
         platform_fee_amount: safeNumber(attempt.platform_fee_amount.toString()),
+        provider_mapping: attempt.provider_mapping,
         provider_checkout_reference: attempt.provider_checkout_reference,
         provider_payment_reference: attempt.provider_payment_reference,
         last_outcome: attempt.last_outcome,

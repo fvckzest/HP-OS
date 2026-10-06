@@ -65,6 +65,14 @@ interface EventRow extends QueryResultRow {
   starts_cursor_time?: string;
 }
 
+interface ProviderMappingRow extends QueryResultRow {
+  event_id: string;
+  connection_id: string;
+  resource_type: string;
+  resource_reference: string;
+  verified_at: Date;
+}
+
 export type SalesStatus = "canceled" | "closed" | "not_configured" | "scheduled" | "paused" | "sold_out" | "open";
 
 export interface EventSalesState {
@@ -442,7 +450,34 @@ export function publicEventData(row: EventRow): Record<string, unknown> {
   return eventData(row, false);
 }
 
-async function readAdminEvent(client: PoolClient, siteId: string, eventId: string): Promise<Record<string, unknown> | null> {
+function providerMappingData(mapping: ProviderMappingRow): Record<string, unknown> {
+  return {
+    connection_id: mapping.connection_id,
+    resource_type: mapping.resource_type,
+    resource_reference: mapping.resource_reference,
+    verified_at: mapping.verified_at.toISOString(),
+  };
+}
+
+function setProviderMappings(event: Record<string, unknown>, mappings: ProviderMappingRow[]): void {
+  const offering = event.ticket_offering;
+  if (offering && typeof offering === "object" && !Array.isArray(offering)) {
+    (offering as Record<string, unknown>).provider_mappings = mappings.map(providerMappingData);
+  }
+}
+
+async function readProviderMappings(client: PoolClient, siteId: string, eventId: string, offeringId: string): Promise<ProviderMappingRow[]> {
+  const result = await client.query<ProviderMappingRow>(
+    `select event_id, connection_id, resource_type, resource_reference, verified_at
+     from hpos.ticket_offering_provider_mappings
+     where site_id = $1 and event_id = $2 and offering_id = $3
+     order by connection_id asc`,
+    [siteId, eventId, offeringId],
+  );
+  return result.rows;
+}
+
+export async function readAdminEvent(client: PoolClient, siteId: string, eventId: string): Promise<Record<string, unknown> | null> {
   const result = await client.query<EventRow>(
     `select e.id, e.site_id, e.ticket_offering_id, e.title, e.description,
        e.venue_name, e.venue_address, e.starts_at, e.starts_at_offset_minutes,
@@ -460,7 +495,10 @@ async function readAdminEvent(client: PoolClient, siteId: string, eventId: strin
     [siteId, eventId],
   );
   const row = result.rows[0];
-  return row ? eventData(row, true) : null;
+  if (!row) return null;
+  const data = eventData(row, true);
+  setProviderMappings(data, await readProviderMappings(client, siteId, eventId, row.ticket_offering_id));
+  return data;
 }
 
 function changedArrivalFields(before: EventRow, after: EventRow): string[] {
@@ -812,11 +850,41 @@ async function listEvents(request: Request, site: AuthenticatedSite, admin: bool
   const nextCursor = hasMore && last
     ? cursorFor(site, mode, cursorScope, admin ? last.created_cursor_time! : last.starts_cursor_time!, last.id)
     : null;
-  return apiSuccess(rows.map((row) => eventData(row, admin)), 200, { nextCursor });
+  if (!admin) return apiSuccess(rows.map((row) => eventData(row, false)), 200, { nextCursor });
+  const mappingsResult = rows.length === 0
+    ? { rows: [] as ProviderMappingRow[] }
+    : await getBusinessPool().query<ProviderMappingRow>(
+      `select event_id, connection_id, resource_type, resource_reference, verified_at
+       from hpos.ticket_offering_provider_mappings
+       where site_id = $1 and event_id = any($2::uuid[])
+       order by event_id asc, connection_id asc`,
+      [site.siteId, rows.map((row) => row.id)],
+    );
+  const mappingsByEvent = new Map<string, ProviderMappingRow[]>();
+  for (const mapping of mappingsResult.rows) {
+    const current = mappingsByEvent.get(mapping.event_id) ?? [];
+    current.push(mapping);
+    mappingsByEvent.set(mapping.event_id, current);
+  }
+  const data = rows.map((row) => {
+    const event = eventData(row, true);
+    setProviderMappings(event, mappingsByEvent.get(row.id) ?? []);
+    return event;
+  });
+  return apiSuccess(data, 200, { nextCursor });
 }
 
 async function readEvent(site: AuthenticatedSite, eventId: string, admin: boolean): Promise<Response> {
   if (!UUID_PATTERN.test(eventId)) return apiFailure(404, "not_found", "The Event is not available to this Site.");
+  if (admin) {
+    const client = await getBusinessPool().connect();
+    try {
+      const event = await readAdminEvent(client, site.siteId, eventId);
+      return event ? apiSuccess(event) : apiFailure(404, "not_found", "The Event is not available to this Site.");
+    } finally {
+      client.release();
+    }
+  }
   const query = `select e.id, e.site_id, e.ticket_offering_id, e.title, e.description,
     e.venue_name, e.venue_address, e.starts_at, e.starts_at_offset_minutes,
     e.ends_at, e.ends_at_offset_minutes, e.time_zone, e.check_in_opens_at,
@@ -830,7 +898,7 @@ async function readEvent(site: AuthenticatedSite, eventId: string, admin: boolea
       and o.event_id=e.id and o.site_id=e.site_id
     where e.site_id=$1 and e.id=$2 ${admin ? "" : "and e.publication_status='published'"}`;
   const result = await getBusinessPool().query<EventRow>(query, [site.siteId, eventId]);
-  return result.rows[0] ? apiSuccess(eventData(result.rows[0], admin)) : apiFailure(404, "not_found", "The Event is not available to this Site.");
+  return result.rows[0] ? apiSuccess(eventData(result.rows[0], false)) : apiFailure(404, "not_found", "The Event is not available to this Site.");
 }
 
 function validatePublish(row: EventRow): void {
