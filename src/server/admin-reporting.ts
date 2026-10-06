@@ -82,7 +82,7 @@ interface ScopeRow extends QueryResultRow {
   scope_reference: string;
   payment_currency: string | null;
   refund_currency: string | null;
-  has_conflict: boolean;
+  conflict_categories: Category[];
 }
 
 function scopeKey(scope: Pick<ScopeRow, "attempt_id" | "connection_id" | "scope_type" | "scope_reference">): string {
@@ -372,17 +372,20 @@ async function readTotals(site: AuthenticatedSite, eventId: string): Promise<Res
            and attempt.last_outcome = 'paid' and refund.outcome = 'completed'
        )
        select relevant_scopes.*,
-              exists (
-                select 1 from hpos.fee_records conflict
-                where conflict.site_id = $1
-                  and conflict.attempt_id = relevant_scopes.attempt_id
-                  and conflict.connection_id = relevant_scopes.connection_id
-                  and conflict.scope_type = relevant_scopes.scope_type
-                  and conflict.scope_reference = relevant_scopes.scope_reference
-                  and conflict.conflict_code is not null
-              ) as has_conflict
-       from relevant_scopes`, [site.siteId, eventId]);
-    const reportableScopeKeys = new Set(scopes.rows.filter((scope) => !scope.has_conflict).map(scopeKey));
+              coalesce(array_agg(distinct conflict.category) filter (where conflict.category is not null), '{}'::text[]) as conflict_categories
+       from relevant_scopes
+       left join hpos.fee_records conflict
+         on conflict.site_id = $1
+        and conflict.attempt_id = relevant_scopes.attempt_id
+        and conflict.connection_id = relevant_scopes.connection_id
+        and conflict.scope_type = relevant_scopes.scope_type
+        and conflict.scope_reference = relevant_scopes.scope_reference
+        and conflict.conflict_code is not null
+       group by relevant_scopes.attempt_id, relevant_scopes.connection_id, relevant_scopes.scope_type,
+                relevant_scopes.scope_reference, relevant_scopes.payment_currency, relevant_scopes.refund_currency`,
+      [site.siteId, eventId]);
+    const conflictKeys = new Set(scopes.rows.flatMap((scope) =>
+      scope.conflict_categories.map((category) => `${scopeKey(scope)}|${category}`)));
     const feeRows = await client.query<CurrentFeeRow>(
       `select distinct on (fee.connection_id, fee.source_reference, fee.category, fee.direction)
               fee.id, fee.category, fee.direction, fee.amount, fee.currency, fee.created_at, fee.observed_at,
@@ -393,7 +396,7 @@ async function readTotals(site: AuthenticatedSite, eventId: string): Promise<Res
       [site.siteId, eventId]);
     const feeAmounts = new Map<string, { charged: number; returned: number }>();
     for (const row of feeRows.rows) {
-      if (!reportableScopeKeys.has(scopeKey(row))) continue;
+      if (conflictKeys.has(`${scopeKey(row)}|${row.category}`)) continue;
       currencies.add(row.currency);
       const key = `${row.category}|${row.currency}`;
       const current = feeAmounts.get(key) ?? { charged: 0, returned: 0 };
@@ -407,12 +410,13 @@ async function readTotals(site: AuthenticatedSite, eventId: string): Promise<Res
       connection_id: string;
       scope_type: "payment" | "refund";
       scope_reference: string;
+      category: Category;
     }>(
       `with latest_confirmations as (
          select distinct on (confirmation.attempt_id, confirmation.connection_id, confirmation.scope_type,
                              confirmation.scope_reference, confirmation.category)
                 confirmation.id, confirmation.attempt_id, confirmation.connection_id,
-                confirmation.scope_type, confirmation.scope_reference
+                confirmation.scope_type, confirmation.scope_reference, confirmation.category
          from hpos.fee_confirmations confirmation
          where confirmation.site_id = $1
          order by confirmation.attempt_id, confirmation.connection_id, confirmation.scope_type,
@@ -420,14 +424,14 @@ async function readTotals(site: AuthenticatedSite, eventId: string): Promise<Res
                   confirmation.observed_at desc, confirmation.created_at desc, confirmation.id desc
        )
        select distinct totals.currency, latest.attempt_id, latest.connection_id,
-              latest.scope_type, latest.scope_reference
+              latest.scope_type, latest.scope_reference, latest.category
        from hpos.fee_confirmation_totals totals
        join latest_confirmations latest on latest.id = totals.confirmation_id
        join hpos.fee_confirmations confirmation on confirmation.id = latest.id and confirmation.site_id = totals.site_id
        join hpos.orders order_row on order_row.id = confirmation.order_id and order_row.site_id = confirmation.site_id
        where totals.site_id = $1 and order_row.event_id = $2`, [site.siteId, eventId]);
     for (const row of confirmationCurrencies.rows) {
-      if (reportableScopeKeys.has(scopeKey(row))) currencies.add(row.currency);
+      if (!conflictKeys.has(`${scopeKey(row)}|${row.category}`)) currencies.add(row.currency);
     }
     const confirmations = await client.query<{ id: string; attempt_id: string; connection_id: string; scope_type: "payment" | "refund"; scope_reference: string; category: "processing" | "platform"; observed_at: Date; created_at: Date }>(
       `select distinct on (attempt_id, connection_id, scope_type, scope_reference, category)
@@ -435,8 +439,6 @@ async function readTotals(site: AuthenticatedSite, eventId: string): Promise<Res
        from hpos.fee_confirmations where site_id = $1
        order by attempt_id, connection_id, scope_type, scope_reference, category, observed_at desc, created_at desc, id desc`, [site.siteId]);
     const latestConfirmations = new Map(confirmations.rows.map((row) => [`${row.attempt_id}|${row.connection_id}|${row.scope_type}|${row.scope_reference}|${row.category}`, row]));
-    const conflictKeys = new Set(scopes.rows.filter((scope) => scope.has_conflict).flatMap((scope) =>
-      (["processing", "platform"] as const).map((category) => `${scopeKey(scope)}|${category}`)));
     const feeComplete = new Map<Category, boolean>();
     for (const category of ["processing", "platform"] as const) {
       let complete = true;

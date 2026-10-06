@@ -367,7 +367,9 @@ async function verify() {
   const conflictedTotals = await api(totalsPath);
   const conflictedSales = new Map(conflictedTotals.data?.data?.sales?.map((row) => [row.currency, row]) ?? []);
   assert(conflictedTotals.status === 200 && !conflictedSales.has("JPY")
-    && conflictedSales.get("USD")?.processing_fees.reporting_status === "pending",
+    && conflictedSales.get("USD")?.processing_fees.reporting_status === "pending"
+    && conflictedSales.get("USD")?.platform_fees.reporting_status === "complete"
+    && conflictedSales.get("USD")?.platform_fees.charged?.amount === 0,
   `A conflicted payment scope retained fee totals or its fee-only currency: ${JSON.stringify(conflictedTotals.data)}`);
 }
 
