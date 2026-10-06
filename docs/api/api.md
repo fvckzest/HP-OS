@@ -327,7 +327,7 @@ Admin Ticket lists use a narrower operational object:
 
 ### Event totals response
 
-Issue #43 implements this response from one repeatable-read PostgreSQL snapshot. Sales rows use the union of payment, completed-refund, confirmed-fee, reported-fee, and configured offering currencies; values are never converted between currencies. Fee fields remain `null` while any relevant payment or completed-refund scope lacks a current explicit confirmation, including a zero confirmation.
+Issue #43 implements this response from one repeatable-read PostgreSQL snapshot. Sales rows use the union of payment, completed-refund, confirmed-fee, reported-fee, and configured offering currencies; values are never converted between currencies. Fee totals and fee-only currencies come only from currently paid or completed-refund scopes without retained fee conflicts. Fee fields remain `null` while any relevant payment or completed-refund scope lacks a current explicit confirmation, including a zero confirmation; a retained conflict removes that scope's fee amounts and confirmation-only currencies while keeping the category pending.
 
 The totals response uses the common success wrapper. Its `data` contains `event_id`, `sales`, `tickets`, and `as_of`. `sales` is an array grouping money totals by currency; each entry contains `gross_paid_sales`, `refunded_amount`, and `net_sales`, represented as money objects. `tickets` contains `issued`, `valid`, and `admitted` counts. These counts can overlap because they describe different aspects of Ticket history. HP-OS calculates all totals from one consistent snapshot identified by the timestamp `as_of`. This response structure was settled in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
 

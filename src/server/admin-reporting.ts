@@ -81,6 +81,12 @@ interface ScopeRow extends QueryResultRow {
   scope_type: "payment" | "refund";
   scope_reference: string;
   payment_currency: string | null;
+  refund_currency: string | null;
+  has_conflict: boolean;
+}
+
+function scopeKey(scope: Pick<ScopeRow, "attempt_id" | "connection_id" | "scope_type" | "scope_reference">): string {
+  return `${scope.attempt_id}|${scope.connection_id}|${scope.scope_type}|${scope.scope_reference}`;
 }
 
 function fieldError(field: string, code: string, message: string): Response {
@@ -338,12 +344,45 @@ async function readTotals(site: AuthenticatedSite, eventId: string): Promise<Res
     const refunds = await client.query<{ currency: string; amount: string | number }>(
       `select refund.currency, refund.amount
        from hpos.orders order_row join hpos.refunds refund on refund.order_id = order_row.id and refund.site_id = order_row.site_id
-       where order_row.site_id = $1 and order_row.event_id = $2 and refund.outcome = 'completed'`, [site.siteId, eventId]);
+       join hpos.payment_attempts attempt on attempt.id = refund.attempt_id and attempt.site_id = refund.site_id
+       where order_row.site_id = $1 and order_row.event_id = $2 and order_row.payment_status = 'paid'
+         and attempt.last_outcome = 'paid' and refund.outcome = 'completed'`, [site.siteId, eventId]);
     const refunded = new Map<string, number>();
     for (const row of refunds.rows) {
       currencies.add(row.currency);
       refunded.set(row.currency, addSafe(refunded.get(row.currency) ?? 0, safeNumber(row.amount)));
     }
+    const scopes = await client.query<ScopeRow>(
+      `with relevant_scopes as (
+         select attempt.id as attempt_id, attempt.connection_id, 'payment'::text as scope_type,
+                attempt.provider_payment_reference as scope_reference, attempt.currency as payment_currency,
+                null::text as refund_currency
+         from hpos.payment_attempts attempt
+         join hpos.orders order_row on order_row.id = attempt.order_id and order_row.site_id = attempt.site_id
+         where attempt.site_id = $1 and order_row.event_id = $2
+           and order_row.payment_status = 'paid' and attempt.last_outcome = 'paid'
+         union all
+         select refund.attempt_id, refund.connection_id, 'refund'::text, refund.provider_refund_reference,
+                attempt.currency, refund.currency
+         from hpos.refunds refund
+         join hpos.orders order_row on order_row.id = refund.order_id and order_row.site_id = refund.site_id
+         join hpos.payment_attempts attempt
+           on attempt.id = refund.attempt_id and attempt.site_id = refund.site_id
+         where refund.site_id = $1 and order_row.event_id = $2 and order_row.payment_status = 'paid'
+           and attempt.last_outcome = 'paid' and refund.outcome = 'completed'
+       )
+       select relevant_scopes.*,
+              exists (
+                select 1 from hpos.fee_records conflict
+                where conflict.site_id = $1
+                  and conflict.attempt_id = relevant_scopes.attempt_id
+                  and conflict.connection_id = relevant_scopes.connection_id
+                  and conflict.scope_type = relevant_scopes.scope_type
+                  and conflict.scope_reference = relevant_scopes.scope_reference
+                  and conflict.conflict_code is not null
+              ) as has_conflict
+       from relevant_scopes`, [site.siteId, eventId]);
+    const reportableScopeKeys = new Set(scopes.rows.filter((scope) => !scope.has_conflict).map(scopeKey));
     const feeRows = await client.query<CurrentFeeRow>(
       `select distinct on (fee.connection_id, fee.source_reference, fee.category, fee.direction)
               fee.id, fee.category, fee.direction, fee.amount, fee.currency, fee.created_at, fee.observed_at,
@@ -354,6 +393,7 @@ async function readTotals(site: AuthenticatedSite, eventId: string): Promise<Res
       [site.siteId, eventId]);
     const feeAmounts = new Map<string, { charged: number; returned: number }>();
     for (const row of feeRows.rows) {
+      if (!reportableScopeKeys.has(scopeKey(row))) continue;
       currencies.add(row.currency);
       const key = `${row.category}|${row.currency}`;
       const current = feeAmounts.get(key) ?? { charged: 0, returned: 0 };
@@ -361,39 +401,47 @@ async function readTotals(site: AuthenticatedSite, eventId: string): Promise<Res
       else current.returned = addSafe(current.returned, safeNumber(row.amount));
       feeAmounts.set(key, current);
     }
-    const confirmationCurrencies = await client.query<{ currency: string }>(
-      `select distinct totals.currency
+    const confirmationCurrencies = await client.query<{
+      currency: string;
+      attempt_id: string;
+      connection_id: string;
+      scope_type: "payment" | "refund";
+      scope_reference: string;
+    }>(
+      `with latest_confirmations as (
+         select distinct on (confirmation.attempt_id, confirmation.connection_id, confirmation.scope_type,
+                             confirmation.scope_reference, confirmation.category)
+                confirmation.id, confirmation.attempt_id, confirmation.connection_id,
+                confirmation.scope_type, confirmation.scope_reference
+         from hpos.fee_confirmations confirmation
+         where confirmation.site_id = $1
+         order by confirmation.attempt_id, confirmation.connection_id, confirmation.scope_type,
+                  confirmation.scope_reference, confirmation.category,
+                  confirmation.observed_at desc, confirmation.created_at desc, confirmation.id desc
+       )
+       select distinct totals.currency, latest.attempt_id, latest.connection_id,
+              latest.scope_type, latest.scope_reference
        from hpos.fee_confirmation_totals totals
-       join hpos.fee_confirmations confirmation on confirmation.id = totals.confirmation_id and confirmation.site_id = totals.site_id
+       join latest_confirmations latest on latest.id = totals.confirmation_id
+       join hpos.fee_confirmations confirmation on confirmation.id = latest.id and confirmation.site_id = totals.site_id
        join hpos.orders order_row on order_row.id = confirmation.order_id and order_row.site_id = confirmation.site_id
-       where confirmation.site_id = $1 and order_row.event_id = $2`, [site.siteId, eventId]);
-    for (const row of confirmationCurrencies.rows) currencies.add(row.currency);
-
-    const scopes = await client.query<ScopeRow>(
-      `select attempt.id as attempt_id, attempt.connection_id, 'payment'::text as scope_type,
-              attempt.provider_payment_reference as scope_reference, attempt.currency as payment_currency
-       from hpos.payment_attempts attempt join hpos.orders order_row on order_row.id = attempt.order_id and order_row.site_id = attempt.site_id
-       where attempt.site_id = $1 and order_row.event_id = $2 and order_row.payment_status = 'paid' and attempt.last_outcome = 'paid'
-       union all
-       select refund.attempt_id, refund.connection_id, 'refund'::text, refund.provider_refund_reference, refund.currency
-       from hpos.refunds refund join hpos.orders order_row on order_row.id = refund.order_id and order_row.site_id = refund.site_id
-       where refund.site_id = $1 and order_row.event_id = $2 and refund.outcome = 'completed'`, [site.siteId, eventId]);
+       where totals.site_id = $1 and order_row.event_id = $2`, [site.siteId, eventId]);
+    for (const row of confirmationCurrencies.rows) {
+      if (reportableScopeKeys.has(scopeKey(row))) currencies.add(row.currency);
+    }
     const confirmations = await client.query<{ id: string; attempt_id: string; connection_id: string; scope_type: "payment" | "refund"; scope_reference: string; category: "processing" | "platform"; observed_at: Date; created_at: Date }>(
       `select distinct on (attempt_id, connection_id, scope_type, scope_reference, category)
               id, attempt_id, connection_id, scope_type, scope_reference, category, observed_at, created_at
        from hpos.fee_confirmations where site_id = $1
        order by attempt_id, connection_id, scope_type, scope_reference, category, observed_at desc, created_at desc, id desc`, [site.siteId]);
     const latestConfirmations = new Map(confirmations.rows.map((row) => [`${row.attempt_id}|${row.connection_id}|${row.scope_type}|${row.scope_reference}|${row.category}`, row]));
-    const feeConflicts = await client.query<{ attempt_id: string; connection_id: string; scope_type: "payment" | "refund"; scope_reference: string; category: "processing" | "platform" }>(
-      `select distinct fee.attempt_id, fee.connection_id, fee.scope_type, fee.scope_reference, fee.category
-       from hpos.fee_records fee join hpos.orders order_row on order_row.id = fee.order_id and order_row.site_id = fee.site_id
-       where fee.site_id = $1 and order_row.event_id = $2 and fee.conflict_code is not null`, [site.siteId, eventId]);
-    const conflictKeys = new Set(feeConflicts.rows.map((row) => `${row.attempt_id}|${row.connection_id}|${row.scope_type}|${row.scope_reference}|${row.category}`));
+    const conflictKeys = new Set(scopes.rows.filter((scope) => scope.has_conflict).flatMap((scope) =>
+      (["processing", "platform"] as const).map((category) => `${scopeKey(scope)}|${category}`)));
     const feeComplete = new Map<Category, boolean>();
     for (const category of ["processing", "platform"] as const) {
       let complete = true;
       for (const scope of scopes.rows) {
-        const key = `${scope.attempt_id}|${scope.connection_id}|${scope.scope_type}|${scope.scope_reference}|${category}`;
+        const key = `${scopeKey(scope)}|${category}`;
         const confirmation = latestConfirmations.get(key);
         const changed = await client.query<{ latest_fee_observed_at: Date; latest_fee_created_at: Date; latest_fee_id: string }>(
           `select fee.observed_at as latest_fee_observed_at, fee.created_at as latest_fee_created_at, fee.id as latest_fee_id
