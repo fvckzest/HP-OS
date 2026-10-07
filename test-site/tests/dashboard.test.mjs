@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { request } from 'node:http';
 import { loadConfig, blockers } from '../config.mjs';
-import { routes, documentedRoutes, tickets, workflows } from '../catalog.mjs';
+import { routes, documentedRoutes, tickets, workflows, ticketChecklist } from '../catalog.mjs';
 import { publicRun, RunStore } from '../evidence.mjs';
 import { Adapter, Unknown, Blocked } from '../adapter.mjs';
 import { createDashboard } from '../server.mjs';
@@ -22,18 +22,27 @@ test('all current documented routes and tickets have explicit coverage, with rel
   assert.equal(routes.length, 49);
   assert.deepEqual(tickets.map(t => t.number), Array.from({ length: 33 }, (_, i) => i + 23));
   assert.ok(routes.every(r => r.tickets.length && r.tickets.every(n => n >= 23 && n <= 55)));
+  assert.ok(routes.every(r => r.implemented), 'every documented route has a current HP-OS handler');
   assert.ok(workflows.every(w => w.ticket < 51));
-  assert.equal(routes.find(r => r.route.includes('/refund-reports')).implemented, false);
+  assert.equal(routes.find(r => r.route.includes('/refund-reports')).implemented, true);
+  assert.equal(routes.find(r => r.route.includes('/apple-wallet-data')).implemented, true);
+  assert.equal(routes.find(r => r.route.includes('/access-requests')).implemented, true);
+  for (const id of ['arrival-change', 'cancellation', 'refund', 'reporting', 'connection-history', 'private-approval', 'private-purchase', 'wallet-data', 'wallet-updates', 'group-purchase']) {
+    assert.ok(workflows.some(workflow => workflow.id === id), 'missing local workflow: ' + id);
+  }
+  const checklist = ticketChecklist();
+  assert.equal(checklist.find(ticket => ticket.number === 50).gate, 'not run');
+  assert.equal(checklist.find(ticket => ticket.number === 45).gate, 'blocked');
 });
 test('Issue #33 journey runs its connected single-ticket checkpoints in order', async () => {
   const calls = [], checks = [];
   const connection = { connection_id: 'dedicated-connection', environment: 'test' };
   const event = { event_id: 'event-one', version: 2, ticket_offering: { available_quantity: 8 } };
   const order = {
-    order_id: 'order-one', order_reference: 'ORDER-ONE', order_token: 'order-token',
+    order_id: 'order-one', order_reference: 'ORDER-ONE', order_token: 'order-token', quantity: 1, reservation: { quantity: 1, status: 'held' },
     pricing: { total: { amount: 2500, currency: 'USD' } }, payment_status: 'unpaid', tickets: [],
   };
-  const ticket = { ticket_id: 'ticket-one', ticket_token: 'ticket-token', qr_payload: 'Q'.repeat(32) };
+  const ticket = { ticket_id: 'ticket-one', ticket_token: 'ticket-token', qr_payload: 'Q'.repeat(32), ordinal: 1 };
   const issued = { ...order, payment_status: 'paid', issuance_status: 'issued', delivery_status: 'pending', tickets: [ticket] };
   const delivered = { ...issued, delivery_status: 'delivered' };
   const job = { job_id: 'job-one', order_id: order.order_id, kind: 'tickets_ready', status: 'pending', requires_verification: false };
@@ -253,8 +262,8 @@ test('Sandbox delivery resume accepts the original payment ID and rejects replac
 });
 test('isolation scenario checks private records and provider references while both Sites share a connection', async () => {
   const saved = { ...run(), workflow: 'configuration' }, calls = [], connection = { connection_id: 'dedicated-connection', environment: 'test' };
-  const ticket = { ticket_id: 'ticket-one', ticket_token: 'ticket-token', qr_payload: 'qr-one' };
-  const order = { order_id: 'order-one', order_token: 'order-token', pricing: { total: { amount: 2500, currency: 'USD' } }, payment_status: 'unpaid', tickets: [] };
+  const ticket = { ticket_id: 'ticket-one', ticket_token: 'ticket-token', qr_payload: 'qr-one', ordinal: 1 };
+  const order = { order_id: 'order-one', order_token: 'order-token', quantity: 1, reservation: { quantity: 1, status: 'held' }, pricing: { total: { amount: 2500, currency: 'USD' } }, payment_status: 'unpaid', tickets: [] };
   const issued = { ...order, payment_status: 'paid', issuance_status: 'issued', tickets: [ticket] };
   const adapter = {
     run: saved, config: config(), save: async () => {}, check: (name, condition) => assert.ok(condition, name),
