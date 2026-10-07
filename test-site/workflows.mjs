@@ -21,8 +21,8 @@ async function configuration(a) {
   await a.read('historical-connection', `/v1/admin/payment-connections/${id(c.connection_id)}`);
   return c;
 }
-async function event(a, prefix = 'event', { ended = false, capacity = 8, futureCheckIn = false, auth = 'primary', visibility = 'public', checkInUsesEventStart = false } = {}) {
-  const t = a.run.clock, start = ended ? t - 7_200_000 : t + 300_000, end = ended ? t - 3_600_000 : t + 86_400_000;
+async function event(a, prefix = 'event', { ended = false, capacity = 8, futureCheckIn = false, auth = 'primary', visibility = 'public', checkInUsesEventStart = false, startOffsetMs = 300_000 } = {}) {
+  const t = a.run.clock, start = ended ? t - 7_200_000 : t + startOffsetMs, end = ended ? t - 3_600_000 : t + 86_400_000;
   const draft = await a.write(prefix + '-draft', '/v1/admin/events', { actor: human }, [201], { auth });
   const p = `/v1/admin/events/${id(draft.data.event_id)}`;
   const saved = await a.call(prefix + '-save', p, { method: 'PATCH', auth, body: {
@@ -481,7 +481,7 @@ async function createApprovedPrivateRequest(a, prefix = 'private') {
 }
 async function arrivalChange(a) {
   await configuration(a);
-  const e = await event(a, 'arrival-change', { checkInUsesEventStart: true });
+  const e = await event(a, 'arrival-change', { checkInUsesEventStart: true, startOffsetMs: -600_000 });
   const { order } = await reserve(a, e, 'arrival-purchase');
   const at = await attempt(a, order, 'arrival-attempt');
   const reference = await checkout(a, at);
