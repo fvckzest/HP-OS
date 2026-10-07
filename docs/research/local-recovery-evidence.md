@@ -4,17 +4,23 @@ This record defines the evidence boundary for issues [#45](https://github.com/fv
 
 ## Local evidence
 
-The implementation is exercised through the normal HTTP API against the repository's local PostgreSQL schema. The verification scripts are:
+Verified on October 6, 2026, against the dedicated local PostgreSQL database at `127.0.0.1:54322/postgres`, using loopback HTTP and synthetic Site/provider reports. The tested source matches implementation commit `9bf2a24`; the checks ran on that source tree before it was committed. The following evidence-only documentation update changes no application code.
 
 | Command | Scope | Result |
 | --- | --- | --- |
-| `pnpm verify:recovery` | Durable recovery state, guarded retries, notification claims, uncertain outcomes, and restart-safe processing for the HP-OS boundary. | Passed in the root-coordinated local working tree; final tested revision remains to be recorded. |
-| `pnpm verify:private-access` | Private Event Access Request submission, approval decisions, approval-link lookup, private checkout, approved-attendee preservation, and one-purchase fencing. | Passed in the root-coordinated local working tree; final tested revision remains to be recorded. |
-| `pnpm verify:events` | Event publication, arrival-change notification fan-out, and related event-boundary behavior. | Passed in the root-coordinated local working tree; final tested revision remains to be recorded. |
-| `pnpm typecheck` | TypeScript API and server type safety. | Passed in the root-coordinated local working tree; final tested revision remains to be recorded. |
-| `pnpm build` | Production compilation of the Next.js application. | Record the root agent's result here. |
+| `pnpm verify:recovery` | Overlapping workers, lost reports, uncertain capacity, issuance, stale claims, correction/recovery, cancellation, late payment, refunds, and totals. | Passed; unknown outcomes remained unresolved and repeated recovery produced no duplicate Tickets or dispatch effects. |
+| `pnpm verify:private-access` | Submission, decision races, link replacement, separate payer/attendee, concurrent checkout, withdrawal, sold-out handling, Admission, refund, and cleanup. | Passed; one approval produced one purchase and retained its consumption through a conflicted state and refund. |
+| `pnpm verify:events` | Existing public checkout, payment, issuance, notification, refund, and Admission behavior. | Passed. |
+| `pnpm verify:notifications` | Claims, fencing, bounded scheduling, Site isolation, and simulated delivery reporting. | Passed. |
+| `pnpm verify:fees` | Fee confirmation, missing information, conflicts, currencies, and consistent Ticket totals. | Passed. |
+| `pnpm verify:historical-connections` | Frozen Order connections/mappings, restart visibility, and Site isolation. | Passed. |
+| `pnpm test` | Local schema, disabled generated Data API, Site credentials, request limits, and permission/isolation checks. | Passed. |
+| `pnpm typecheck` | TypeScript API and server type safety. | Passed. |
+| `pnpm exec next build --webpack` | Production compilation of the Next.js application. | Passed. |
+| All version-controlled migration SQL files, in order, in a temporary empty local database | Fresh installation of all 24 migrations, including private approval constraints. | Passed; the temporary database was removed afterward. |
+| `git diff --check` | Patch whitespace validation. | Passed. |
 
-The evidence should record the tested revision, local database environment, scenario, expected result, actual result, and command output. A failed or incomplete scenario remains visible as unresolved work; an unknown provider or dispatch outcome must not be treated as success.
+The verifier assertions encode the expected outcomes and fail with bounded diagnostics when an outcome differs. Both new verifiers reported their local verification as passed. They retain unknown provider or dispatch outcomes as unresolved work rather than treating them as success. These results establish local HP-OS behavior only.
 
 ## Behavior covered by the HP-OS boundary
 
