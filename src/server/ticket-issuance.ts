@@ -67,6 +67,9 @@ interface IssuanceRow extends EventRow {
   buyer_name: string;
   delivery_email: string;
   checkout_identity: Record<string, unknown>;
+  access_request_id: string | null;
+  approved_attendee_name: string | null;
+  approved_attendee_email: string | null;
   order_token: string | null;
   quantity: number;
   accepted_quote: Record<string, unknown>;
@@ -92,6 +95,7 @@ interface TicketRow extends QueryResultRow {
   issued_at: Date;
   qr_payload: string;
   attendee_name: string | null;
+  approved_attendee_email: string | null;
   admission_id: string | null;
   admitted_at: Date | null;
   version: number;
@@ -269,6 +273,7 @@ async function readIssuanceRow(client: PoolClient, siteId: string, orderId: stri
     `select order_row.id as order_id, event_row.id, order_row.buyer_id, order_row.quote_id, order_row.site_id, order_row.event_id,
             order_row.offering_id as ticket_offering_id, order_row.order_reference,
             order_row.buyer_name, order_row.delivery_email, order_row.checkout_identity, order_row.order_token,
+            order_row.access_request_id, order_row.approved_attendee_name, order_row.approved_attendee_email,
             order_row.accepted_quote, quote.quantity, order_row.checkout_status,
             order_row.payment_status, order_row.issuance_status, order_row.delivery_status,
             order_row.refund_status, order_row.checkout_expires_at,
@@ -381,9 +386,10 @@ export async function issuePaidOrder(siteId: string, orderId: string): Promise<{
       await client.query(
         `insert into hpos.tickets (
            id, site_id, order_id, event_id, offering_id, ordinal, attendee_name,
-           ticket_token, ticket_token_hash, qr_payload, qr_token_hash
-         ) values ($1, $2, $3, $4, $5, $6, null, $7, $8, $9, $10)`,
+           approved_attendee_email, ticket_token, ticket_token_hash, qr_payload, qr_token_hash
+         ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
         [ticket.id, siteId, orderId, row.event_id, row.ticket_offering_id, ordinal,
+          row.approved_attendee_name, row.approved_attendee_email,
           ticket.token, hashToken(ticket.token), ticket.qr, hashToken(ticket.qr)],
       );
       tickets.push(ticket);
@@ -559,7 +565,7 @@ async function readBuyerOrder(site: AuthenticatedSite, token: string): Promise<R
     const ticketsResult = order.issuance_status === "issued"
       ? await client.query<TicketRow>(
         `select ticket.id as ticket_id, ticket.ticket_token, ticket.ordinal, ticket.issued_at,
-                ticket.qr_payload, ticket.attendee_name, ticket.version,
+                ticket.qr_payload, ticket.attendee_name, ticket.approved_attendee_email, ticket.version,
                 admission.id as admission_id, admission.admitted_at
          from hpos.tickets ticket
          left join hpos.admissions admission
@@ -646,7 +652,7 @@ export async function handleBuyerTicketGet(site: AuthenticatedSite, path: string
   if (!TOKEN_PATTERN.test(token)) return apiFailure(404, "not_found", "The Ticket is not available to this Site.");
   const result = await getBusinessPool().query<TicketRow & EventRow & { site_id: string; refund_status: string }>(
     `select ticket.id as ticket_id, event_row.id, ticket.site_id, ticket.ticket_token, ticket.ordinal, ticket.issued_at,
-            ticket.qr_payload, ticket.attendee_name, ticket.version,
+            ticket.qr_payload, ticket.attendee_name, ticket.approved_attendee_email, ticket.version,
             admission.id as admission_id, admission.admitted_at,
             order_row.refund_status, event_row.is_canceled,
             event_row.title, event_row.description, event_row.venue_name, event_row.venue_address,
@@ -713,7 +719,9 @@ function adminTicketData(ticket: AdminTicketRow, event: Record<string, unknown>)
     buyer_id: ticket.buyer_id,
     buyer_name: ticket.buyer_name,
     delivery_email: ticket.delivery_email,
-    approved_attendee: null,
+    approved_attendee: ticket.approved_attendee_email && ticket.attendee_name
+      ? { name: ticket.attendee_name, email: ticket.approved_attendee_email }
+      : null,
     admission_status: ticket.admission_id === null ? "unused" : "admitted",
     admitted_at: ticket.admitted_at?.toISOString() ?? null,
     can_admit: blockers.length === 0,
@@ -732,6 +740,7 @@ async function readAdminOrder(site: AuthenticatedSite, orderId: string, existing
     const ticketsResult = await client.query<AdminTicketRow>(
       `select ticket.id as ticket_id, ticket.event_id, ticket.order_id, order_row.order_reference,
               ticket.ordinal, ticket.issued_at, ticket.version, ticket.created_at, ticket.updated_at,
+              ticket.attendee_name, ticket.approved_attendee_email,
               order_row.buyer_id, order_row.buyer_name, order_row.delivery_email,
               order_row.refund_status, event_row.is_canceled as event_canceled,
               admission.id as admission_id, admission.admitted_at
@@ -862,8 +871,10 @@ async function readAdminOrder(site: AuthenticatedSite, orderId: string, existing
       delivery_email: row.delivery_email,
       checkout_identity: row.checkout_identity,
       quote_id: row.quote_id,
-      access_request_id: null,
-      approved_attendee: null,
+      access_request_id: row.access_request_id,
+      approved_attendee: row.approved_attendee_name && row.approved_attendee_email
+        ? { name: row.approved_attendee_name, email: row.approved_attendee_email }
+        : null,
       created_at: row.order_created_at.toISOString(),
       updated_at: row.order_updated_at.toISOString(),
       pricing: row.accepted_quote,

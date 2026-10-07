@@ -91,8 +91,8 @@ Paths are relative to the base URL. `{...}` identifies a path parameter. All end
 
 | Endpoint | Meaning |
 | --- | --- |
-| `POST /v1/public/events/{event_id}/quotes` | Quote quantity and complete buyer price; no capacity hold. |
-| `POST /v1/public/orders` | Create an unpaid Order and Reservation from a quote. |
+| `POST /v1/public/events/{event_id}/quotes` | Quote one public Ticket or one approved private Ticket; no capacity hold. |
+| `POST /v1/public/orders` | Create an unpaid public Order from a quote or a private Order from an approval token. |
 | `POST /v1/public/events/{event_id}/access-requests` | Submit intended attendee details for approval. |
 | `POST /v1/public/order-recovery` | Queue temporary Order links; generic acknowledgment. |
 
@@ -292,6 +292,7 @@ Use `error.code` for program logic; use `error.message` for explanation. Retry n
 | `sales_closed` | Sales window/Event ended. |
 | `sold_out` | No remaining capacity. |
 | `insufficient_capacity` | Some capacity remains, but less than requested. |
+| `access_not_required` | The Event uses public checkout, so an Access Request or approval token is not accepted. |
 | `quote_expired` | Quote lifetime elapsed. |
 | `quote_changed` | Pricing changed; request a fresh quote. |
 | `quote_already_used` | Quote already created an Order. |
@@ -354,7 +355,7 @@ Notation: `T[]` = array of T; `T?` = T or JSON `null`; optional = may be omitted
 | `null` | `null` | Explicit missing/cleared value; not zero or an empty string. |
 | `object` | `{"name":"Hall"}` | Named fields enclosed in braces. |
 | `array` | `["a","b"]` | Ordered values enclosed in brackets; [] is empty. |
-| `timestamp` | `"2026-10-11T02:00:00Z"` | RFC 3339 with offset; responses normalized to UTC. |
+| `timestamp` | `"2026-10-11T02:00:00Z"` | RFC 3339 with explicit `Z` or numeric offset; whole-second values retain the suffix, and responses are normalized to UTC. |
 | `time zone` | `"America/Los_Angeles"` | IANA time-zone name. |
 | `currency` | `"USD"` | Uppercase currency code. |
 | `UUID` | `"123e4567-e89b-42d3-a456-426614174000"` | Format used for Idempotency-Key. |
@@ -788,8 +789,8 @@ Each row lists operation-specific body fields/result data. Apply common headers 
 | Event action | `expected_version` | `AdminEvent; 200` |
 | Set mapping | `actor, resource_type, resource_reference, verified_at, expected_version` | `AdminEvent; 200` |
 | Delete mapping | `actor, expected_version` | `AdminEvent; 200` |
-| Quote | `quantity` | `Quote; 201` |
-| Create Order | Current public path: `quote_id, buyer {name,email}` | One unpaid public Order + Reservation + order_token; 201 |
+| Quote | Public: `quantity`; private: `quantity, access_request_token` | One-Ticket Quote; 201 |
+| Create Order | Public: `quote_id, buyer {name,email}`; private: `quote_id, access_request_token, buyer {name,email}` | One unpaid one-Ticket Order + Reservation + order_token; 201 |
 | Submit Access Request | `name, email` | `{received:true}; 201` |
 | Edit Access Request | `Changed name/email + expected_version` | `AdminAccessRequest; 200` |
 | Request decision | `expected_version` | `AdminAccessRequest; 200` |

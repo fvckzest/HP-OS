@@ -59,6 +59,7 @@ export interface AttemptRow extends QueryResultRow {
 
 interface PaymentAttemptListRow extends AttemptRow {
   event_id: string;
+  created_cursor_time: string;
   checkout_expired: boolean;
   requires_verification: boolean;
   requires_report_work: boolean;
@@ -156,14 +157,14 @@ function listLimit(value: string | null): number | Response {
   return Number(value);
 }
 
-function listCursor(site: AuthenticatedSite, filters: object, limit: number, row: { created_at: Date; id: string }): string {
+function listCursor(site: AuthenticatedSite, filters: object, limit: number, row: { created_at: Date; created_cursor_time?: string; id: string }): string {
   const payload = Buffer.from(JSON.stringify({
     route: "admin-payment-attempts",
     siteId: site.siteId,
     filters,
     limit,
     issuedAt: new Date().toISOString(),
-    createdAt: row.created_at.toISOString(),
+    createdAt: row.created_cursor_time ?? row.created_at.toISOString(),
     id: row.id,
   }), "utf8").toString("base64url");
   const signature = createHmac("sha256", site.cursorSigningKey).update(payload).digest("base64url");
@@ -242,6 +243,7 @@ async function listPaymentAttempts(request: Request, site: AuthenticatedSite): P
   )`;
   const result = await getBusinessPool().query<PaymentAttemptListRow>(
     `select attempt.*, order_row.event_id,
+            to_char(attempt.created_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as created_cursor_time,
             order_row.checkout_status, order_row.checkout_expires_at,
             order_row.payment_status, reservation.status as reservation_status,
             ${requiresVerification} as requires_verification,
@@ -296,16 +298,28 @@ function rejectCheckoutReferenceConflict(sameSite: boolean): never {
 async function createAttempt(client: PoolClient, site: AuthenticatedSite, orderId: string): Promise<IdempotentResult> {
   const event = await lockOrderEvent(client, site.siteId, orderId);
   if (event.is_canceled) reject(409, "checkout_ended", "This Event was canceled before provider checkout could start.");
+  const scope = await client.query<{ access_request_id: string | null }>(
+    `select access_request_id from hpos.orders where id = $1 and site_id = $2`,
+    [orderId, site.siteId],
+  );
+  const accessRequestId = scope.rows[0]?.access_request_id ?? null;
+  if (accessRequestId) {
+    await client.query(
+      `select id from hpos.access_requests where id = $1 and site_id = $2 for update`,
+      [accessRequestId, site.siteId],
+    );
+  }
   const orderResult = await client.query<{
     id: string;
     payment_connection_id: string | null;
     provider_mapping: Record<string, unknown> | null;
     accepted_quote: Record<string, unknown>;
+    access_request_id: string | null;
     checkout_status: AttemptRow["checkout_status"];
     checkout_expired: boolean;
     payment_status: AttemptRow["payment_status"];
   }>(
-    `select id, payment_connection_id, provider_mapping, accepted_quote, checkout_status,
+    `select id, payment_connection_id, provider_mapping, accepted_quote, access_request_id, checkout_status,
             checkout_expires_at <= clock_timestamp() as checkout_expired, payment_status
      from hpos.orders
      where id = $1 and site_id = $2
@@ -319,6 +333,16 @@ async function createAttempt(client: PoolClient, site: AuthenticatedSite, orderI
     reject(409, "checkout_expired", "This checkout expired. Start a new checkout if capacity remains.");
   }
   if (order.checkout_status === "ended") reject(409, "checkout_ended", "This checkout has ended and cannot start another payment attempt.");
+  if (order.access_request_id) {
+    const approval = await client.query<{ status: "pending" | "approved" | "rejected"; paid_order_id: string | null }>(
+      `select status, paid_order_id from hpos.access_requests where id = $1 and site_id = $2`,
+      [order.access_request_id, site.siteId],
+    );
+    const request = approval.rows[0];
+    if (!request || request.status !== "approved" || (request.paid_order_id && request.paid_order_id !== order.id)) {
+      reject(409, "checkout_ended", "The private approval no longer permits a new payment attempt.");
+    }
+  }
   if (order.checkout_status === "awaiting_payment_result") {
     reject(409, "payment_attempt_in_progress", "An existing provider checkout must be verified or closed before another attempt can start.");
   }

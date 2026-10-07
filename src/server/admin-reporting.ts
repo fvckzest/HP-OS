@@ -33,6 +33,8 @@ interface TicketRow extends QueryResultRow {
   buyer_id: string;
   buyer_name: string;
   delivery_email: string;
+  attendee_name: string | null;
+  approved_attendee_email: string | null;
   refund_status: "none" | "partial" | "full";
   event_canceled: boolean;
   starts_at: Date | null;
@@ -174,7 +176,10 @@ function ticketData(row: TicketRow) {
     buyer_id: row.buyer_id,
     buyer_name: row.buyer_name,
     delivery_email: row.delivery_email,
-    approved_attendee: null,
+    approved_attendee: row.approved_attendee_email === null ? null : {
+      name: row.attendee_name,
+      email: row.approved_attendee_email,
+    },
     admission_status: row.admission_id === null ? "unused" : "admitted",
     admitted_at: row.admitted_at?.toISOString() ?? null,
     can_admit: blockers.length === 0,
@@ -194,6 +199,7 @@ async function readTicketRows(client: Pool | PoolClient, siteId: string, eventId
   const result = await client.query<TicketRow>(
     `select ticket.id as ticket_id, ticket.event_id, ticket.order_id, order_row.order_reference,
             ticket.ordinal, ticket.issued_at, ticket.created_at, ticket.updated_at, ticket.version,
+            ticket.attendee_name, ticket.approved_attendee_email,
             order_row.buyer_id, order_row.buyer_name, order_row.delivery_email,
             order_row.refund_status, event_row.is_canceled as event_canceled,
             event_row.starts_at, event_row.ends_at, event_row.check_in_opens_at,
@@ -299,6 +305,7 @@ async function listTickets(request: Request, site: AuthenticatedSite, eventId: s
   const result = await getBusinessPool().query<TicketRow>(
     `select ticket.id as ticket_id, ticket.event_id, ticket.order_id, order_row.order_reference,
             ticket.ordinal, ticket.issued_at, ticket.created_at, ticket.updated_at, ticket.version,
+            ticket.attendee_name, ticket.approved_attendee_email,
             order_row.buyer_id, order_row.buyer_name, order_row.delivery_email,
             order_row.refund_status, event_row.is_canceled as event_canceled,
             event_row.starts_at, event_row.ends_at, event_row.check_in_opens_at,
