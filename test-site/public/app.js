@@ -32,21 +32,44 @@ function render() {
   const list = document.querySelector('#checklist'); list.replaceChildren();
   for (const group of state.groups) {
     list.append(el('h2', group.title));
+    const table = el('table', undefined, 'workflow-table'), head = el('tr'), body = el('tbody');
+    for (const label of ['Run / gate', 'Workflow', 'Description']) { const th = el('th', label); th.scope = 'col'; head.append(th); }
+    const thead = el('thead'); thead.append(head); table.append(thead, body);
+    const scroll = el('div', undefined, 'table-scroll'); scroll.append(table); list.append(scroll);
     for (const ticket of state.tickets.filter(t => t.number >= group.from && t.number <= group.to)) {
-      const row = el('article', undefined, 'ticket'), title = el('h3'); title.append(link(`#${ticket.number} ${ticket.title}`, ticket.url)); row.append(title);
-      row.dataset.ticket = ticket.number;
-      row.append(el('p', `${ticket.gate} · ${ticket.reason}`, 'muted'));
-      if (ticket.criteria.length) { const criteria = el('ul'); for (const item of ticket.criteria) criteria.append(el('li', item)); row.append(details('Full ticket acceptance checklist (not scenario results)', criteria)); }
-      for (const w of state.workflows.filter(w => w.ticket === ticket.number)) {
-        const scenario = el('div', undefined, 'scenario'), latest = state.runs.find(r => r.workflow === w.id && r.profile === current), reasons = w.blockers[current];
+      const ticketWorkflows = state.workflows.filter(w => w.ticket === ticket.number);
+      if (!ticketWorkflows.length) {
+        const row = el('tr', undefined, 'ticket-only-row'), gate = el('span', ticket.gate, 'ticket-gate');
+        const gateCell = el('td'); gateCell.append(gate); row.append(gateCell);
+        const ticketCell = el('td'), ticketLink = link(`#${ticket.number} ${ticket.title}`, ticket.url); ticketCell.append(ticketLink, el('span', 'No local workflow', 'workflow-status')); row.append(ticketCell);
+        const descriptionCell = el('td'), ticketDetails = el('details');
+        ticketDetails.dataset.key = `ticket:${ticket.number}`;
+        const ticketSummary = el('summary'); ticketSummary.append(el('span', ticket.reason, 'description-preview'), el('span', 'Details', 'expand-label'));
+        const ticketContent = el('div', undefined, 'expanded-content');
+        ticketContent.append(el('p', ticket.reason, 'muted'));
+        if (ticket.criteria.length) { ticketContent.append(el('h4', 'Ticket acceptance criteria')); const criteria = el('ul'); for (const item of ticket.criteria) criteria.append(el('li', item)); ticketContent.append(criteria); }
+        ticketDetails.append(ticketSummary, ticketContent); descriptionCell.append(ticketDetails); row.append(descriptionCell); body.append(row);
+      }
+      for (const w of ticketWorkflows) {
+        const row = el('tr', undefined, 'workflow-row'), latest = state.runs.find(r => r.workflow === w.id && r.profile === current), reasons = w.blockers[current];
         const status = latest?.status ?? (reasons.length ? 'blocked' : 'not run');
-        scenario.append(el('p', `${w.title} — ${status}`, 'status'));
-        if (w.scope) scenario.append(el('p', w.scope, 'muted'));
-        const steps = el('ol'); w.steps.forEach(s => steps.append(el('li', s))); scenario.append(details('Buyer, staff and worker steps', steps));
-        if (reasons.length) scenario.append(el('p', reasons.join(' '), 'muted'));
-        scenario.append(button('Run workflow', () => action('/api/run', { workflow: w.id, profile: current }), Boolean(reasons.length || state.runs.some(r => r.status === 'running'))));
-        row.append(scenario);
-      } list.append(row);
+        const run = button('Run', () => action('/api/run', { workflow: w.id, profile: current }), Boolean(reasons.length || state.runs.some(r => r.status === 'running')));
+        run.setAttribute('aria-label', `Run workflow: ${w.title}`);
+        const actionCell = el('td'); actionCell.append(run); row.append(actionCell);
+        const workflowCell = el('td'), ticketLink = link(`#${ticket.number} ${ticket.title}`, ticket.url);
+        ticketLink.className = 'workflow-ticket'; workflowCell.append(ticketLink, el('strong', w.title, 'workflow-name'), el('span', status, 'workflow-status')); row.append(workflowCell);
+        const descriptionCell = el('td'), workflowDetails = el('details');
+        workflowDetails.dataset.key = `workflow:${w.id}`;
+        const summary = el('summary'); summary.append(el('span', w.scope ?? `${w.steps.length} documented checks`, 'description-preview'), el('span', 'Details', 'expand-label'));
+        const content = el('div', undefined, 'expanded-content');
+        if (w.scope) content.append(el('p', w.scope, 'muted'));
+        content.append(el('h4', 'Workflow checks'));
+        const steps = el('ol'); w.steps.forEach(s => steps.append(el('li', s))); content.append(steps);
+        if (reasons.length) content.append(el('p', `Profile requirements: ${reasons.join(' ')}`, 'muted'));
+        content.append(el('h4', 'Ticket context'), el('p', ticket.reason, 'muted'));
+        if (ticket.criteria.length) { const criteria = el('ul'); for (const item of ticket.criteria) criteria.append(el('li', item)); content.append(criteria); }
+        workflowDetails.append(summary, content); descriptionCell.append(workflowDetails); row.append(descriptionCell); body.append(row);
+      }
     }
   }
   document.querySelector('#route-count').textContent = `All ${state.routes.length} documented API routes and ticket mappings`;
@@ -73,7 +96,7 @@ function render() {
   }
   if (!state.runs.length) runs.append(el('p', 'No workflow has been run.'));
   for (const d of document.querySelectorAll('details')) {
-    d.dataset.key = `${d.closest('[data-ticket]')?.dataset.ticket ?? d.closest('[data-run]')?.dataset.run ?? 'global'}:${d.querySelector('summary')?.textContent}`;
+    d.dataset.key ??= `${d.closest('[data-ticket]')?.dataset.ticket ?? d.closest('[data-run]')?.dataset.run ?? 'global'}:${d.querySelector('summary')?.textContent}`;
     if (openDetails.has(d.dataset.key) || openDetails.has(d.querySelector('summary')?.textContent)) d.open = true;
   }
 }

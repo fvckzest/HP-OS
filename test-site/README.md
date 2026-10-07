@@ -35,12 +35,12 @@ docker compose down
 ## Run and interpret a workflow
 
 1. Leave **Local simulation** selected unless you intend to call external test services.
-2. Expand a workflow's buyer, staff and worker steps, then select **Run workflow**.
+2. Select **Run** in a workflow's table row. The description is in the last column; expand **Details** for the full checks, profile requirements, ticket reason, and acceptance criteria.
 3. The current run and HTTP step appear above the checklist. While running, saved progress refreshes every two seconds; **Refresh saved status** and **Interrupt current run** remain available. Refresh reads saved records and does not run or poll HP-OS.
 4. Open the saved Fake LMNL buyer pages or redacted HTTP evidence as needed. Buyer-page opening explicitly performs its current read through the server adapter.
 5. Export redacted evidence for later review. Keep the original profile and limitations with every result.
 
-Each runnable scenario has one explicit Run action. The complete checklist covers tickets #23–55 and keeps their acceptance criteria visible. Unimplemented capabilities are unavailable. Missing configuration and release prerequisites are blocked. A scenario can be not run, passed, failed, interrupted, or have an unknown outcome. Passing a subset does not pass its ticket, #33, #51, or any release gate. Hosted/cutover checks and sales approval have no local execution action. This tool supplies a prerequisite for collecting #51 evidence; it does not execute or complete #51.
+Each runnable scenario has one explicit Run action. The complete checklist covers tickets #23–55 and keeps their acceptance criteria available in expanded row details. Unimplemented capabilities are unavailable. Missing configuration and release prerequisites are blocked. A scenario can be not run, passed, failed, interrupted, or have an unknown outcome. Passing a subset does not pass its ticket, #33, #51, or any release gate. Hosted/cutover checks and sales approval have no local execution action. This tool supplies a prerequisite for collecting #51 evidence; it does not execute or complete #51.
 
 The **Connected public single-ticket rehearsal** is the supported local workflow for Issue #33. It records the sequence in one saved run: accepted Order total and provider checkout registration, confirmation-pending access before payment, verified payment, one issued Ticket, initial email dispatch and separate delivery evidence, Order and individual Ticket reads, and one successful Admission followed by a rejected repeat. The simulation profile uses synthetic provider and email reports. The Sandbox profile uses Square Sandbox and sends only to the configured operator email through Resend. A passed run is implementation evidence for the dashboard workflow; it does not check off Issue #33 or claim the deferred LMNL cutover proof.
 
