@@ -2,6 +2,19 @@ import { Pause, Blocked, Unknown } from './adapter.mjs';
 const human = { type: 'user', reference: 'fake-lmnl:local-staff' };
 const system = { type: 'system', reference: 'fake-lmnl:local-worker' };
 const iso = n => new Date(n).toISOString();
+function isoInTimeZone(n, timeZone) {
+  const date = new Date(n);
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(date).filter(part => part.type !== 'literal').map(part => [part.type, part.value]));
+  const milliseconds = date.getUTCMilliseconds();
+  const localAsUtc = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute), Number(parts.second), milliseconds);
+  const offsetMinutes = Math.round((localAsUtc - n) / 60_000);
+  const absoluteOffset = Math.abs(offsetMinutes);
+  const offset = `${offsetMinutes < 0 ? '-' : '+'}${String(Math.floor(absoluteOffset / 60)).padStart(2, '0')}:${String(absoluteOffset % 60).padStart(2, '0')}`;
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}.${String(milliseconds).padStart(3, '0')}${offset}`;
+}
 const id = x => encodeURIComponent(x);
 export async function settleRequests(requests) {
   const results = await Promise.allSettled(requests);
@@ -21,23 +34,23 @@ async function configuration(a) {
   await a.read('historical-connection', `/v1/admin/payment-connections/${id(c.connection_id)}`);
   return c;
 }
-async function event(a, prefix = 'event', { ended = false, capacity = 8, futureCheckIn = false, auth = 'primary' } = {}) {
-  const t = a.run.clock, start = ended ? t - 7_200_000 : t + 300_000, end = ended ? t - 3_600_000 : t + 86_400_000;
+async function event(a, prefix = 'event', { ended = false, capacity = 8, futureCheckIn = false, auth = 'primary', visibility = 'public', checkInUsesEventStart = false, startOffsetMs = 300_000 } = {}) {
+  const t = a.run.clock, start = ended ? t - 7_200_000 : t + startOffsetMs, end = ended ? t - 3_600_000 : t + 86_400_000;
   const draft = await a.write(prefix + '-draft', '/v1/admin/events', { actor: human }, [201], { auth });
   const p = `/v1/admin/events/${id(draft.data.event_id)}`;
   const saved = await a.call(prefix + '-save', p, { method: 'PATCH', auth, body: {
-    actor: human, expected_version: draft.data.version, title: `Fake LMNL ${a.run.id.slice(0, 8)} ${prefix}`, description: 'Dedicated local synthetic workflow Event.', visibility: 'public',
-    venue: { name: 'Fake LMNL local venue', address: null }, starts_at: iso(start), ends_at: iso(end), time_zone: 'UTC', check_in_opens_at: futureCheckIn ? iso(start) : iso(start - 600_000),
+    actor: human, expected_version: draft.data.version, title: `Fake LMNL ${a.run.id.slice(0, 8)} ${prefix}`, description: 'Dedicated local synthetic workflow Event.', visibility,
+    venue: { name: 'Fake LMNL local venue', address: null }, starts_at: iso(start), ends_at: iso(end), time_zone: 'UTC', check_in_opens_at: checkInUsesEventStart ? null : futureCheckIn ? iso(start) : iso(start - 600_000),
     ticket_offering: { price: { amount: 2500, currency: 'USD' }, tax_amount: 0, buyer_fees: [], capacity, sales_opens_at: iso(start - 600_000), sales_closes_at: iso(end) },
   } });
   const published = await a.write(prefix + '-publish', p + '/actions/publish', { actor: human, expected_version: saved.data.version }, [200], { auth });
   if (auth === 'primary') a.run.privateContext.event = published.data;
   await a.save(); return published.data;
 }
-async function reserve(a, e, prefix = 'purchase', auth = 'primary', buyerEmail = null) {
-  const quote = await a.write(prefix + '-quote', `/v1/public/events/${id(e.event_id)}/quotes`, { quantity: 1 }, [201], { auth });
+async function reserve(a, e, prefix = 'purchase', auth = 'primary', buyerEmail = null, quantity = 1) {
+  const quote = await a.write(prefix + '-quote', `/v1/public/events/${id(e.event_id)}/quotes`, { quantity }, [201], { auth });
   const order = await a.write(prefix + '-order', '/v1/public/orders', { quote_id: quote.data.quote_id, buyer: { name: 'Fake LMNL Buyer', email: buyerEmail || (a.run.profile === 'sandbox' ? a.config.operatorEmail : 'buyer@fake-lmnl.test') } }, [201], { auth });
-  a.check(prefix + ': unpaid Order', order.data.payment_status === 'unpaid' && order.data.tickets.length === 0, 'Unpaid Order with no Tickets', { payment: order.data.payment_status, tickets: order.data.tickets.length });
+  a.check(prefix + ': unpaid Order', order.data.payment_status === 'unpaid' && order.data.quantity === quantity && order.data.reservation?.quantity === quantity && order.data.tickets.length === 0, 'Unpaid Order and Reservation preserve the requested quantity, with no Tickets before payment', { payment: order.data.payment_status, quantity: order.data.quantity, reservation: order.data.reservation?.quantity, tickets: order.data.tickets.length });
   if (auth === 'primary') a.run.privateContext.order = order.data;
   await a.save(); return { quote: quote.data, order: order.data };
 }
@@ -80,9 +93,14 @@ async function paid(a, order, at, reference) {
   await a.write('paid-report', `/v1/admin/payment-attempts/${id(at.attempt_id)}/payment-reports`, body, [201, 200]);
   let buyer = await a.read('issued-order', `/v1/public/orders/${id(order.order_token)}`, { fresh: true });
   if (buyer.data.issuance_status !== 'issued') { await a.scheduler('issuance-processing'); buyer = await a.read('recovered-order', `/v1/public/orders/${id(order.order_token)}`, { fresh: true }); }
-  a.check('complete issuance', buyer.data.payment_status === 'paid' && buyer.data.issuance_status === 'issued' && buyer.data.tickets.length === 1, 'Paid Order has exactly one fully issued Ticket', { payment: buyer.data.payment_status, issuance: buyer.data.issuance_status, tickets: buyer.data.tickets.length });
-  const ticket = buyer.data.tickets[0];
-  a.check('distinct access scopes', ticket.ticket_token !== order.order_token && ticket.ticket_token !== ticket.qr_payload && !ticket.qr_payload.includes('@'), 'Order token, Ticket token and QR are distinct; QR has no email', { distinct: true });
+  const expectedQuantity = order.quantity || 1, tickets = buyer.data.tickets;
+  const uniqueIds = new Set(tickets.map(item => item.ticket_id)).size === expectedQuantity;
+  const orderedOrdinals = tickets.every((item, index) => item.ordinal === index + 1);
+  a.check('complete issuance', buyer.data.payment_status === 'paid' && buyer.data.issuance_status === 'issued' && tickets.length === expectedQuantity && uniqueIds && orderedOrdinals, `Paid Order has its complete set of ${expectedQuantity} Tickets with stable ordinals`, { payment: buyer.data.payment_status, issuance: buyer.data.issuance_status, quantity: expectedQuantity, tickets: tickets.length, uniqueIds, ordinals: tickets.map(item => item.ordinal) });
+  const ticket = tickets[0];
+  const uniqueTokens = new Set(tickets.map(item => item.ticket_token)).size === expectedQuantity;
+  const uniqueQr = new Set(tickets.map(item => item.qr_payload)).size === expectedQuantity;
+  a.check('distinct access scopes', uniqueTokens && uniqueQr && tickets.every(item => item.ticket_token !== order.order_token && item.ticket_token !== item.qr_payload && !item.qr_payload.includes('@')), 'Order token, each Ticket token and each QR are distinct; QR data has no email', { uniqueTokens, uniqueQr, quantity: expectedQuantity });
   const buyerTicket = await a.read('buyer-ticket', `/v1/public/tickets/${id(ticket.ticket_token)}`);
   a.check(
     'buyer Ticket page',
@@ -101,26 +119,96 @@ async function paid(a, order, at, reference) {
   await a.read('staff-payment-status', `/v1/admin/orders/${id(order.order_id)}/payment-status`);
   await a.write('paid-report-duplicate-source', `/v1/admin/payment-attempts/${id(at.attempt_id)}/payment-reports`, body, [200]);
   const duplicate = await a.read('after-payment-replay', `/v1/public/orders/${id(order.order_token)}`, { fresh: true });
-  a.check('no duplicate Ticket', duplicate.data.tickets.length === 1 && duplicate.data.tickets[0].ticket_id === ticket.ticket_id, 'Repeated report preserves the same Ticket', duplicate.data.tickets.map(t => t.ticket_id));
-  a.run.privateContext.ticket = ticket; await a.save(); return { ticket, body };
+  a.check('no duplicate Ticket', duplicate.data.tickets.length === expectedQuantity && duplicate.data.tickets.map(item => item.ticket_id).join('|') === tickets.map(item => item.ticket_id).join('|'), 'Repeated report preserves the same complete Ticket set', duplicate.data.tickets.map(t => t.ticket_id));
+  a.run.privateContext.ticket = ticket; a.run.privateContext.tickets = tickets; await a.save(); return { ticket, tickets, body };
 }
 async function fixture(a, { buyerEmail = null } = {}) {
   await configuration(a); const e = await event(a), { order } = await reserve(a, e, 'purchase', 'primary', buyerEmail), at = await attempt(a, order), reference = await checkout(a, at), payment = await paid(a, order, at, reference);
   return { e, order, at, reference, ...payment };
 }
+function savedStepData(run, name) {
+  const step = run.steps.find(item => item.name === name);
+  return step?.actual?.response?.data ?? null;
+}
+function savedNotificationJob(value, jobId) {
+  if (Array.isArray(value)) return value.map(item => savedNotificationJob(item, jobId)).find(Boolean) ?? null;
+  if (!value || typeof value !== 'object') return null;
+  // Order reads return a summary without dispatch_attempts or delivery_reports.
+  // The preceding outcome-report response carries that detailed evidence.
+  if (value.job_id === jobId) return value;
+  return Object.values(value).map(item => savedNotificationJob(item, jobId)).find(Boolean) ?? null;
+}
+function provesSimulatedNoDispatch(run, jobId) {
+  if (run.profile !== 'simulation' || run.status !== 'passed') return false;
+  if (!Array.isArray(run.steps) || run.steps.some(step => step.provider !== 'hpos')) return false;
+  const reportPath = `/v1/admin/notification-jobs/${id(jobId)}/outcome-reports`;
+  const reportIndex = run.steps.findIndex(step => step.method === 'POST'
+    && step.path === reportPath
+    && step.request?.outcome === 'unknown'
+    && step.request.provider_message_reference === null);
+  if (reportIndex < 0) return false;
+  const reportStep = run.steps[reportIndex];
+  const claimId = reportStep.request.claim_id;
+  const claimedStep = run.steps.find(step => step.method === 'POST'
+    && step.path === '/v1/admin/notification-jobs/claims'
+    && step.actual?.response?.data?.claim_id === claimId);
+  const claim = claimedStep?.actual?.response?.data;
+  const claimed = claim?.jobs?.find(item => item.job_id === jobId);
+  const reported = reportStep.actual?.response?.data;
+  const observedStep = run.steps.slice(reportIndex + 1).find(step => step.method === 'GET'
+    && step.actual?.status === 200
+    && savedNotificationJob(step.actual?.response?.data, jobId));
+  const observed = savedNotificationJob(observedStep?.actual?.response?.data, jobId);
+  const reportedAttempt = reported?.dispatch_attempts?.at(-1);
+  const noProviderReference = attempts => Array.isArray(attempts) && attempts.length > 0
+    && attempts.every(attempt => attempt.outcome === 'unknown' && attempt.provider_message_reference === null);
+  return claimedStep?.actual?.status === 200 && Boolean(claim?.claim_id) && claimed?.job_id === jobId
+    && reportStep.actual?.status === 200
+    && reportStep.request?.claim_id === claimId && claimId === claim.claim_id
+    && reportStep.request?.lease_fence === claimed.lease_fence
+    && observedStep?.actual?.status === 200
+    && reported?.job_id === jobId && reported.requires_verification === true
+    && reported.provider_message_reference === null && noProviderReference(reported.dispatch_attempts)
+    && reportedAttempt?.outcome === 'unknown'
+    && reportedAttempt.claim_id === claim.claim_id && reportedAttempt.lease_fence === claimed.lease_fence
+    && reportedAttempt.provider_message_reference === null
+    && observed?.job_id === jobId && observed.requires_verification === true
+    && observed.provider_message_reference === null
+    && Array.isArray(reported.delivery_reports) && reported.delivery_reports.length === 0;
+}
+async function verifiedSimulationUnknowns(a, frontier) {
+  const pending = frontier.filter(job => job.status !== 'completed' && job.requires_verification);
+  const proofs = new Map();
+  if (!pending.length) return proofs;
+  if (a.run.profile !== 'simulation') {
+    throw new Blocked('Unfinished jobs require provider or durable-log verification. Resolve their saved runs first; no blind resend is permitted.');
+  }
+  const savedRuns = await a.store.all();
+  for (const job of pending) {
+    const sourceRun = savedRuns.find(run => provesSimulatedNoDispatch(run, job.job_id));
+    if (!sourceRun) {
+      throw new Blocked(`Notification job ${job.job_id} requires verification. No matching saved Local simulation run proves that a provider dispatch was not made; no resend was attempted.`);
+    }
+    a.check(`saved simulation proves no provider dispatch ${job.job_id}`, true,
+      'The matching passed saved run used only the HP-OS API and recorded an unknown result without a provider message or delivery report',
+      { job_id: job.job_id, saved_run_id: sourceRun.id, profile: sourceRun.profile, workflow: sourceRun.workflow });
+    proofs.set(job.job_id, sourceRun.id);
+  }
+  return proofs;
+}
 async function deliver(a, f, { unknown = false, overlap = false, failure = false } = {}) {
   const jobs = await a.read('email-list', `/v1/admin/notification-jobs?order_id=${id(f.order.order_id)}&kind=tickets_ready`);
   const job = jobs.data.find(j => j.order_id === f.order.order_id && j.kind === 'tickets_ready');
   a.check('initial email job', jobs.data.length === 1 && Boolean(job), 'Exactly one initial email job for this Order', jobs.data.length);
-  const frontier = await a.read('email-frontier', '/v1/admin/notification-jobs?kind=tickets_ready&limit=100');
+  const frontier = await a.read('email-frontier', '/v1/admin/notification-jobs?kind=tickets_ready&limit=100', { fresh: true });
   if (frontier.envelope.pagination?.next_cursor) throw new Blocked('The worker frontier exceeds this bounded 100-job run. Resolve preceding work first.');
-  if (frontier.data.some(j => j.status !== 'completed' && j.requires_verification)) throw new Blocked('Unfinished jobs require dispatch verification. Resolve their saved runs first; no blind resend is permitted.');
+  const verifiedUnknowns = await verifiedSimulationUnknowns(a, frontier.data);
   if (a.run.profile === 'sandbox' && frontier.data.some(j => j.job_id !== job.job_id && j.status !== 'completed')) throw new Blocked('Other unfinished Ticket-email jobs exist. Resolve preceding simulated runs first; Sandbox cannot send unrelated notifications.');
   const claim = await a.write('email-claim', '/v1/admin/notification-jobs/claims', { actor: system, limit: 100, kinds: ['tickets_ready'] });
   const claimed = claim.data.jobs.find(j => j.job_id === job.job_id);
   if (!claimed) throw new Blocked('Target job is not claimable. Recover its existing claim before dispatch.');
   if (a.run.profile === 'simulation') for (const preceding of claim.data.jobs.filter(j => j.job_id !== job.job_id)) {
-    if (preceding.requires_verification) throw new Blocked('A preceding claimed job requires dispatch verification. No blind simulated resend.');
+    if (preceding.requires_verification && !verifiedUnknowns.has(preceding.job_id)) throw new Blocked('A newly claimed job requires provider or durable-log verification. No blind simulated resend.');
     const reference = `fake-email-${preceding.job_id}`;
     await a.write('backlog-dispatch-' + preceding.job_id, `/v1/admin/notification-jobs/${id(preceding.job_id)}/outcome-reports`, { actor: system, claim_id: claim.data.claim_id, lease_fence: preceding.lease_fence, outcome: 'completed', provider_message_reference: reference, observed_at: iso(a.run.clock + 2000), error_code: null });
     await a.write('backlog-delivery-' + preceding.job_id, `/v1/admin/notification-jobs/${id(preceding.job_id)}/delivery-reports`, { actor: system, outcome: 'delivered', provider_message_reference: reference, provider_event_reference: `fake-delivery-${preceding.job_id}`, observed_at: iso(a.run.clock + 3000) });
@@ -361,7 +449,7 @@ async function recoveryFrontier(a) {
     observed_at: iso(a.run.clock + 1000),
     payment_started_at: null,
     provider_can_take_payment: null,
-  });
+  }, [201]);
   const frontier = await a.read('verification-frontier', '/v1/admin/payment-attempts?requires_verification=true&limit=100');
   const discovered = frontier.data.find(row => row.attempt_id === at.attempt_id);
   a.check('verification frontier', discovered?.requires_verification === true
@@ -373,11 +461,473 @@ async function recoveryFrontier(a) {
   const scheduled = await a.scheduler('verification-frontier-scheduler');
   a.check('scheduler verification count', Number.isInteger(scheduled.data.verification_required_attempts), 'The bounded scheduler reports payment attempts promoted for verification', scheduled.data.verification_required_attempts);
 }
+
+async function createApprovedPrivateRequest(a, prefix = 'private') {
+  const e = await event(a, prefix + '-event', { visibility: 'private' });
+  const attendee = {
+    name: 'Fake LMNL Attendee ' + a.run.id.slice(0, 8),
+    email: 'attendee-' + a.run.id.slice(0, 8) + '@fake-lmnl.test',
+  };
+  await a.write(prefix + '-request', '/v1/public/events/' + id(e.event_id) + '/access-requests', attendee, [201]);
+  const list = await a.read(prefix + '-request-list', '/v1/admin/events/' + id(e.event_id) + '/access-requests?limit=100');
+  const request = list.data.find(item => item.status === 'pending' && item.email === attendee.email);
+  if (!request) throw new Blocked('The submitted attendee request is not visible to this Site.');
+  const before = await a.read(prefix + '-capacity-before', '/v1/admin/events/' + id(e.event_id));
+  const decision = await a.write(prefix + '-approve', '/v1/admin/access-requests/' + id(request.request_id) + '/actions/approve', {
+    actor: human, expected_version: request.version,
+  });
+  const jobs = await a.read(prefix + '-approval-job', '/v1/admin/notification-jobs?event_id=' + id(e.event_id) + '&kind=access_approved&limit=100');
+  const job = jobs.data.find(item => item.access_request_id === request.request_id && !item.is_superseded);
+  const token = job?.payload?.approval_token;
+  if (!token) throw new Blocked('Approval produced no current Site-side approval-link job.');
+  const lookup = await a.read(prefix + '-approval-link', '/v1/public/access-requests/' + id(token));
+  a.check(prefix + ': approved attendee', lookup.data.approved_attendee?.name === attendee.name
+    && lookup.data.approved_attendee?.email === attendee.email
+    && lookup.data.max_quantity_per_order === 1,
+  'The approval link contains the approved attendee and one-Ticket limit', lookup.data);
+  a.check(prefix + ': approval does not reserve', before.data.ticket_offering.available_quantity === e.ticket_offering.available_quantity,
+    'Approval creates no capacity Reservation', before.data.ticket_offering.available_quantity);
+  a.run.privateContext.accessRequest = decision.data;
+  a.run.privateContext.approvalToken = token;
+  await a.save();
+  return { e, attendee, request: decision.data, token, approvalJob: job };
+}
+async function arrivalChange(a) {
+  await configuration(a);
+  const e = await event(a, 'arrival-change', { checkInUsesEventStart: true, startOffsetMs: -600_000 });
+  const { order } = await reserve(a, e, 'arrival-purchase');
+  const at = await attempt(a, order, 'arrival-attempt');
+  const reference = await checkout(a, at);
+  const { ticket } = await paid(a, order, at, reference);
+  const before = await a.read('arrival-event-before', '/v1/admin/events/' + id(e.event_id));
+  const starts = Date.parse(before.data.starts_at) + 3_600_000;
+  const ends = Date.parse(before.data.ends_at) + 3_600_000;
+  const timeZone = 'America/Los_Angeles';
+  const edited = await a.call('arrival-event-edit', '/v1/admin/events/' + id(e.event_id), {
+    method: 'PATCH',
+    body: {
+      actor: human, expected_version: before.data.version,
+      starts_at: isoInTimeZone(starts, timeZone), ends_at: isoInTimeZone(ends, timeZone), time_zone: timeZone,
+      venue: { name: 'Fake LMNL updated venue', address: '100 Synthetic Street' },
+      ticket_offering: {
+        sales_opens_at: isoInTimeZone(Date.parse(before.data.ticket_offering.sales_opens_at), timeZone),
+        sales_closes_at: isoInTimeZone(Date.parse(before.data.ticket_offering.sales_closes_at), timeZone),
+      },
+    },
+  });
+  a.check('default check-in follows start', edited.data.check_in_uses_event_start === true
+    && Date.parse(edited.data.check_in_opens_at) === Date.parse(edited.data.starts_at),
+  'Default check-in opening follows the edited Event start', { usesEventStart: edited.data.check_in_uses_event_start, opensAt: edited.data.check_in_opens_at, startsAt: edited.data.starts_at });
+  const changed = await a.read('arrival-notifications', '/v1/admin/notification-jobs?event_id=' + id(e.event_id) + '&kind=event_changed&limit=100');
+  const jobs = changed.data.filter(item => item.order_id === order.order_id && !item.is_superseded);
+  const job = jobs[0];
+  const expectedFields = ['ends_at', 'starts_at', 'time_zone', 'venue.address', 'venue.name'];
+  a.check('per-Order Event change job', jobs.length === 1
+    && job.payload?.event?.changed_fields?.slice().sort().join('|') === expectedFields.join('|'),
+    'Exactly one active durable notification records the changed Event fields for the paid Order', jobs.map(item => item.payload?.event?.changed_fields));
+  const publicWallet = await a.read('arrival-wallet-data', '/v1/public/tickets/' + id(ticket.ticket_token) + '/apple-wallet-data');
+  const walletJobs = await a.read('arrival-wallet-jobs', '/v1/admin/notification-jobs?kind=wallet_update&limit=100');
+  const walletJob = walletJobs.data.find(item => item.ticket_id === ticket.ticket_id && !item.is_superseded);
+  a.check('Event edit queues Wallet version', Boolean(walletJob)
+    && walletJob.payload?.data_version === publicWallet.data.data_version,
+  'Wallet update work carries the current unsigned Ticket data version', walletJob?.payload);
+}
+async function cancelEvent(a) {
+  await configuration(a);
+  const e = await event(a, 'cancellation', { capacity: 2 });
+  const { order: paidOrder } = await reserve(a, e, 'cancellation-paid');
+  const at = await attempt(a, paidOrder, 'cancellation-attempt');
+  const reference = await checkout(a, at);
+  const { ticket } = await paid(a, paidOrder, at, reference);
+  const { order: unpaidOrder } = await reserve(a, e, 'cancellation-unpaid');
+  const currentEvent = await a.read('cancellation-event-current', '/v1/admin/events/' + id(e.event_id));
+  const canceled = await a.write('cancel-event', '/v1/admin/events/' + id(e.event_id) + '/actions/cancel', {
+    actor: human, expected_version: currentEvent.data.version,
+  });
+  a.check('Event canceled', canceled.data.is_canceled === true && canceled.data.sales_status === 'canceled',
+    'Cancellation stops sales while preserving the Event record', { canceled: canceled.data.is_canceled, salesStatus: canceled.data.sales_status });
+  const paidAdmin = await a.read('canceled-paid-order', '/v1/admin/orders/' + id(paidOrder.order_id));
+  const unpaidAdmin = await a.read('canceled-unpaid-order', '/v1/admin/orders/' + id(unpaidOrder.order_id));
+  a.check('cancellation is not a refund', paidAdmin.data.refund_status === 'none',
+    'Canceling an Event does not report or imply a provider refund', paidAdmin.data.refund_status);
+  a.check('safe unpaid Reservation released', unpaidAdmin.data.reservation.status === 'released',
+    'An unpaid Order with no provider checkout releases its Reservation safely', unpaidAdmin.data.reservation);
+  const notices = await a.read('cancellation-notifications', '/v1/admin/notification-jobs?event_id=' + id(e.event_id) + '&kind=event_canceled&limit=100');
+  a.check('paid Order cancellation notice queued', notices.data.filter(item => item.order_id === paidOrder.order_id && !item.is_superseded).length === 1,
+    'One durable cancellation notice is queued for the paid Order', notices.data.map(item => ({ kind: item.kind, order_id: item.order_id })));
+  await a.write('admission-after-cancel', '/v1/admin/events/' + id(e.event_id) + '/admissions', {
+    actor: human, qr_token: ticket.qr_payload,
+  }, [409], { expectedError: 'event_canceled' });
+}
+async function reportRefunds(a) {
+  await configuration(a);
+  const f = await fixture(a);
+  const partialAmount = Math.floor(f.order.pricing.total.amount / 3);
+  const makeRefund = (label, amount) => ({
+    attempt_id: f.at.attempt_id,
+    connection_id: f.at.connection.connection_id,
+    provider_payment_reference: f.body.provider_payment_reference,
+    provider_refund_reference: 'fake-refund-' + label + '-' + a.run.id,
+    source_reference: 'fake-refund-source-' + label + '-' + a.run.id,
+    outcome: 'completed', amount, currency: f.order.pricing.total.currency,
+    observed_at: iso(a.run.clock + (label === 'partial' ? 5000 : 6000)),
+  });
+  const path = '/v1/admin/orders/' + id(f.order.order_id) + '/refund-reports';
+  await a.write('partial-refund', path, makeRefund('partial', partialAmount), [201]);
+  const partial = await a.read('partial-refund-order', '/v1/admin/orders/' + id(f.order.order_id));
+  const ticketAfterPartial = await a.read('ticket-after-partial-refund', '/v1/public/tickets/' + id(f.ticket.ticket_token));
+  a.check('partial refund preserves entry', partial.data.refund_status === 'partial' && ticketAfterPartial.data.can_admit === true,
+    'A partial completed refund updates money status without revoking the Ticket', { refundStatus: partial.data.refund_status, canAdmit: ticketAfterPartial.data.can_admit });
+  await a.write('complete-refund', path, makeRefund('complete', f.order.pricing.total.amount - partialAmount), [201]);
+  const full = await a.read('fully-refunded-order', '/v1/admin/orders/' + id(f.order.order_id));
+  const buyer = await a.read('buyer-after-full-refund', '/v1/public/orders/' + id(f.order.order_token));
+  const wallet = await a.read('wallet-after-full-refund', '/v1/public/tickets/' + id(f.ticket.ticket_token) + '/apple-wallet-data');
+  const eventAfter = await a.read('capacity-after-full-refund', '/v1/admin/events/' + id(f.e.event_id));
+  a.check('full refund blocks entry and preserves history', full.data.refund_status === 'full'
+    && buyer.data.tickets.length === 1 && buyer.data.tickets[0].ticket_id === f.ticket.ticket_id
+    && buyer.data.tickets[0].can_admit === false,
+  'The issued Ticket and its history remain, but the fully refunded Ticket cannot be admitted', { refundStatus: full.data.refund_status, ticketCount: buyer.data.tickets.length, canAdmit: buyer.data.tickets[0]?.can_admit });
+  a.check('full refund voids Wallet data', wallet.data.voided === true,
+    'Unsigned Wallet data reflects the current voided state', { voided: wallet.data.voided, data_version: wallet.data.data_version });
+  a.check('unadmitted capacity restored', eventAfter.data.ticket_offering.available_quantity === f.e.ticket_offering.available_quantity,
+    'A fully refunded unadmitted Ticket restores its capacity once', eventAfter.data.ticket_offering.available_quantity);
+  await a.write('admission-after-full-refund', '/v1/admin/events/' + id(f.e.event_id) + '/admissions', {
+    actor: human, qr_token: f.ticket.qr_payload,
+  }, [409], { expectedError: 'ticket_refunded' });
+}
+async function eventReporting(a) {
+  await configuration(a);
+  const f = await fixture(a);
+  const ordersPath = '/v1/admin/events/' + id(f.e.event_id) + '/orders?limit=100';
+  const ticketsPath = '/v1/admin/events/' + id(f.e.event_id) + '/tickets?limit=100';
+  const totalsPath = '/v1/admin/events/' + id(f.e.event_id) + '/totals';
+  const orders = await a.read('event-order-list', ordersPath);
+  const tickets = await a.read('event-ticket-list', ticketsPath);
+  const initial = await a.read('event-totals-pending', totalsPath);
+  const initialCurrency = initial.data.sales.find(item => item.currency === f.order.pricing.total.currency);
+  a.check('operational lists', orders.data.some(item => item.order_id === f.order.order_id)
+    && tickets.data.some(item => item.ticket_id === f.ticket.ticket_id),
+  'Site staff can list this Order and Ticket without buyer access tokens', { orders: orders.data.length, tickets: tickets.data.length });
+  a.check('fees start pending', initialCurrency?.processing_fees?.reporting_status === 'pending'
+    && initialCurrency?.platform_fees?.reporting_status === 'pending',
+  'Missing fee evidence is represented as pending, not zero', initialCurrency);
+  const paymentReference = f.body.provider_payment_reference;
+  const fees = [
+    { category: 'processing', amount: 125 },
+    { category: 'platform', amount: 250 },
+  ];
+  for (const fee of fees) {
+    await a.write('fee-' + fee.category, '/v1/admin/orders/' + id(f.order.order_id) + '/fee-reports', {
+      actor: system, attempt_id: f.at.attempt_id, connection_id: f.at.connection.connection_id,
+      scope_type: 'payment', scope_reference: paymentReference,
+      source_reference: 'fake-fee-' + fee.category + '-' + a.run.id, source_revision: 1,
+      category: fee.category, direction: 'charge', amount: fee.amount,
+      currency: f.order.pricing.total.currency, observed_at: iso(a.run.clock + 7000),
+    }, [201]);
+    await a.write('fee-' + fee.category + '-confirmation', '/v1/admin/orders/' + id(f.order.order_id) + '/fee-confirmations', {
+      actor: system, attempt_id: f.at.attempt_id, connection_id: f.at.connection.connection_id,
+      scope_type: 'payment', scope_reference: paymentReference, category: fee.category,
+      totals: [{ currency: f.order.pricing.total.currency, charged: fee.amount, returned: 0 }],
+      observed_at: iso(a.run.clock + 8000),
+    });
+  }
+  const final = await a.read('event-totals-confirmed', totalsPath);
+  const currency = final.data.sales.find(item => item.currency === f.order.pricing.total.currency);
+  a.check('confirmed fee totals', currency?.processing_fees?.reporting_status === 'complete'
+    && currency.processing_fees.charged.amount === 125
+    && currency?.platform_fees?.reporting_status === 'complete'
+    && currency.platform_fees.charged.amount === 250,
+  'Explicit confirmations make both fee categories complete with the reported amounts', currency);
+}
+async function connectionHistory(a) {
+  const active = await configuration(a);
+  let e = await event(a, 'connection-history');
+  const resourceType = active.provider === 'square' ? 'square_item_variation' : 'stripe_price';
+  const originalReference = 'fake-resource-original-' + a.run.id;
+  const initial = await a.call('mapping-original', '/v1/admin/events/' + id(e.event_id) + '/provider-mappings/' + id(active.connection_id), {
+    method: 'PUT', body: { actor: human, resource_type: resourceType, resource_reference: originalReference, verified_at: iso(a.run.clock), expected_version: e.version },
+  });
+  e = initial.data;
+  const { order } = await reserve(a, e, 'mapped-purchase');
+  const at = await attempt(a, order, 'mapped-attempt');
+  a.check('attempt freezes mapping', at.provider_mapping?.resource_reference === originalReference,
+    'The payment attempt copies the Order mapping snapshot', at.provider_mapping);
+  const replacementReference = 'fake-resource-replacement-' + a.run.id;
+  const beforeEdit = await a.read('mapping-event-before-replacement', '/v1/admin/events/' + id(e.event_id));
+  await a.call('mapping-replacement', '/v1/admin/events/' + id(e.event_id) + '/provider-mappings/' + id(active.connection_id), {
+    method: 'PUT', body: { actor: human, resource_type: resourceType, resource_reference: replacementReference, verified_at: iso(a.run.clock + 1000), expected_version: beforeEdit.data.version },
+  });
+  const existingOrder = await a.read('existing-mapped-order', '/v1/admin/orders/' + id(order.order_id));
+  const existingAttempt = await a.read('existing-mapped-attempt', '/v1/admin/payment-attempts/' + id(at.attempt_id));
+  a.check('history retains old mapping', existingOrder.data.payment_attempts[0]?.provider_mapping?.resource_reference === originalReference
+    && existingAttempt.data.provider_mapping?.resource_reference === originalReference,
+  'Existing Order and attempt retain their original provider mapping', { order: existingOrder.data.payment_attempts[0]?.provider_mapping, attempt: existingAttempt.data.provider_mapping });
+  const { order: nextOrder } = await reserve(a, e, 'replacement-mapped-purchase');
+  const nextAttempt = await attempt(a, nextOrder, 'replacement-mapped-attempt');
+  a.check('future Order uses new mapping', nextAttempt.provider_mapping?.resource_reference === replacementReference,
+    'New purchases use the Event mapping currently assigned to the connection', nextAttempt.provider_mapping);
+}
+async function privateApproval(a) {
+  await configuration(a);
+  const e = await event(a, 'private-approval', { visibility: 'private' });
+  const attendee = { name: 'Fake LMNL Attendee ' + a.run.id.slice(0, 8), email: 'attendee-' + a.run.id.slice(0, 8) + '@fake-lmnl.test' };
+  const eventPath = '/v1/admin/events/' + id(e.event_id);
+  const before = await a.read('private-capacity-before', eventPath);
+  await a.write('private-request-one', '/v1/public/events/' + id(e.event_id) + '/access-requests', attendee, [201]);
+  const firstList = await a.read('private-request-list-one', eventPath + '/access-requests?limit=100');
+  const first = firstList.data.find(item => item.status === 'pending' && item.email === attendee.email);
+  if (!first) throw new Blocked('The first private attendee request is not visible to the Site.');
+  const approved = await a.write('private-approve-one', '/v1/admin/access-requests/' + id(first.request_id) + '/actions/approve', {
+    actor: human, expected_version: first.version,
+  });
+  const firstJobs = await a.read('private-approval-jobs-one', '/v1/admin/notification-jobs?event_id=' + id(e.event_id) + '&kind=access_approved&limit=100');
+  const firstJob = firstJobs.data.find(item => item.access_request_id === first.request_id && !item.is_superseded);
+  const oldToken = firstJob?.payload?.approval_token;
+  if (!oldToken) throw new Blocked('The approved request has no current approval-link job.');
+  await a.write('private-request-two', '/v1/public/events/' + id(e.event_id) + '/access-requests', attendee, [201]);
+  const secondList = await a.read('private-request-list-two', eventPath + '/access-requests?limit=100');
+  const second = secondList.data.find(item => item.request_id !== first.request_id && item.status === 'pending' && item.email === attendee.email);
+  if (!second) throw new Blocked('An intentional duplicate attendee request did not create its own request record.');
+  const rejected = await a.write('private-reject-two', '/v1/admin/access-requests/' + id(second.request_id) + '/actions/reject', {
+    actor: human, expected_version: second.version,
+  });
+  const afterRejectJobs = await a.read('private-jobs-after-reject', '/v1/admin/notification-jobs?event_id=' + id(e.event_id) + '&kind=access_approved&limit=100');
+  a.check('rejection sends no approval job', !afterRejectJobs.data.some(item => item.access_request_id === second.request_id),
+    'Rejecting a request queues no approval email', afterRejectJobs.data.map(item => item.access_request_id));
+  const afterRequests = await a.read('private-capacity-after', eventPath);
+  a.check('requests do not reserve capacity', afterRequests.data.ticket_offering.available_quantity === before.data.ticket_offering.available_quantity,
+    'Submitting and deciding Access Requests do not reserve Ticket capacity', afterRequests.data.ticket_offering.available_quantity);
+  const undone = await a.write('private-undo-one', '/v1/admin/access-requests/' + id(first.request_id) + '/actions/undo_decision', {
+    actor: human, expected_version: approved.data.version,
+  });
+  await a.read('old-approval-invalidated', '/v1/public/access-requests/' + id(oldToken), { expected: [404], expectedError: 'not_found' });
+  await a.write('private-reapprove-one', '/v1/admin/access-requests/' + id(first.request_id) + '/actions/approve', {
+    actor: human, expected_version: undone.data.version,
+  });
+  const renewedJobs = await a.read('private-renewed-approval-jobs', '/v1/admin/notification-jobs?event_id=' + id(e.event_id) + '&kind=access_approved&limit=100');
+  const renewedJob = renewedJobs.data.find(item => item.access_request_id === first.request_id
+    && !item.is_superseded && item.payload?.approval_token !== oldToken);
+  if (!renewedJob?.payload?.approval_token) throw new Blocked('Reapproval did not create a replacement approval link.');
+  const renewed = await a.read('renewed-approval-link', '/v1/public/access-requests/' + id(renewedJob.payload.approval_token));
+  a.check('renewed approval link works', renewed.data.request_id === first.request_id && renewed.data.purchase_completed === false,
+    'A renewed approval has a new valid link and no purchase yet', renewed.data);
+  a.check('duplicate request identity preserved', rejected.data.request_id === second.request_id && rejected.data.status === 'rejected',
+    'An identical attendee may have a separate independently rejected request', { request_id: rejected.data.request_id, status: rejected.data.status });
+}
+async function privatePurchase(a) {
+  await configuration(a);
+  const approved = await createApprovedPrivateRequest(a, 'private-purchase');
+  const quote = await a.write('private-quote', '/v1/public/events/' + id(approved.e.event_id) + '/quotes', {
+    quantity: 1, access_request_token: approved.token,
+  }, [201]);
+  const buyer = { name: 'Fake LMNL Purchaser', email: 'payer-' + a.run.id.slice(0, 8) + '@fake-lmnl.test' };
+  const orderResult = await a.write('private-order', '/v1/public/orders', {
+    quote_id: quote.data.quote_id, access_request_token: approved.token, buyer,
+  }, [201]);
+  const order = orderResult.data;
+  a.check('private purchaser and attendee differ', order.payment_status === 'unpaid' && order.tickets.length === 0
+    && order.buyer_name === buyer.name,
+  'Private checkout records purchaser details separately from the approved attendee', { status: order.payment_status, buyer: order.buyer_name, tickets: order.tickets.length });
+  const attemptResult = await attempt(a, order, 'private-attempt');
+  const reference = await checkout(a, attemptResult);
+  const { ticket } = await paid(a, order, attemptResult, reference);
+  const admin = await a.read('private-admin-order', '/v1/admin/orders/' + id(order.order_id));
+  a.check('Ticket keeps approved attendee', ticket.attendee_name === approved.attendee.name
+    && admin.data.approved_attendee?.name === approved.attendee.name
+    && admin.data.approved_attendee?.email === approved.attendee.email
+    && admin.data.checkout_identity?.email === buyer.email,
+  'The issued Ticket retains the approved attendee while the Order retains the separate purchaser', {
+    ticketAttendee: ticket.attendee_name, approvedAttendee: admin.data.approved_attendee, purchaser: admin.data.checkout_identity,
+  });
+  const completed = await a.read('private-approval-consumed', '/v1/public/access-requests/' + id(approved.token));
+  a.check('approval consumed after purchase', completed.data.purchase_completed === true,
+    'A successful paid Order consumes this approval', { purchaseCompleted: completed.data.purchase_completed });
+  const admission = await a.write('private-admission', '/v1/admin/events/' + id(approved.e.event_id) + '/admissions', {
+    actor: human, qr_token: ticket.qr_payload,
+  }, [201]);
+  const buyerPage = await a.read('private-admitted-ticket-page', '/v1/public/tickets/' + id(ticket.ticket_token), { fresh: true });
+  a.check('private Ticket admitted once', admission.data.ticket_id === ticket.ticket_id
+    && buyerPage.data.admission_status === 'admitted' && buyerPage.data.can_admit === false,
+  'The approved attendee Ticket is admitted and its buyer page reflects used eligibility', {
+    ticket_id: buyerPage.data.ticket_id, admission_status: buyerPage.data.admission_status, can_admit: buyerPage.data.can_admit,
+  });
+  await a.write('private-repeat-admission-blocked', '/v1/admin/events/' + id(approved.e.event_id) + '/admissions', {
+    actor: human, qr_token: ticket.qr_payload,
+  }, [409], { expectedError: 'already_admitted' });
+  await a.write('second-private-purchase-blocked', '/v1/public/events/' + id(approved.e.event_id) + '/quotes', {
+    quantity: 1, access_request_token: approved.token,
+  }, [409], { expectedError: 'access_already_used' });
+}
+async function walletData(a) {
+  await configuration(a);
+  const f = await fixture(a);
+  const publicPath = '/v1/public/tickets/' + id(f.ticket.ticket_token) + '/apple-wallet-data';
+  const adminPath = '/v1/admin/tickets/' + id(f.ticket.ticket_id) + '/apple-wallet-data';
+  const initialPublic = await a.read('wallet-public-data', publicPath);
+  const initialAdmin = await a.read('wallet-admin-data', adminPath);
+  a.check('public and admin Wallet data agree', initialPublic.data.ticket_id === f.ticket.ticket_id
+    && initialPublic.data.qr_payload === f.ticket.qr_payload
+    && initialPublic.data.data_version === initialAdmin.data.data_version
+    && initialPublic.data.used === false && initialPublic.data.voided === false,
+  'Buyer-token and Site-admin reads return the same unsigned current Ticket data', { publicVersion: initialPublic.data.data_version, adminVersion: initialAdmin.data.data_version, used: initialPublic.data.used, voided: initialPublic.data.voided });
+  a.check('public Wallet data omits purchaser email', !JSON.stringify(initialPublic.data).includes(f.order.delivery_email)
+    && !Object.hasOwn(initialPublic.data, 'buyer_email') && !Object.hasOwn(initialPublic.data, 'delivery_email'),
+  'The buyer Wallet-data route does not expose purchaser email', initialPublic.data);
+  await a.write('wallet-admission', '/v1/admin/events/' + id(f.e.event_id) + '/admissions', { actor: human, qr_token: f.ticket.qr_payload }, [201]);
+  const after = await a.read('wallet-after-admission', publicPath, { fresh: true });
+  a.check('Wallet data reflects Admission', after.data.used === true && after.data.voided === false
+    && after.data.qr_payload === initialPublic.data.qr_payload
+    && after.data.data_version !== initialPublic.data.data_version,
+  'Admission changes the Wallet data version and used state without changing the stable QR', { used: after.data.used, voided: after.data.voided, sameQr: after.data.qr_payload === initialPublic.data.qr_payload, versionChanged: after.data.data_version !== initialPublic.data.data_version });
+}
+async function walletUpdateJobs(a) {
+  await configuration(a);
+  const f = await fixture(a);
+  await a.write('wallet-update-admission', '/v1/admin/events/' + id(f.e.event_id) + '/admissions', { actor: human, qr_token: f.ticket.qr_payload }, [201]);
+  const used = await a.read('wallet-update-used-data', '/v1/public/tickets/' + id(f.ticket.ticket_token) + '/apple-wallet-data');
+  const initialJobs = await a.read('wallet-update-after-admission', '/v1/admin/notification-jobs?kind=wallet_update&limit=100');
+  const admissionJob = initialJobs.data.find(item => item.ticket_id === f.ticket.ticket_id && !item.is_superseded);
+  a.check('Admission queues Wallet update', Boolean(admissionJob) && admissionJob.payload?.data_version === used.data.data_version,
+    'A durable Wallet job identifies the current used-state data version', admissionJob?.payload);
+  const before = await a.read('wallet-update-event-before', '/v1/admin/events/' + id(f.e.event_id));
+  await a.call('wallet-update-event-edit', '/v1/admin/events/' + id(f.e.event_id), {
+    method: 'PATCH',
+    body: { actor: human, expected_version: before.data.version, venue: { name: 'Fake LMNL Wallet update venue' } },
+  });
+  const current = await a.read('wallet-update-current-data', '/v1/admin/tickets/' + id(f.ticket.ticket_id) + '/apple-wallet-data');
+  const eventJobs = await a.read('wallet-update-after-event-change', '/v1/admin/notification-jobs?kind=wallet_update&limit=100');
+  const currentJob = eventJobs.data.find(item => item.ticket_id === f.ticket.ticket_id
+    && item.payload?.data_version === current.data.data_version && !item.is_superseded);
+  a.check('Event edit queues current Wallet version', Boolean(currentJob) && current.data.data_version !== used.data.data_version,
+    'Event operational changes queue the updated unsigned data version for the same Ticket', { currentVersion: current.data.data_version, queued: currentJob?.payload });
+}
+async function groupPurchase(a) {
+  await configuration(a);
+  const e = await event(a, 'group-purchase', { capacity: 8 });
+  const eventPath = '/v1/admin/events/' + id(e.event_id);
+  const before = await a.read('group-capacity-before-quote', eventPath);
+  const quantityOne = await a.write('group-quantity-one-quote', '/v1/public/events/' + id(e.event_id) + '/quotes', { quantity: 1 }, [201]);
+  const quantityEight = await a.write('group-quantity-eight-quote', '/v1/public/events/' + id(e.event_id) + '/quotes', { quantity: 8 }, [201]);
+  await a.write('group-quantity-nine-rejected', '/v1/public/events/' + id(e.event_id) + '/quotes', { quantity: 9 }, [422], { expectedError: 'validation_failed' });
+  a.check('public quantity boundaries', quantityOne.data.quantity === 1 && quantityEight.data.quantity === 8,
+    'Public quotes accept the one- and eight-Ticket quantity boundaries and reject quantity nine', { accepted: [quantityOne.data.quantity, quantityEight.data.quantity], rejectedQuantity: 9 });
+  const quote = await a.write('group-quote', '/v1/public/events/' + id(e.event_id) + '/quotes', { quantity: 3 }, [201]);
+  const afterQuote = await a.read('group-capacity-after-quote', eventPath);
+  a.check('group quote does not reserve', quote.data.quantity === 3
+    && afterQuote.data.ticket_offering.available_quantity === before.data.ticket_offering.available_quantity,
+  'A three-Ticket quote preserves its quantity without reserving capacity', { quoteQuantity: quote.data.quantity, availableBefore: before.data.ticket_offering.available_quantity, availableAfter: afterQuote.data.ticket_offering.available_quantity });
+  a.check('group quote pricing scales', quote.data.subtotal.amount === quote.data.unit_price.amount * 3,
+    'The quote subtotal is the unit price multiplied by the requested quantity', { unitPrice: quote.data.unit_price, subtotal: quote.data.subtotal });
+  const buyer = { name: 'Fake LMNL Group Buyer', email: 'group-' + a.run.id.slice(0, 8) + '@fake-lmnl.test' };
+  const created = await a.write('group-order', '/v1/public/orders', { quote_id: quote.data.quote_id, buyer }, [201]);
+  const order = created.data;
+  a.check('group Order and Reservation', order.quantity === 3 && order.reservation?.quantity === 3
+    && order.reservation?.status === 'held' && order.tickets.length === 0
+    && order.pricing.total.amount === quote.data.total.amount,
+  'One unpaid Order holds all three Tickets at the accepted full quote total', { quantity: order.quantity, reservation: order.reservation, total: order.pricing.total, tickets: order.tickets.length });
+  const adminOrder = await a.read('group-order-identity-deadlines', '/v1/admin/orders/' + id(order.order_id));
+  a.check('group buyer identity and original deadlines', order.buyer_name === buyer.name && order.delivery_email === buyer.email
+    && adminOrder.data.checkout_identity?.name === buyer.name && adminOrder.data.checkout_identity?.email === buyer.email
+    && order.checkout_expires_at === order.reservation?.expires_at
+    && adminOrder.data.checkout_expires_at === order.checkout_expires_at
+    && adminOrder.data.reservation?.expires_at === order.checkout_expires_at,
+  'The Order preserves buyer identity and one original checkout deadline for its Reservation', {
+    buyerName: order.buyer_name, deliveryEmail: order.delivery_email,
+    checkoutDeadline: order.checkout_expires_at, reservationDeadline: order.reservation?.expires_at,
+  });
+  const afterOrder = await a.read('group-capacity-after-order', eventPath);
+  a.check('group Reservation capacity', afterOrder.data.ticket_offering.available_quantity === before.data.ticket_offering.available_quantity - 3,
+    'Order creation reserves the full requested quantity atomically', { availableBefore: before.data.ticket_offering.available_quantity, availableAfter: afterOrder.data.ticket_offering.available_quantity });
+  const at = await attempt(a, order, 'group-attempt');
+  const reference = await checkout(a, at);
+  const { tickets } = await paid(a, order, at, reference);
+  const f = { e, order, at, reference, ticket: tickets[0], tickets };
+  await deliver(a, f);
+  const orderPage = await a.read('group-order-page', '/v1/public/orders/' + id(order.order_token), { fresh: true });
+  a.check('Order page presents complete group', orderPage.data.quantity === 3
+    && orderPage.data.tickets.length === 3
+    && orderPage.data.tickets.map(item => item.ticket_id).join('|') === tickets.map(item => item.ticket_id).join('|')
+    && orderPage.data.buyer_name === buyer.name && orderPage.data.delivery_email === buyer.email
+    && orderPage.data.checkout_expires_at === order.checkout_expires_at,
+  'The Order page retains buyer identity, the original deadline, and all issued Tickets in stable order', { quantity: orderPage.data.quantity, ticketIds: orderPage.data.tickets.map(item => item.ticket_id), checkoutDeadline: orderPage.data.checkout_expires_at });
+  const ticketPages = [];
+  const walletPages = [];
+  for (const ticket of tickets) {
+    const page = await a.read('group-ticket-page-' + ticket.ordinal, '/v1/public/tickets/' + id(ticket.ticket_token));
+    ticketPages.push(page.data);
+    const wallet = await a.read('group-wallet-data-' + ticket.ordinal, '/v1/public/tickets/' + id(ticket.ticket_token) + '/apple-wallet-data');
+    walletPages.push(wallet.data);
+  }
+  a.check('independent Ticket pages', ticketPages.length === 3
+    && ticketPages.every((page, index) => page.ticket_id === tickets[index].ticket_id && page.ordinal === index + 1 && page.qr_payload === tickets[index].qr_payload),
+  'Each group member has a separate page, Ticket identity, ordinal, and QR', ticketPages.map(page => ({ ticket_id: page.ticket_id, ordinal: page.ordinal })));
+  a.check('independent unsigned Wallet data', walletPages.length === 3
+    && walletPages.every((wallet, index) => wallet.ticket_id === tickets[index].ticket_id
+      && wallet.qr_payload === tickets[index].qr_payload && wallet.used === false && wallet.voided === false),
+  'Each group Ticket has separate current unsigned Wallet data with its stable QR and unused state',
+  walletPages.map(wallet => ({ ticket_id: wallet.ticket_id, used: wallet.used, voided: wallet.voided })));
+  const staffLookup = await a.write('group-staff-lookup', eventPath + '/ticket-lookup', { order_reference: order.order_reference });
+  a.check('staff lookup shows complete group', staffLookup.data.length === 1
+    && staffLookup.data[0].tickets.length === 3
+    && staffLookup.data[0].tickets.map(item => item.ticket_id).join('|') === tickets.map(item => item.ticket_id).join('|')
+    && !/order_token|ticket_token|qr_payload|qr_token/.test(JSON.stringify(staffLookup.envelope)),
+  'Staff lookup finds the Order and all Tickets without exposing buyer access tokens or QR data', staffLookup.data);
+  const staffTickets = await a.read('group-event-ticket-list', eventPath + '/tickets?limit=100');
+  a.check('Event list includes group Tickets', tickets.every(ticket => staffTickets.data.some(item => item.ticket_id === ticket.ticket_id)),
+    'Event Ticket reporting includes every Ticket from the Order', staffTickets.data.map(item => item.ticket_id));
+  for (const ticket of tickets) {
+    const path = eventPath + '/admissions';
+    const body = { actor: human, qr_token: ticket.qr_payload };
+    const admission = await a.write('group-admission-' + ticket.ordinal, path, body, [201]);
+    const page = await a.read('group-admitted-page-' + ticket.ordinal, '/v1/public/tickets/' + id(ticket.ticket_token), { fresh: true });
+    a.check('group Ticket admitted once ' + ticket.ordinal, page.data.admission_status === 'admitted'
+      && page.data.can_admit === false && admission.data.ticket_id === ticket.ticket_id,
+    'Each Ticket can be admitted independently once', { ordinal: ticket.ordinal, status: page.data.admission_status, canAdmit: page.data.can_admit });
+    await a.write('group-repeat-admission-' + ticket.ordinal, path, body, [409], { expectedError: 'already_admitted' });
+  }
+  const raceEvent = await event(a, 'group-last-capacity', { capacity: 1 });
+  const racePath = '/v1/public/events/' + id(raceEvent.event_id) + '/quotes';
+  const raceQuotes = [
+    await a.write('group-last-capacity-quote-one', racePath, { quantity: 1 }, [201]),
+    await a.write('group-last-capacity-quote-two', racePath, { quantity: 1 }, [201]),
+  ];
+  const raceBuyer = { name: 'Fake LMNL Capacity Buyer', email: 'capacity-' + a.run.id.slice(0, 8) + '@fake-lmnl.test' };
+  const raceOrders = await settleRequests(raceQuotes.map((raceQuote, index) => a.write(
+    'group-last-capacity-order-' + (index + 1), '/v1/public/orders', { quote_id: raceQuote.data.quote_id, buyer: raceBuyer }, [201, 409],
+  )));
+  const acceptedOrders = raceOrders.filter(result => result.status === 201);
+  const rejectedOrders = raceOrders.filter(result => result.status === 409);
+  a.check('concurrent last-capacity Orders', acceptedOrders.length === 1 && rejectedOrders.length === 1
+    && rejectedOrders[0].error?.code === 'sold_out',
+  'Two simultaneous one-Ticket Orders for the last unit produce one Reservation and one sold-out response',
+  raceOrders.map(result => ({ status: result.status, error: result.error?.code, quantity: result.data?.quantity })));
+  const currentRaceEvent = await a.read('group-last-capacity-current-event', '/v1/admin/events/' + id(raceEvent.event_id));
+  const canceledRaceEvent = await a.write('group-last-capacity-cancel', '/v1/admin/events/' + id(raceEvent.event_id) + '/actions/cancel', {
+    actor: human, expected_version: currentRaceEvent.data.version,
+  }, [200]);
+  const finalRaceEvent = await a.read('group-last-capacity-after-release', '/v1/admin/events/' + id(raceEvent.event_id));
+  a.check('last-capacity fixture released', canceledRaceEvent.data.is_canceled === true
+    && finalRaceEvent.data.ticket_offering.available_quantity === 1,
+  'Canceling the unpaid synthetic race fixture releases its winning Reservation', {
+    canceled: canceledRaceEvent.data.is_canceled, available: finalRaceEvent.data.ticket_offering.available_quantity,
+  });
+}
+
 export async function execute(a) {
   const workflow = a.run.workflow;
   if (workflow === 'service') { await configuration(a); return; }
   if (workflow === 'checkout' || workflow === 'closure') { await closure(a); return; }
   if (workflow === 'recovery-frontier') { await recoveryFrontier(a); return; }
+  if (workflow === 'arrival-change') { await arrivalChange(a); return; }
+  if (workflow === 'cancellation') { await cancelEvent(a); return; }
+  if (workflow === 'refund') { await reportRefunds(a); return; }
+  if (workflow === 'reporting') { await eventReporting(a); return; }
+  if (workflow === 'connection-history') { await connectionHistory(a); return; }
+  if (workflow === 'private-approval') { await privateApproval(a); return; }
+  if (workflow === 'private-purchase') { await privatePurchase(a); return; }
+  if (workflow === 'wallet-data') { await walletData(a); return; }
+  if (workflow === 'wallet-updates') { await walletUpdateJobs(a); return; }
+  if (workflow === 'group-purchase') { await groupPurchase(a); return; }
   if (workflow === 'configuration') {
     await configuration(a); await a.read('missing-key', '/v1/admin/payment-configuration', { auth: 'none', expected: [401], expectedError: 'unauthorized' });
     const otherConfig = await a.read('other-Site-configuration', '/v1/admin/payment-configuration', { auth: 'other' });
