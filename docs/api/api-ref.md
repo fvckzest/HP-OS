@@ -91,7 +91,7 @@ Paths are relative to the base URL. `{...}` identifies a path parameter. All end
 
 | Endpoint | Meaning |
 | --- | --- |
-| `POST /v1/public/events/{event_id}/quotes` | Quote one public Ticket or one approved private Ticket; no capacity hold. |
+| `POST /v1/public/events/{event_id}/quotes` | Quote one to eight public Tickets or one approved private Ticket; reject quantities above current availability with `sold_out` or `insufficient_capacity` without holding capacity. |
 | `POST /v1/public/orders` | Create an unpaid public Order from a quote or a private Order from an approval token. |
 | `POST /v1/public/events/{event_id}/access-requests` | Submit intended attendee details for approval. |
 | `POST /v1/public/order-recovery` | Queue temporary Order links; generic acknowledgment. |
@@ -331,7 +331,7 @@ Use `error.code` for program logic; use `error.message` for explanation. Retry n
 | Approval access | One paid Ticket; new checkout blocked when approval revoked or sales close. |
 | Admission QR | Stable across resends, recovery, and delivery-email corrections. |
 | Notification lease | 5 minutes; renewable. |
-| Public quantity | Current checkout supports exactly 1 Ticket per Order; broader product limit remains 1–8. |
+| Public quantity | 1–8 Tickets per Order. |
 | Private quantity | Exactly 1 Ticket per Order. |
 | List/claim size | Default 50; maximum 100. |
 | JSON body | Maximum 64 KiB. |
@@ -428,7 +428,7 @@ Text limits: name/title 200 characters; description 20,000; venue address 1,000;
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `price` | Money? | Base Ticket price; positive when set. |
-| `max_quantity_per_order` | integer | Current checkout limit: 1 Ticket per Order. |
+| `max_quantity_per_order` | integer | 8 for public checkout; 1 for private approval checkout. |
 | `tax_amount` | integer?; admin | Explicit tax per Ticket in minor units; null means unknown, zero means confirmed none. |
 | `buyer_fees` | BuyerFee[]?; admin | Explicit buyer-fee list; null means unknown, [] means confirmed none. |
 | `offering_id` | string; admin | Sale-option ID. |
@@ -750,7 +750,7 @@ Completed refund amounts accumulate per Order and cannot exceed its confirmed pa
 | `event_canceled` | `{ recipient_email, order: { order_id, order_reference }, event: { event_id, event_reference, title, starts_at, ends_at, time_zone, venue: { name, address } }, canceled_at }`. |
 | `wallet_update` | `{ ticket_id, data_version }`. |
 
-All members shown are required. `venue.address` may be `null`; `changed_fields` is nonempty and duplicate-free, and `orders` is nonempty. Nested IDs match the related job IDs, and all timestamps include a UTC offset. Published arrival edits create one durable `event_changed` job per paid Order in the same transaction; older unsent, unattempted, unclaimed jobs for that Event are superseded, and a fan-out failure rolls back the edit and new jobs. Order and Ticket APIs return the current Event details. Templates, URLs, provider credentials, and Apple device/signing credentials belong to LMNL.
+All members shown are required. `venue.address` may be `null`; `changed_fields` is nonempty and duplicate-free, and `orders` is nonempty. Nested IDs match the related job IDs, and all timestamps include a UTC offset. Published arrival edits create one durable `event_changed` job per paid Order in the same transaction; older unsent, unattempted, unclaimed jobs for that Event are superseded, and a fan-out failure rolls back the edit and new jobs. Published Event edits that change stable pass-visible content, arrival/check-in details, or price, Event cancellation or archival, successful Admission, and applied full refunds also create one `wallet_update` job per affected issued Ticket in the same transaction; clock-derived `event.sales_status`, email correction, and partial refunds do not. Wallet jobs carry the post-mutation `data_version`, and a queue failure rolls back the triggering mutation. Order and Ticket APIs return the current Event details. Templates, URLs, provider credentials, and Apple device/signing credentials belong to LMNL.
 
 ### Wallet data, issues, and audit metadata
 
@@ -762,7 +762,7 @@ All members shown are required. `venue.address` may be `null`; `changed_fields` 
 | `WalletData.attendee_name` | string? | Approved private attendee name. |
 | `WalletData.used` | boolean | Successful Admission exists. |
 | `WalletData.voided` | boolean | Event canceled or Order fully refunded. |
-| `WalletData.data_version` | string | Opaque change token covering all payload-affecting data. |
+| `WalletData.data_version` | string | Opaque change token covering stable persisted pass data. Computed `event.sales_status` is excluded because it changes with the clock rather than a persisted pass mutation. |
 | `Issue.issue_id` | string | Investigation issue ID. |
 | `Issue.code` | string | Problem category. |
 | `Issue.status` | enum | open or resolved. |
@@ -789,8 +789,8 @@ Each row lists operation-specific body fields/result data. Apply common headers 
 | Event action | `expected_version` | `AdminEvent; 200` |
 | Set mapping | `actor, resource_type, resource_reference, verified_at, expected_version` | `AdminEvent; 200` |
 | Delete mapping | `actor, expected_version` | `AdminEvent; 200` |
-| Quote | Public: `quantity`; private: `quantity, access_request_token` | One-Ticket Quote; 201 |
-| Create Order | Public: `quote_id, buyer {name,email}`; private: `quote_id, access_request_token, buyer {name,email}` | One unpaid one-Ticket Order + Reservation + order_token; 201 |
+| Quote | Public: `quantity` 1–8; private: `quantity` 1 plus `access_request_token` | Quantity-specific Quote; 201 |
+| Create Order | Public: `quote_id, buyer {name,email}`; private: `quote_id, access_request_token, buyer {name,email}` | One unpaid Order holding the requested quantity + Reservation + order_token; 201 |
 | Submit Access Request | `name, email` | `{received:true}; 201` |
 | Edit Access Request | `Changed name/email + expected_version` | `AdminAccessRequest; 200` |
 | Request decision | `expected_version` | `AdminAccessRequest; 200` |

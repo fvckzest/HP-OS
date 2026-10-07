@@ -6,6 +6,7 @@ import { ApiOperationError } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
 import type { AuthenticatedSite } from "./site-auth";
+import { enqueueWalletUpdateJobsForOrder } from "./wallet-data";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RFC3339_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
@@ -652,6 +653,9 @@ async function addRefundReport(
         );
         if (capacity.rowCount !== 1) throw new Error("Refunded Order Reservation capacity could not be restored safely.");
       }
+    }
+    if (order.refund_status !== "full") {
+      await enqueueWalletUpdateJobsForOrder(client, site.siteId, order.order_id);
     }
   }
 
