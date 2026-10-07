@@ -117,36 +117,54 @@ function savedStepData(run, name) {
   const step = run.steps.find(item => item.name === name);
   return step?.actual?.response?.data ?? null;
 }
+function savedNotificationJob(value, jobId) {
+  if (Array.isArray(value)) return value.map(item => savedNotificationJob(item, jobId)).find(Boolean) ?? null;
+  if (!value || typeof value !== 'object') return null;
+  if (value.job_id === jobId && Array.isArray(value.dispatch_attempts)) return value;
+  return Object.values(value).map(item => savedNotificationJob(item, jobId)).find(Boolean) ?? null;
+}
 function provesSimulatedNoDispatch(run, jobId) {
-  if (run.profile !== 'simulation' || run.workflow !== 'unknown-email' || run.status !== 'passed') return false;
+  if (run.profile !== 'simulation' || run.status !== 'passed') return false;
   if (!Array.isArray(run.steps) || run.steps.some(step => step.provider !== 'hpos')) return false;
-  const listStep = run.steps.find(item => item.name === 'email-list');
-  const claim = savedStepData(run, 'email-claim');
-  const listed = savedStepData(run, 'email-list');
-  const reportStep = run.steps.find(item => item.name === 'email-dispatch');
-  const observedStep = run.steps.find(item => item.name === 'unknown-job');
-  const observed = savedStepData(run, 'unknown-job');
-  const reported = reportStep?.actual?.response?.data;
+  const reportPath = `/v1/admin/notification-jobs/${id(jobId)}/outcome-reports`;
+  const reportIndex = run.steps.findIndex(step => step.method === 'POST'
+    && step.path === reportPath
+    && step.request?.outcome === 'unknown'
+    && step.request.provider_message_reference === null);
+  if (reportIndex < 0) return false;
+  const reportStep = run.steps[reportIndex];
+  const claimId = reportStep.request.claim_id;
+  const claimedStep = run.steps.find(step => step.method === 'POST'
+    && step.path === '/v1/admin/notification-jobs/claims'
+    && step.actual?.response?.data?.claim_id === claimId);
+  const claim = claimedStep?.actual?.response?.data;
+  const claimed = claim?.jobs?.find(item => item.job_id === jobId);
+  const reported = reportStep.actual?.response?.data;
+  const observedStep = run.steps.slice(reportIndex + 1).find(step => step.method === 'GET'
+    && step.actual?.status === 200
+    && savedNotificationJob(step.actual?.response?.data, jobId));
+  const observed = savedNotificationJob(observedStep?.actual?.response?.data, jobId);
   const reportedAttempt = reported?.dispatch_attempts?.at(-1);
   const observedAttempt = observed?.dispatch_attempts?.at(-1);
-  const claimed = claim?.jobs?.find(item => item.job_id === jobId);
-  return listStep?.actual?.status === 200 && reportStep?.actual?.status === 200
-    && observedStep?.actual?.status === 200 && Boolean(claim?.claim_id) && claimed?.job_id === jobId
-    && reportStep?.request?.claim_id === claim?.claim_id
-    && reportStep?.request?.lease_fence === claimed.lease_fence
-    && reportStep.request?.outcome === 'unknown'
-    && reportStep.request.provider_message_reference === null
-    && Array.isArray(listed) && listed.some(item => item.job_id === jobId && item.kind === 'tickets_ready')
+  const noProviderReference = attempts => Array.isArray(attempts) && attempts.length > 0
+    && attempts.every(attempt => attempt.outcome === 'unknown' && attempt.provider_message_reference === null);
+  return claimedStep?.actual?.status === 200 && Boolean(claim?.claim_id) && claimed?.job_id === jobId
+    && reportStep.actual?.status === 200
+    && reportStep.request?.claim_id === claimId && claimId === claim.claim_id
+    && reportStep.request?.lease_fence === claimed.lease_fence
+    && observedStep?.actual?.status === 200
     && reported?.job_id === jobId && reported.requires_verification === true
-    && reported.provider_message_reference === null && reportedAttempt?.outcome === 'unknown'
+    && reported.provider_message_reference === null && noProviderReference(reported.dispatch_attempts)
+    && reportedAttempt?.outcome === 'unknown'
     && reportedAttempt.claim_id === claim.claim_id && reportedAttempt.lease_fence === claimed.lease_fence
     && reportedAttempt.provider_message_reference === null
     && observed?.job_id === jobId && observed.requires_verification === true
-    && observed.provider_message_reference === null && observedAttempt?.outcome === 'unknown'
+    && observed.provider_message_reference === null && noProviderReference(observed.dispatch_attempts)
+    && observedAttempt?.outcome === 'unknown'
     && observedAttempt.claim_id === claim.claim_id && observedAttempt.lease_fence === claimed.lease_fence
     && observedAttempt.provider_message_reference === null
-    && (reported.delivery_reports?.length ?? 0) === 0
-    && (observed.delivery_reports?.length ?? 0) === 0;
+    && Array.isArray(reported.delivery_reports) && reported.delivery_reports.length === 0
+    && Array.isArray(observed.delivery_reports) && observed.delivery_reports.length === 0;
 }
 async function verifiedSimulationUnknowns(a, frontier) {
   const pending = frontier.filter(job => job.status !== 'completed' && job.requires_verification);
