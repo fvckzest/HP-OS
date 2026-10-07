@@ -379,7 +379,7 @@ async function readJsonBody(request: Request): Promise<Record<string, unknown> |
 function iso(value: Date | null, offsetMinutes: number | null = 0): string | null {
   if (!value) return null;
   const offset = Number(offsetMinutes ?? 0);
-  const local = new Date(value.getTime() + offset * 60_000).toISOString().replace(/\.000Z$/, "");
+  const local = new Date(value.getTime() + offset * 60_000).toISOString().replace(/\.000Z$/, "Z");
   const suffix = offset === 0 ? "Z" : `${offset < 0 ? "-" : "+"}${String(Math.floor(Math.abs(offset) / 60)).padStart(2, "0")}:${String(Math.abs(offset) % 60).padStart(2, "0")}`;
   return local.replace(/Z$/, suffix);
 }
@@ -649,7 +649,7 @@ async function enqueueEventCancellationNotifications(
   event: EventRow,
   canceledAt: Date,
 ): Promise<void> {
-  await supersedeUnsentNotificationJobs(client, { siteId, eventId: event.id, kinds: ["event_changed"] });
+  await supersedeUnsentNotificationJobs(client, { siteId, eventId: event.id, kinds: ["event_changed", "access_approved"] });
   const fullDetails = eventNotificationDetails(event, []);
   const details = {
     event_id: fullDetails.event_id,

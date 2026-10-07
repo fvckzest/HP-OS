@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 import { getBusinessPool } from "./database";
 import { apiFailure, apiSuccess } from "./api-response";
@@ -53,6 +53,8 @@ export interface NewNotificationJob {
   eventId?: string | null;
   orderId?: string | null;
   accessRequestId?: string | null;
+  /** SHA-256 digest of the raw approval token for access_approved jobs. */
+  accessRequestTokenHash?: string | null;
   ticketId?: string | null;
   availableAt?: Date;
   payload: NotificationPayload;
@@ -74,11 +76,13 @@ interface NotificationJobRow extends QueryResultRow {
   event_id: string | null;
   order_id: string | null;
   access_request_id: string | null;
+  access_request_token_hash: string | null;
   ticket_id: string | null;
   is_superseded: boolean;
   attempt_count: number;
   available_at: Date;
   created_at: Date;
+  created_cursor_time?: string;
   updated_at: Date;
   requires_verification: boolean;
   provider_message_reference: string | null;
@@ -111,6 +115,14 @@ function validEmail(value: unknown): value is string {
   return typeof value === "string" && value.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 }
 
+function approvalToken(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{32,200}$/.test(value);
+}
+
+function tokenHash(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
 function validTimestamp(value: unknown): value is string {
   return typeof value === "string" && RFC3339_PATTERN.test(value) && Number.isFinite(Date.parse(value));
 }
@@ -133,7 +145,7 @@ export function validateNotificationPayload(kind: NotificationKind, value: unkno
   if (kind === "access_approved") {
     return hasOnlyKeys(value, ["attendee", "approval_token"])
       && object(value.attendee) && hasOnlyKeys(value.attendee, ["name", "email"])
-      && validText(value.attendee.name, 200) && validEmail(value.attendee.email) && validText(value.approval_token, 2000);
+      && validText(value.attendee.name, 200) && validEmail(value.attendee.email) && approvalToken(value.approval_token);
   }
   if (kind === "tickets_ready") {
     if (!hasOnlyKeys(value, ["recipient_email", "buyer_name", "event", "order"]) || !validEmail(value.recipient_email) || !validText(value.buyer_name, 200)) return false;
@@ -192,15 +204,20 @@ export async function enqueueNotificationJob(client: PoolClient, input: NewNotif
   if (!UUID_PATTERN.test(input.siteId) || !NOTIFICATION_KINDS.includes(input.kind)) throw new Error("Notification producer supplied an invalid Site ID or notification kind.");
   if (!expectedRecordIds(input.kind, input)) throw new Error("Notification producer supplied record references that do not match the job kind.");
   if (!validateNotificationPayload(input.kind, input.payload)) throw new Error("Notification producer supplied a payload that does not match the documented job kind.");
+  const computedAccessTokenHash = input.kind === "access_approved"
+    ? tokenHash((input.payload as { approval_token: string }).approval_token)
+    : null;
+  if (input.kind !== "access_approved" && input.accessRequestTokenHash != null) throw new Error("Only access approval jobs may carry an approval token digest.");
+  if (computedAccessTokenHash !== null && input.accessRequestTokenHash != null && computedAccessTokenHash !== input.accessRequestTokenHash) throw new Error("Notification producer supplied an approval token digest that does not match its payload.");
   if (input.availableAt && !Number.isFinite(input.availableAt.getTime())) throw new Error("Notification producer supplied an invalid availability time.");
   if (Buffer.byteLength(JSON.stringify(input.payload), "utf8") > MAX_BODY_BYTES) throw new Error("Notification producer supplied a payload larger than 64 KiB.");
   const result = await client.query<{ id: string }>(
     `insert into hpos.notification_jobs (
-       site_id, kind, event_id, order_id, access_request_id, ticket_id,
+       site_id, kind, event_id, order_id, access_request_id, access_request_token_hash, ticket_id,
        available_at, payload
-     ) values ($1, $2, $3, $4, $5, $6, coalesce($7::timestamptz, clock_timestamp()), $8::jsonb)
+     ) values ($1, $2, $3, $4, $5, $6, $7, coalesce($8::timestamptz, clock_timestamp()), $9::jsonb)
      returning id`,
-    [input.siteId, input.kind, input.eventId ?? null, input.orderId ?? null, input.accessRequestId ?? null, input.ticketId ?? null, input.availableAt ?? null, JSON.stringify(input.payload)],
+    [input.siteId, input.kind, input.eventId ?? null, input.orderId ?? null, input.accessRequestId ?? null, computedAccessTokenHash, input.ticketId ?? null, input.availableAt ?? null, JSON.stringify(input.payload)],
   );
   return result.rows[0].id;
 }
@@ -422,12 +439,16 @@ async function listJobs(request: Request, site: AuthenticatedSite): Promise<Resp
     const hasNext = result.rows.length > limit;
     const rows = result.rows.slice(0, limit);
     const next = hasNext && rows.length ? encodeCursor(site.siteId, filters, limit, rows[rows.length - 1]) : null;
-    return apiSuccess(rows.map(jobObject), 200, { nextCursor: next });
+    const rowsWithFreshApprovalState = await Promise.all(rows.map(async (row) => ({
+      row,
+      stale: !(await accessApprovalIsCurrent(getBusinessPool(), row)),
+    })));
+    return apiSuccess(rowsWithFreshApprovalState.map(({ row, stale }) => jobObject(row, stale)), 200, { nextCursor: next });
   } catch { return apiFailure(503, "service_unavailable", "Notification jobs are temporarily unavailable.", { retryAfter: 1 }); }
 }
 
-function encodeCursor(siteId: string, filters: object, limit: number, row: { created_at: Date; id: string }): string {
-  const payload = JSON.stringify({ siteId, route: "admin-notification-jobs", filters, limit, issuedAt: new Date().toISOString(), createdAt: row.created_at.toISOString(), id: row.id });
+function encodeCursor(siteId: string, filters: object, limit: number, row: { created_at: Date; created_cursor_time?: string; id: string }): string {
+  const payload = JSON.stringify({ siteId, route: "admin-notification-jobs", filters, limit, issuedAt: new Date().toISOString(), createdAt: row.created_cursor_time ?? row.created_at.toISOString(), id: row.id });
   return Buffer.from(payload).toString("base64url");
 }
 
@@ -442,8 +463,10 @@ function decodeCursor(value: string, siteId: string, filters: object, limit: num
   } catch { return null; }
 }
 
-const JOB_SELECT = `select j.id, j.site_id, j.kind, j.status, j.event_id, j.order_id, j.access_request_id, j.ticket_id,
-       j.is_superseded, j.attempt_count, j.available_at, j.created_at, j.updated_at,
+const JOB_SELECT = `select j.id, j.site_id, j.kind, j.status, j.event_id, j.order_id, j.access_request_id, j.access_request_token_hash, j.ticket_id,
+       j.is_superseded, j.attempt_count, j.available_at, j.created_at,
+       to_char(j.created_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as created_cursor_time,
+       j.updated_at,
        j.requires_verification, j.provider_message_reference, j.failure_class, j.payload, j.claim_id, j.lease_fence,
        c.lease_expires_at,
        (select coalesce(jsonb_agg(jsonb_build_object(
@@ -470,12 +493,38 @@ const JOB_SELECT = `select j.id, j.site_id, j.kind, j.status, j.event_id, j.orde
      from hpos.notification_jobs j
      left join hpos.notification_claims c on c.id = j.claim_id and c.site_id = j.site_id`;
 
-async function readJob(client: Pool | PoolClient, siteId: string, jobId: string): Promise<Record<string, unknown> | null> {
-  const result = await client.query<NotificationJobRow & QueryResultRow>(`${JOB_SELECT} where j.site_id = $1 and j.id = $2`, [siteId, jobId]);
-  return result.rows[0] ? jobObject(result.rows[0]) : null;
+async function accessApprovalIsCurrent(client: Pool | PoolClient, row: Pick<NotificationJobRow, "kind" | "site_id" | "event_id" | "access_request_id" | "access_request_token_hash">): Promise<boolean> {
+  if (row.kind !== "access_approved") return true;
+  if (!row.event_id || !row.access_request_id || !row.access_request_token_hash) return false;
+  const result = await client.query<{ current: boolean }>(
+    `select exists (
+       select 1
+       from hpos.access_requests request_row
+       join hpos.access_request_approval_tokens token
+         on token.access_request_id = request_row.id and token.site_id = request_row.site_id
+       join hpos.events event_row
+         on event_row.id = request_row.event_id and event_row.site_id = request_row.site_id
+       where request_row.site_id = $1 and request_row.id = $2 and request_row.event_id = $3
+         and request_row.status = 'approved'
+         and token.token_hash = $4 and token.revoked_at is null
+         and event_row.publication_status = 'published'
+         and event_row.visibility = 'private'
+         and event_row.is_canceled = false and event_row.is_archived = false
+     ) as current`,
+    [row.site_id, row.access_request_id, row.event_id, row.access_request_token_hash],
+  );
+  return result.rows[0]?.current ?? false;
 }
 
-function jobObject(row: NotificationJobRow & QueryResultRow): Record<string, unknown> {
+async function readJob(client: Pool | PoolClient, siteId: string, jobId: string): Promise<Record<string, unknown> | null> {
+  const result = await client.query<NotificationJobRow & QueryResultRow>(`${JOB_SELECT} where j.site_id = $1 and j.id = $2`, [siteId, jobId]);
+  const row = result.rows[0];
+  if (!row) return null;
+  const stale = !(await accessApprovalIsCurrent(client, row));
+  return jobObject(row, stale);
+}
+
+function jobObject(row: NotificationJobRow & QueryResultRow, forceSuperseded = false): Record<string, unknown> {
   return {
     job_id: row.id,
     kind: row.kind,
@@ -484,7 +533,7 @@ function jobObject(row: NotificationJobRow & QueryResultRow): Record<string, unk
     order_id: row.order_id,
     access_request_id: row.access_request_id,
     ticket_id: row.ticket_id,
-    is_superseded: row.is_superseded,
+    is_superseded: row.is_superseded || forceSuperseded,
     attempt_count: row.attempt_count,
     available_at: row.available_at,
     created_at: row.created_at,
@@ -503,8 +552,8 @@ function jobObject(row: NotificationJobRow & QueryResultRow): Record<string, unk
 }
 
 async function claimJobs(client: PoolClient, siteId: string, limit: number, kinds: NotificationKind[] | null, actor: Actor): Promise<IdempotentResult> {
-  const picked = await client.query<{ id: string; expired_lease: boolean }>(
-    `select j.id, (c.id is not null and (c.closed_at is not null or c.lease_expires_at <= clock_timestamp())) as expired_lease
+  const candidates = await client.query<{ id: string; event_id: string | null; access_request_id: string | null }>(
+    `select j.id, j.event_id, j.access_request_id
      from hpos.notification_jobs j
      left join hpos.notification_claims c on c.id = j.claim_id and c.site_id = j.site_id
      where j.site_id = $1 and j.status = 'pending' and j.is_superseded = false
@@ -512,11 +561,93 @@ async function claimJobs(client: PoolClient, siteId: string, limit: number, kind
        and (j.claim_id is null or c.id is null or c.closed_at is not null or c.lease_expires_at <= clock_timestamp())
        and ($2::text[] is null or j.kind = any($2::text[]))
      order by j.available_at, j.created_at, j.id
-     limit $3
-     for update of j skip locked`,
-    [siteId, kinds, limit],
+     limit $3`,
+    [siteId, kinds, Math.max(limit * 2, limit)],
   );
-  if (picked.rows.length === 0) return { status: 200, data: { claim_id: null, lease_expires_at: null, jobs: [] } };
+
+  const picked: Array<{ id: string; expiredLease: boolean; verificationOnly: boolean }> = [];
+  for (const candidate of candidates.rows) {
+    if (picked.length >= limit) break;
+    if (candidate.access_request_id) {
+      // Decision actions use the same advisory lock before locking Event,
+      // request, and job rows. This prevents a withdrawal from racing a
+      // worker claim while keeping lock order deterministic.
+      await client.query(`select pg_advisory_xact_lock(hashtextextended($1, 0))`, [`access-request:${siteId}:${candidate.access_request_id}`]);
+      if (candidate.event_id) {
+        await client.query(
+          `select e.id from hpos.events e join hpos.ticket_offerings o on o.id = e.ticket_offering_id and o.event_id = e.id and o.site_id = e.site_id
+           where e.site_id = $1 and e.id = $2 for update of e, o`,
+          [siteId, candidate.event_id],
+        );
+      }
+      const requestCurrent = await client.query<{ status: string; event_id: string; token_hash: string | null; event_active: boolean }>(
+        `select request_row.status, request_row.event_id, token.token_hash,
+                (event_row.publication_status = 'published' and event_row.visibility = 'private'
+                 and event_row.is_canceled = false and event_row.is_archived = false) as event_active
+         from hpos.access_requests request_row
+         left join hpos.access_request_approval_tokens token
+           on token.site_id = request_row.site_id and token.access_request_id = request_row.id and token.revoked_at is null
+         join hpos.events event_row on event_row.site_id = request_row.site_id and event_row.id = request_row.event_id
+         where request_row.site_id = $1 and request_row.id = $2
+         for update of request_row`,
+        [siteId, candidate.access_request_id],
+      );
+      const job = await client.query<{ id: string; claim_id: string | null; lease_expires_at: Date | null; closed_at: Date | null; attempt_count: number; requires_verification: boolean; access_request_token_hash: string | null }>(
+        `select j.id, j.claim_id, c.lease_expires_at, c.closed_at, j.attempt_count, j.requires_verification, j.access_request_token_hash
+         from hpos.notification_jobs j
+         left join hpos.notification_claims c on c.id = j.claim_id and c.site_id = j.site_id
+         where j.site_id = $1 and j.id = $2 and j.status = 'pending' and j.is_superseded = false
+           and j.available_at <= clock_timestamp()
+           and (j.claim_id is null or c.id is null or c.closed_at is not null or c.lease_expires_at <= clock_timestamp())
+         for update of j skip locked`,
+        [siteId, candidate.id],
+      );
+      const current = requestCurrent.rows[0];
+      const lockedJob = job.rows[0];
+      if (!lockedJob) continue;
+      const tokenMatches = Boolean(current && current.status === "approved" && current.event_active && current.event_id === candidate.event_id && current.token_hash && lockedJob.access_request_token_hash === current.token_hash);
+      if (!tokenMatches) {
+        // A job with no dispatch attempt is safe to discard. If a provider
+        // outcome may already be unknown, retain the row for a verification-
+        // only claim. The response marks it superseded so a worker cannot
+        // resend the old token, while the active claim still accepts a
+        // completed, failed, or unknown reconciliation report.
+        if (lockedJob.attempt_count === 0 && !lockedJob.requires_verification && !lockedJob.claim_id) {
+          await client.query(`update hpos.notification_jobs set is_superseded = true, claim_id = null, updated_at = clock_timestamp() where site_id = $1 and id = $2`, [siteId, candidate.id]);
+          continue;
+        }
+        picked.push({
+          id: lockedJob.id,
+          expiredLease: Boolean(lockedJob.claim_id && (lockedJob.closed_at || (lockedJob.lease_expires_at && lockedJob.lease_expires_at <= new Date()))),
+          verificationOnly: true,
+        });
+        continue;
+      }
+      picked.push({
+        id: lockedJob.id,
+        expiredLease: Boolean(lockedJob.claim_id && (lockedJob.closed_at || (lockedJob.lease_expires_at && lockedJob.lease_expires_at <= new Date()))),
+        verificationOnly: false,
+      });
+      continue;
+    }
+    const job = await client.query<{ id: string; claim_id: string | null; lease_expires_at: Date | null; closed_at: Date | null }>(
+      `select j.id, j.claim_id, c.lease_expires_at, c.closed_at
+       from hpos.notification_jobs j
+       left join hpos.notification_claims c on c.id = j.claim_id and c.site_id = j.site_id
+       where j.site_id = $1 and j.id = $2 and j.status = 'pending' and j.is_superseded = false
+         and j.available_at <= clock_timestamp()
+         and (j.claim_id is null or c.id is null or c.closed_at is not null or c.lease_expires_at <= clock_timestamp())
+       for update of j skip locked`,
+      [siteId, candidate.id],
+    );
+    const row = job.rows[0];
+    if (row) picked.push({
+      id: row.id,
+      expiredLease: Boolean(row.claim_id && (row.closed_at || (row.lease_expires_at && row.lease_expires_at <= new Date()))),
+      verificationOnly: false,
+    });
+  }
+  if (picked.length === 0) return { status: 200, data: { claim_id: null, lease_expires_at: null, jobs: [] } };
 
   const claimId = randomUUID();
   const claim = await client.query<{ lease_expires_at: Date }>(
@@ -524,18 +655,19 @@ async function claimJobs(client: PoolClient, siteId: string, limit: number, kind
      values ($1, $2, clock_timestamp() + interval '5 minutes', $3, $4) returning lease_expires_at`,
     [claimId, siteId, actor.type, actor.reference],
   );
-  const jobIds = picked.rows.map((row) => row.id);
-  await client.query(
-    `update hpos.notification_jobs j set claim_id = $3,
-       lease_fence = j.lease_fence + 1,
-       requires_verification = j.requires_verification or picked.expired_lease,
-       updated_at = clock_timestamp()
-     from unnest($1::uuid[], $2::boolean[]) as picked(id, expired_lease)
-     where j.id = picked.id and j.site_id = $4`,
-    [jobIds, picked.rows.map((row) => row.expired_lease), claimId, siteId],
-  );
+  for (const row of picked) {
+    await client.query(
+      `update hpos.notification_jobs set claim_id = $3,
+         lease_fence = lease_fence + 1,
+         requires_verification = requires_verification or $4 or $5,
+         updated_at = clock_timestamp()
+       where id = $1 and site_id = $2 and status = 'pending' and is_superseded = false`,
+      [row.id, siteId, claimId, row.expiredLease, row.verificationOnly],
+    );
+  }
   const jobs = await client.query<NotificationJobRow & QueryResultRow>(`${JOB_SELECT} where j.site_id = $1 and j.claim_id = $2 order by j.available_at, j.created_at, j.id`, [siteId, claimId]);
-  return { status: 200, data: { claim_id: claimId, lease_expires_at: claim.rows[0].lease_expires_at, jobs: jobs.rows.map(jobObject) } };
+  const verificationOnly = new Set(picked.filter((row) => row.verificationOnly).map((row) => row.id));
+  return { status: 200, data: { claim_id: claimId, lease_expires_at: claim.rows[0].lease_expires_at, jobs: jobs.rows.map((row) => jobObject(row, verificationOnly.has(row.id))) } };
 }
 
 async function renewClaim(client: PoolClient, siteId: string, claimId: string, actor: Actor): Promise<IdempotentResult> {
@@ -558,7 +690,7 @@ async function renewClaim(client: PoolClient, siteId: string, claimId: string, a
 
 async function reportOutcome(client: PoolClient, siteId: string, jobId: string, claimId: string, input: OutcomeReportInput, actor: Actor): Promise<IdempotentResult> {
   const jobResult = await client.query<NotificationJobRow & QueryResultRow>(
-    `select j.id, j.site_id, j.kind, j.status, j.event_id, j.order_id, j.access_request_id, j.ticket_id,
+    `select j.id, j.site_id, j.kind, j.status, j.event_id, j.order_id, j.access_request_id, j.access_request_token_hash, j.ticket_id,
        j.is_superseded, j.attempt_count, j.available_at, j.created_at, j.updated_at,
        j.requires_verification, j.provider_message_reference, j.failure_class, j.payload, j.claim_id, j.lease_fence,
        c.lease_expires_at

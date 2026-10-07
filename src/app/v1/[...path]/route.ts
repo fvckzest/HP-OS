@@ -13,6 +13,7 @@ import { handleBuyerOrderRecoveryPost } from "@/server/buyer-order-recovery";
 import { handleProviderMappingDelete, handleProviderMappingPut } from "@/server/provider-mappings";
 import { handleFeeReportPost } from "@/server/fee-reports";
 import { handleAdminReportingGet } from "@/server/admin-reporting";
+import { handleAccessRequestGet, handleAccessRequestPost, handleAccessRequestPatch } from "@/server/access-requests";
 
 export const dynamic = "force-dynamic";
 
@@ -26,6 +27,9 @@ export async function GET(request: Request, context: RouteContext) {
   const { path } = await context.params;
 
   try {
+    const accessRequestResponse = await handleAccessRequestGet(request, authentication.site, path);
+    if (accessRequestResponse) return accessRequestResponse;
+
     const buyerOrderResponse = await handleBuyerOrderGet(authentication.site, path);
     if (buyerOrderResponse) return buyerOrderResponse;
 
@@ -79,6 +83,9 @@ export async function POST(request: Request, context: RouteContext) {
   const { path } = await context.params;
 
   try {
+    const accessRequestResponse = await handleAccessRequestPost(request, authentication.site, path);
+    if (accessRequestResponse) return accessRequestResponse;
+
     const admissionResponse = await handleAdmissionPost(request, authentication.site, path);
     if (admissionResponse) return admissionResponse;
 
@@ -147,6 +154,9 @@ export async function PATCH(request: Request, context: RouteContext) {
   const { path } = await context.params;
 
   try {
+    const accessRequestResponse = await handleAccessRequestPatch(request, authentication.site, path);
+    if (accessRequestResponse) return accessRequestResponse;
+
     const eventResponse = await handleEventPatch(request, authentication.site, path);
     return eventResponse ?? apiFailure(404, "not_found", "The requested API operation is unavailable.");
   } catch {

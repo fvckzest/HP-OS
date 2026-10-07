@@ -373,6 +373,27 @@ async function lockAttemptEvent(client: PoolClient, siteId: string, attemptId: s
   );
 }
 
+async function lockAttemptApproval(
+  client: PoolClient,
+  siteId: string,
+  attemptId: string,
+): Promise<{ id: string; paid_order_id: string | null } | null> {
+  const result = await client.query<{ access_request_id: string | null }>(
+    `select order_row.access_request_id
+     from hpos.payment_attempts attempt
+     join hpos.orders order_row on order_row.id = attempt.order_id and order_row.site_id = attempt.site_id
+     where attempt.id = $1 and attempt.site_id = $2`,
+    [attemptId, siteId],
+  );
+  const id = result.rows[0]?.access_request_id;
+  if (!id) return null;
+  const approval = await client.query<{ id: string; paid_order_id: string | null }>(
+    `select id, paid_order_id from hpos.access_requests where id = $1 and site_id = $2 for update`,
+    [id, siteId],
+  );
+  return approval.rows[0] ?? null;
+}
+
 async function addConflictIssue(client: PoolClient, attempt: LockedAttempt, reportId: string, message: string): Promise<void> {
   await client.query(
     `insert into hpos.payment_report_issues
@@ -455,8 +476,14 @@ async function createPaymentReport(
   options: { allowOpenConflict?: boolean } = {},
 ): Promise<IdempotentResult> {
   await lockAttemptEvent(client, site.siteId, attemptId);
+  const approval = await lockAttemptApproval(client, site.siteId, attemptId);
   const attempt = await lockAttempt(client, site.siteId, attemptId);
   if (!attempt) throw new ApiOperationError(404, "not_found", "The payment attempt is not available to this Site.");
+
+  if (approval?.paid_order_id && approval.paid_order_id !== attempt.order_id && input.outcome === "paid") {
+    return retainReport(client, attempt, input, fingerprint(input),
+      "This private approval has already been consumed by a different paid Order.");
+  }
 
   await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [
     `${site.siteId}:${attempt.connection_id}:${input.source_reference}`,
@@ -585,12 +612,25 @@ async function createPaymentReport(
         : "awaiting_payment_result";
   await client.query(
     `update hpos.orders
-     set payment_status = $3, checkout_status = $4,
+     set payment_status = $3,
+         private_approval_consumed = case
+           when access_request_id is not null and $3 = 'paid' then true
+           else private_approval_consumed
+         end,
+         checkout_status = $4,
          issuance_status = case when $3 = 'paid' and issuance_status = 'not_started' then 'pending' else issuance_status end,
          version = version + 1, updated_at = clock_timestamp()
      where id = $1 and site_id = $2`,
     [attempt.order_id, site.siteId, nextPaymentStatus, nextCheckoutStatus],
   );
+  if (input.outcome === "paid" && approval) {
+    await client.query(
+      `update hpos.access_requests
+       set paid_order_id = $3, updated_at = clock_timestamp()
+       where id = $1 and site_id = $2 and paid_order_id is null`,
+      [approval.id, site.siteId, attempt.order_id],
+    );
+  }
   await client.query(
     `update hpos.reservations
      set awaiting_provider_verification = $3, updated_at = clock_timestamp()
@@ -620,6 +660,7 @@ async function resolvePaymentConflict(
   input: ResolutionInput,
 ): Promise<IdempotentResult> {
   await lockAttemptEvent(client, site.siteId, attemptId);
+  await lockAttemptApproval(client, site.siteId, attemptId);
   const attempt = await lockAttempt(client, site.siteId, attemptId);
   if (!attempt) throw new ApiOperationError(404, "not_found", "The payment attempt is not available to this Site.");
   if (attempt.version !== input.expected_version) {

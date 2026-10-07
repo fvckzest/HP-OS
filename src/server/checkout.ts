@@ -49,6 +49,19 @@ interface QuoteRow extends QueryResultRow {
   platform_fee_basis_points: number;
   platform_fee_amount: string;
   expires_at: Date;
+  access_request_id: string | null;
+  approval_token_id: string | null;
+}
+
+interface ApprovedAccessRow extends QueryResultRow {
+  id: string;
+  event_id: string;
+  name: string;
+  email: string;
+  status: "pending" | "approved" | "rejected";
+  paid_order_id: string | null;
+  token_id: string;
+  token_revoked_at: Date | null;
 }
 
 interface PaymentConnectionRow extends QueryResultRow {
@@ -128,6 +141,17 @@ function quoteData(row: QuoteRow) {
 function mapCheckoutDatabaseError(error: unknown): Response | null {
   if (object(error) && error.code === "23514") return apiFailure(422, "validation_failed", "The checkout request violates a configured field constraint.");
   if (object(error) && error.code === "23503") return apiFailure(409, "invalid_state", "The Event or checkout configuration is no longer available.");
+  if (object(error) && error.code === "23505") {
+    if (error.constraint === "orders_one_private_active_checkout_idx") {
+      return apiFailure(409, "access_checkout_in_progress", "This approval already has an active or unresolved checkout.");
+    }
+    if (error.constraint === "orders_one_private_consumed_purchase_idx") {
+      return apiFailure(409, "access_already_used", "This approval has already produced a purchase.");
+    }
+    if (error.constraint === "orders_quote_id_key") {
+      return apiFailure(409, "quote_already_used", "This quote has already created an Order. Request a new quote for another checkout.");
+    }
+  }
   return null;
 }
 
@@ -165,6 +189,47 @@ function assertPublicSalesOpen(row: PricingRow): void {
   if (status === "closed" || status === "canceled") operationError(409, "sales_closed", "Sales for this Event are closed.");
 }
 
+function assertPrivateSalesOpen(row: PricingRow): void {
+  if (row.publication_status !== "published" || row.is_archived || row.visibility !== "private") {
+    operationError(404, "not_found", "The Event is not available for private checkout.");
+  }
+  const status = salesStatus(row);
+  if (status === "not_configured") operationError(409, "sales_not_configured", "This Event is not configured for checkout.");
+  if (status === "sold_out") operationError(409, "sold_out", "No Tickets remain available for this Event.");
+  if (status === "paused") operationError(409, "sales_paused", "Sales for this Event are temporarily stopped.");
+  if (status === "scheduled") operationError(409, "sales_not_open", "Sales for this Event have not opened yet.");
+  if (status === "closed" || status === "canceled") operationError(409, "sales_closed", "Sales for this Event are closed.");
+}
+
+function approvalTokenHash(token: string): string {
+  return createHash("sha256").update(token, "utf8").digest("hex");
+}
+
+async function lockedApprovedAccess(
+  client: PoolClient,
+  siteId: string,
+  eventId: string,
+  token: string,
+): Promise<ApprovedAccessRow> {
+  const result = await client.query<ApprovedAccessRow>(
+    `select request.id, request.event_id, request.name, request.email,
+            request.status, request.paid_order_id,
+            token.id as token_id, token.revoked_at as token_revoked_at
+     from hpos.access_request_approval_tokens token
+     join hpos.access_requests request
+       on request.id = token.access_request_id and request.site_id = token.site_id
+     where token.site_id = $1 and token.token_hash = $2 and request.event_id = $3
+     for update of request, token`,
+    [siteId, approvalTokenHash(token), eventId],
+  );
+  const access = result.rows[0];
+  if (!access || access.token_revoked_at || access.status !== "approved") {
+    operationError(404, "not_found", "The approval link is not available to this Site.");
+  }
+  if (access.paid_order_id) operationError(409, "access_already_used", "This approval has already produced a purchase.");
+  return access;
+}
+
 function validatedPricing(row: PricingRow) {
   if (row.platform_fee_basis_points === null || row.fee_terms_status !== "configured") {
     operationError(503, "payment_configuration_unavailable", "The Organization platform-fee terms are not configured.");
@@ -191,34 +256,57 @@ function validatedPricing(row: PricingRow) {
   return { currency: row.currency, price, subtotal, buyerFees: row.buyer_fees, tax, total, platformFee, feeRate: Number(row.platform_fee_basis_points) };
 }
 
-async function createQuote(client: PoolClient, site: AuthenticatedSite, eventId: string): Promise<IdempotentResult> {
+async function createQuote(
+  client: PoolClient,
+  site: AuthenticatedSite,
+  eventId: string,
+  accessRequestToken: string | null = null,
+): Promise<IdempotentResult> {
   const row = await lockedPricing(client, site.siteId, eventId);
-  assertPublicSalesOpen(row);
+  if (accessRequestToken && row.visibility === "public") {
+    operationError(409, "access_not_required", "This Event accepts public checkout instead of an approval token.");
+  }
+  const access = accessRequestToken
+    ? await lockedApprovedAccess(client, site.siteId, eventId, accessRequestToken)
+    : null;
+  if (access) assertPrivateSalesOpen(row);
+  else if (row.visibility === "private") operationError(404, "not_found", "The approval link is not available to this Site.");
+  else assertPublicSalesOpen(row);
   const pricing = validatedPricing(row);
   const quoteId = randomUUID();
   const inserted = await client.query<QuoteRow>(
     `insert into hpos.public_quotes (
        id, site_id, event_id, offering_id, quantity, currency, unit_price, subtotal,
        buyer_fees, tax_total, total, platform_fee_basis_points, platform_fee_amount,
-       expires_at
+       expires_at, access_request_id, approval_token_id
      ) values (
        $1, $2, $3, $4, 1, $5, $6, $7, $8::jsonb, $9, $10, $11, $12,
-       clock_timestamp() + interval '10 minutes'
+       clock_timestamp() + interval '10 minutes', $13, $14
      )
      returning id, site_id, event_id, offering_id, quantity, currency, unit_price,
        subtotal, buyer_fees, tax_total, total, platform_fee_basis_points,
-       platform_fee_amount, expires_at`,
+       platform_fee_amount, expires_at, access_request_id, approval_token_id`,
     [quoteId, site.siteId, eventId, row.ticket_offering_id, pricing.currency, pricing.price,
       pricing.subtotal, JSON.stringify(pricing.buyerFees), pricing.tax, pricing.total,
-      pricing.feeRate, pricing.platformFee],
+      pricing.feeRate, pricing.platformFee, access?.id ?? null, access?.token_id ?? null],
   );
   return { status: 201, data: quoteData(inserted.rows[0]) };
 }
 
-function parseQuoteRequest(body: Record<string, unknown>): Response | null {
-  if (!hasOnlyKeys(body, ["quantity"])) return fieldError("body", "unknown_field", "A quote accepts only quantity.");
+function parseApprovalToken(value: unknown): string | Response | null {
+  if (value === undefined) return null;
+  if (typeof value !== "string" || value.length > 512) {
+    return apiFailure(404, "not_found", "The approval link is not available to this Site.");
+  }
+  return value;
+}
+
+function parseQuoteRequest(body: Record<string, unknown>): { accessRequestToken: string | null } | Response {
+  if (!hasOnlyKeys(body, ["quantity", "access_request_token"])) return fieldError("body", "unknown_field", "A quote accepts quantity and an optional approval token.");
   if (body.quantity !== 1) return fieldError("quantity", "unsupported_quantity", "This checkout currently quotes one Ticket at a time.");
-  return null;
+  const token = parseApprovalToken(body.access_request_token);
+  if (token instanceof Response) return token;
+  return { accessRequestToken: token };
 }
 
 function parseBuyer(value: unknown): { name: string; email: string; normalizedEmail: string } | Response {
@@ -234,12 +322,14 @@ function parseBuyer(value: unknown): { name: string; email: string; normalizedEm
   return { name: value.name.trim(), email, normalizedEmail: email.toLowerCase() };
 }
 
-function parseOrderRequest(body: Record<string, unknown>): { quoteId: string; buyer: { name: string; email: string; normalizedEmail: string } } | Response {
-  if (!hasOnlyKeys(body, ["quote_id", "buyer"])) return fieldError("body", "unknown_field", "An Order accepts only quote_id and buyer.");
+function parseOrderRequest(body: Record<string, unknown>): { quoteId: string; buyer: { name: string; email: string; normalizedEmail: string }; accessRequestToken: string | null } | Response {
+  if (!hasOnlyKeys(body, ["quote_id", "buyer", "access_request_token"])) return fieldError("body", "unknown_field", "An Order accepts quote_id, buyer, and an optional approval token.");
   if (typeof body.quote_id !== "string" || !UUID_PATTERN.test(body.quote_id)) return fieldError("quote_id", "invalid_uuid", "Provide the quote_id returned by the quote operation.");
   const buyer = parseBuyer(body.buyer);
   if (buyer instanceof Response) return buyer;
-  return { quoteId: body.quote_id, buyer };
+  const token = parseApprovalToken(body.access_request_token);
+  if (token instanceof Response) return token;
+  return { quoteId: body.quote_id, buyer, accessRequestToken: token };
 }
 
 async function createOrder(
@@ -247,7 +337,15 @@ async function createOrder(
   site: AuthenticatedSite,
   quoteId: string,
   buyer: { name: string; email: string; normalizedEmail: string },
+  accessRequestToken: string | null,
 ): Promise<IdempotentResult> {
+  const quoteEvent = await client.query<{ event_id: string }>(
+    `select event_id from hpos.public_quotes where id = $1 and site_id = $2`,
+    [quoteId, site.siteId],
+  );
+  const eventId = quoteEvent.rows[0]?.event_id;
+  if (!eventId) operationError(404, "not_found", "The quote is not available to this Site.");
+  const row = await lockedPricing(client, site.siteId, eventId);
   const selectedQuote = await client.query<QuoteRow & { used_at: boolean }>(
     `select quote.*,
             exists (select 1 from hpos.orders order_row where order_row.quote_id = quote.id) as used_at
@@ -258,11 +356,44 @@ async function createOrder(
   );
   const quote = selectedQuote.rows[0];
   if (!quote) operationError(404, "not_found", "The quote is not available to this Site.");
+  if (quote.access_request_id && !accessRequestToken) {
+    operationError(404, "not_found", "The approval token is required for private checkout.");
+  }
+  const privateAccess = quote.access_request_id
+    ? await lockedApprovedAccess(client, site.siteId, quote.event_id, accessRequestToken as string)
+    : null;
+  if (!quote.access_request_id && accessRequestToken) {
+    operationError(409, "access_not_required", "This public quote does not accept an approval token.");
+  }
   if (quote.used_at) operationError(409, "quote_already_used", "This quote has already created an Order. Request a new quote for another checkout.");
   if (quote.expires_at.getTime() <= Date.now()) operationError(409, "quote_expired", "This quote expired. Request a new quote and show its total before checkout.");
 
-  const row = await lockedPricing(client, site.siteId, quote.event_id);
-  assertPublicSalesOpen(row);
+  if (quote.access_request_id) {
+    if (!privateAccess || privateAccess.id !== quote.access_request_id
+      || privateAccess.token_id !== quote.approval_token_id) {
+      operationError(404, "not_found", "The approval token is not valid for this quote.");
+    }
+    assertPrivateSalesOpen(row);
+    const active = await client.query<{ id: string }>(
+      `select order_row.id
+       from hpos.orders order_row
+       left join hpos.reservations reservation
+         on reservation.order_id = order_row.id and reservation.site_id = order_row.site_id
+       where order_row.site_id = $1 and order_row.access_request_id = $2
+         and (
+           order_row.checkout_status in ('active', 'awaiting_payment_result')
+           or order_row.payment_status in ('processing', 'unknown', 'conflicted')
+           or reservation.awaiting_provider_verification = true
+         )
+       order by order_row.created_at desc, order_row.id desc
+       limit 1
+       for update of order_row`,
+      [site.siteId, quote.access_request_id],
+    );
+    if (active.rows[0]) operationError(409, "access_checkout_in_progress", "This approval already has an active or unresolved checkout.");
+  } else {
+    assertPublicSalesOpen(row);
+  }
 
   const selectedConnection = await client.query<PaymentConnectionRow>(
     `select connection.id, connection.provider, connection.environment,
@@ -324,11 +455,12 @@ async function createOrder(
     `insert into hpos.orders (
        id, site_id, event_id, offering_id, buyer_id, quote_id, order_reference,
        buyer_name, delivery_email, checkout_identity, accepted_quote,
-       checkout_expires_at, order_token_hash, payment_connection_id, provider_mapping, order_token
+       checkout_expires_at, order_token_hash, payment_connection_id, provider_mapping, order_token,
+       access_request_id, approved_attendee_name, approved_attendee_email
      )
      select
        $1, $2, $3, $4, $5, quote_row.id, $7, $8, $9, $10::jsonb, $11::jsonb,
-       clock_timestamp() + interval '15 minutes', $12, $13, $14::jsonb, $15
+       clock_timestamp() + interval '15 minutes', $12, $13, $14::jsonb, $15, $16, $17, $18
      from hpos.public_quotes quote_row
      where quote_row.id = $6 and quote_row.site_id = $2
        and quote_row.expires_at > clock_timestamp()
@@ -349,7 +481,7 @@ async function createOrder(
       }),
       orderTokenHash, connection.id,
       connection.provider_mapping ? JSON.stringify(connection.provider_mapping) : null,
-      orderToken],
+      orderToken, quote.access_request_id, privateAccess?.name ?? null, privateAccess?.email ?? null],
   );
   if (insertedOrder.rowCount !== 1) {
     operationError(409, "quote_expired", "This quote expired. Request a new quote and show its total before checkout.");
@@ -410,16 +542,18 @@ export async function handleCheckoutPost(request: Request, site: AuthenticatedSi
     if (!UUID_PATTERN.test(eventId)) return apiFailure(404, "not_found", "The Event is not available for public checkout.");
     const body = await readJsonBody(request);
     if (body instanceof Response) return body;
-    const error = parseQuoteRequest(body);
-    if (error) return error;
-    return withApiIdempotency(request, site, body, (client) => createQuote(client, site, eventId), mapCheckoutDatabaseError);
+    const input = parseQuoteRequest(body);
+    if (input instanceof Response) return input;
+    return withApiIdempotency(request, site, body,
+      (client) => createQuote(client, site, eventId, input.accessRequestToken), mapCheckoutDatabaseError);
   }
   if (path.length === 2 && path[0] === "public" && path[1] === "orders") {
     const body = await readJsonBody(request);
     if (body instanceof Response) return body;
     const input = parseOrderRequest(body);
     if (input instanceof Response) return input;
-    return withApiIdempotency(request, site, body, (client) => createOrder(client, site, input.quoteId, input.buyer), mapCheckoutDatabaseError);
+    return withApiIdempotency(request, site, body,
+      (client) => createOrder(client, site, input.quoteId, input.buyer, input.accessRequestToken), mapCheckoutDatabaseError);
   }
   return null;
 }
