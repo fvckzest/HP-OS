@@ -22,6 +22,16 @@ Verified on October 6, 2026, against the dedicated local PostgreSQL database at 
 
 The verifier assertions encode the expected outcomes and fail with bounded diagnostics when an outcome differs. Both new verifiers reported their local verification as passed. They retain unknown provider or dispatch outcomes as unresolved work rather than treating them as success. These results establish local HP-OS behavior only.
 
+## Issue completion scope
+
+[PR #98](https://github.com/fvckzest/HP-OS/pull/98) delivers the following HP-OS scope. Issue closure follows the [repository-wide deferral policy](../release-and-cutover.md#repository-wide-deferral-and-issue-closure); it does not certify the complete LMNL recovery stage or external private-purchase journey.
+
+| Issue | Completed HP-OS scope | Later cutover evidence |
+| --- | --- | --- |
+| #45 | Combined recovery verification through local PostgreSQL and HTTP, including interrupted and overlapping processing, retained uncertainty, issuance, notification fencing, buyer correction/recovery, cancellation, refunds, and totals. | Actual LMNL scheduled workers and durable provider reporting, verified provider closure, hosted processing, and actual email delivery. |
+| #46 | Private Access Request submission, Site-scoped reads, version-guarded decisions and correction, attendee history, replaceable approval links, and durable approval notification work without capacity reservation. | LMNL request and staff interfaces, Site staff permission enforcement, and actual approval email execution. |
+| #47 | Approval-bound one-Ticket checkout, separate attendee and payer snapshots, one active or unresolved Order, permanent purchase consumption, safe withdrawal, and existing issuance/Admission/refund behavior. | The complete LMNL approval-to-purchase journey through actual provider checkout, email, and supported devices. |
+
 ## Behavior covered by the HP-OS boundary
 
 - Approval requests are Site-scoped and identify the intended attendee by name and email. Repeated submission with one idempotency key replays the original request; a new key creates an independent request, including when attendee details match another request.
