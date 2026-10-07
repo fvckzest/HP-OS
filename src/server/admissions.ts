@@ -5,6 +5,7 @@ import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
 import type { AuthenticatedSite } from "./site-auth";
+import { enqueueWalletUpdateJobs } from "./wallet-data";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,128}$/;
@@ -261,6 +262,7 @@ async function recordAdmission(
     "update hpos.orders set version = version + 1, updated_at = clock_timestamp() where site_id = $1 and id = $2",
     [siteId, target.order_id],
   );
+  await enqueueWalletUpdateJobs(client, siteId, [target.ticket_id]);
   return {
     status: 201,
     data: {

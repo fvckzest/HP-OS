@@ -10,6 +10,7 @@ import type { AuthenticatedSite } from "./site-auth";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MAX_BODY_BYTES = 64 * 1024;
+const MAX_PUBLIC_QUANTITY = 8;
 const MAX_AMOUNT = BigInt(Number.MAX_SAFE_INTEGER);
 
 interface Fee {
@@ -112,10 +113,21 @@ function addSafeAmounts(...amounts: Array<number | string>): number {
   return Number(sum);
 }
 
+function multiplySafeAmount(amount: number | string, quantity: number): number {
+  const product = BigInt(amount) * BigInt(quantity);
+  if (product < 0n || product > MAX_AMOUNT) operationError(503, "payment_configuration_unavailable", "The configured checkout total is outside the supported amount range.");
+  return Number(product);
+}
+
 function feeAmount(subtotal: number, basisPoints: number): number {
   const rounded = (BigInt(subtotal) * BigInt(basisPoints) + 5000n) / 10000n;
   if (rounded > MAX_AMOUNT) operationError(503, "payment_configuration_unavailable", "The configured platform fee is outside the supported amount range.");
   return Number(rounded);
+}
+
+function insufficientCapacity(available: number): never {
+  if (available <= 0) operationError(409, "sold_out", "No Tickets remain available for this Event.");
+  operationError(409, "insufficient_capacity", "The requested Ticket quantity exceeds the Event's current availability.");
 }
 
 function money(amount: number | string, currency: string) {
@@ -230,7 +242,7 @@ async function lockedApprovedAccess(
   return access;
 }
 
-function validatedPricing(row: PricingRow) {
+function validatedPricing(row: PricingRow, quantity: number) {
   if (row.platform_fee_basis_points === null || row.fee_terms_status !== "configured") {
     operationError(503, "payment_configuration_unavailable", "The Organization platform-fee terms are not configured.");
   }
@@ -242,24 +254,29 @@ function validatedPricing(row: PricingRow) {
   if (!Number.isSafeInteger(price) || !Number.isSafeInteger(tax)) {
     operationError(503, "payment_configuration_unavailable", "Configured price or tax is outside the supported amount range.");
   }
-  let feesTotal = 0;
   for (const fee of row.buyer_fees) {
     if (!fee || typeof fee.code !== "string" || typeof fee.label !== "string"
       || !Number.isSafeInteger(fee.amount) || fee.amount < 0 || fee.currency !== row.currency) {
       operationError(503, "payment_configuration_unavailable", "Buyer-fee configuration is invalid or uses a different currency from the Ticket.");
     }
-    feesTotal = addSafeAmounts(feesTotal, fee.amount);
   }
-  const subtotal = price;
-  const total = addSafeAmounts(subtotal, feesTotal, tax);
+  const subtotal = multiplySafeAmount(price, quantity);
+  const buyerFees = row.buyer_fees.map((fee) => ({
+    ...fee,
+    amount: multiplySafeAmount(fee.amount, quantity),
+  }));
+  const feesTotal = addSafeAmounts(...buyerFees.map((fee) => fee.amount));
+  const taxTotal = multiplySafeAmount(tax, quantity);
+  const total = addSafeAmounts(subtotal, feesTotal, taxTotal);
   const platformFee = feeAmount(subtotal, Number(row.platform_fee_basis_points));
-  return { currency: row.currency, price, subtotal, buyerFees: row.buyer_fees, tax, total, platformFee, feeRate: Number(row.platform_fee_basis_points) };
+  return { currency: row.currency, price, subtotal, buyerFees, tax: taxTotal, total, platformFee, feeRate: Number(row.platform_fee_basis_points) };
 }
 
 async function createQuote(
   client: PoolClient,
   site: AuthenticatedSite,
   eventId: string,
+  quantity: number,
   accessRequestToken: string | null = null,
 ): Promise<IdempotentResult> {
   const row = await lockedPricing(client, site.siteId, eventId);
@@ -269,10 +286,17 @@ async function createQuote(
   const access = accessRequestToken
     ? await lockedApprovedAccess(client, site.siteId, eventId, accessRequestToken)
     : null;
+  if (access && quantity !== 1) {
+    operationError(422, "validation_failed", "Private checkout supports exactly one Ticket per Order.", [
+      { field: "quantity", code: "unsupported_quantity", message: "Private checkout supports exactly one Ticket per Order." },
+    ]);
+  }
   if (access) assertPrivateSalesOpen(row);
   else if (row.visibility === "private") operationError(404, "not_found", "The approval link is not available to this Site.");
   else assertPublicSalesOpen(row);
-  const pricing = validatedPricing(row);
+  const available = Number(row.capacity) - Number(row.reserved_quantity);
+  if (available < quantity) insufficientCapacity(available);
+  const pricing = validatedPricing(row, quantity);
   const quoteId = randomUUID();
   const inserted = await client.query<QuoteRow>(
     `insert into hpos.public_quotes (
@@ -280,13 +304,13 @@ async function createQuote(
        buyer_fees, tax_total, total, platform_fee_basis_points, platform_fee_amount,
        expires_at, access_request_id, approval_token_id
      ) values (
-       $1, $2, $3, $4, 1, $5, $6, $7, $8::jsonb, $9, $10, $11, $12,
-       clock_timestamp() + interval '10 minutes', $13, $14
+       $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13,
+       clock_timestamp() + interval '10 minutes', $14, $15
      )
      returning id, site_id, event_id, offering_id, quantity, currency, unit_price,
        subtotal, buyer_fees, tax_total, total, platform_fee_basis_points,
        platform_fee_amount, expires_at, access_request_id, approval_token_id`,
-    [quoteId, site.siteId, eventId, row.ticket_offering_id, pricing.currency, pricing.price,
+    [quoteId, site.siteId, eventId, row.ticket_offering_id, quantity, pricing.currency, pricing.price,
       pricing.subtotal, JSON.stringify(pricing.buyerFees), pricing.tax, pricing.total,
       pricing.feeRate, pricing.platformFee, access?.id ?? null, access?.token_id ?? null],
   );
@@ -301,12 +325,14 @@ function parseApprovalToken(value: unknown): string | Response | null {
   return value;
 }
 
-function parseQuoteRequest(body: Record<string, unknown>): { accessRequestToken: string | null } | Response {
+function parseQuoteRequest(body: Record<string, unknown>): { quantity: number; accessRequestToken: string | null } | Response {
   if (!hasOnlyKeys(body, ["quantity", "access_request_token"])) return fieldError("body", "unknown_field", "A quote accepts quantity and an optional approval token.");
-  if (body.quantity !== 1) return fieldError("quantity", "unsupported_quantity", "This checkout currently quotes one Ticket at a time.");
+  if (!Number.isSafeInteger(body.quantity) || Number(body.quantity) < 1 || Number(body.quantity) > MAX_PUBLIC_QUANTITY) {
+    return fieldError("quantity", "out_of_range", "Public checkout supports an integer quantity from 1 through 8.");
+  }
   const token = parseApprovalToken(body.access_request_token);
   if (token instanceof Response) return token;
-  return { accessRequestToken: token };
+  return { quantity: Number(body.quantity), accessRequestToken: token };
 }
 
 function parseBuyer(value: unknown): { name: string; email: string; normalizedEmail: string } | Response {
@@ -428,8 +454,9 @@ async function createOrder(
     operationError(503, "payment_configuration_unavailable", "The Site does not have a verified, eligible payment connection for new Orders.");
   }
 
-  if (Number(row.reserved_quantity) >= Number(row.capacity)) operationError(409, "sold_out", "No Tickets remain available for this Event.");
-  const pricing = validatedPricing(row);
+  const available = Number(row.capacity) - Number(row.reserved_quantity);
+  if (available < quote.quantity) insufficientCapacity(available);
+  const pricing = validatedPricing(row, quote.quantity);
   if (pricing.currency !== quote.currency || pricing.price !== Number(quote.unit_price)
     || pricing.subtotal !== Number(quote.subtotal) || pricing.tax !== Number(quote.tax_total)
     || pricing.total !== Number(quote.total) || pricing.platformFee !== Number(quote.platform_fee_amount)
@@ -470,7 +497,7 @@ async function createOrder(
       JSON.stringify({ name: buyer.name, email: buyer.email }),
       JSON.stringify({
         quote_id: quote.id,
-        quantity: 1,
+        quantity: quote.quantity,
         unit_price: money(quote.unit_price, quote.currency),
         subtotal: money(quote.subtotal, quote.currency),
         buyer_fees: quote.buyer_fees,
@@ -489,16 +516,16 @@ async function createOrder(
   const reservationExpiry = insertedOrder.rows[0].checkout_expires_at;
   const reserved = await client.query(
     `update hpos.ticket_offerings
-     set reserved_quantity = reserved_quantity + 1
-     where id = $1 and site_id = $2 and capacity > reserved_quantity
+     set reserved_quantity = reserved_quantity + $3
+     where id = $1 and site_id = $2 and capacity - reserved_quantity >= $3
      returning id`,
-    [row.ticket_offering_id, site.siteId],
+    [row.ticket_offering_id, site.siteId, quote.quantity],
   );
-  if (reserved.rowCount !== 1) operationError(409, "sold_out", "No Tickets remain available for this Event.");
+  if (reserved.rowCount !== 1) insufficientCapacity(available);
   await client.query(
-    `insert into hpos.reservations (id, site_id, event_id, offering_id, order_id, expires_at)
-     values ($1, $2, $3, $4, $5, $6)`,
-    [reservationId, site.siteId, quote.event_id, row.ticket_offering_id, orderId, reservationExpiry],
+    `insert into hpos.reservations (id, site_id, event_id, offering_id, order_id, quantity, expires_at)
+     values ($1, $2, $3, $4, $5, $6, $7)`,
+    [reservationId, site.siteId, quote.event_id, row.ticket_offering_id, orderId, quote.quantity, reservationExpiry],
   );
 
   return {
@@ -506,7 +533,7 @@ async function createOrder(
     data: {
       order_id: orderId,
       order_reference: orderReference,
-      quantity: 1,
+      quantity: quote.quantity,
       created_at: insertedOrder.rows[0].created_at.toISOString(),
       buyer_name: buyer.name,
       delivery_email: buyer.email,
@@ -527,7 +554,7 @@ async function createOrder(
       order_token: orderToken,
       reservation: {
         reservation_id: reservationId,
-        quantity: 1,
+        quantity: quote.quantity,
         status: "held",
         expires_at: reservationExpiry.toISOString(),
         awaiting_provider_verification: false,
@@ -545,7 +572,7 @@ export async function handleCheckoutPost(request: Request, site: AuthenticatedSi
     const input = parseQuoteRequest(body);
     if (input instanceof Response) return input;
     return withApiIdempotency(request, site, body,
-      (client) => createQuote(client, site, eventId, input.accessRequestToken), mapCheckoutDatabaseError);
+      (client) => createQuote(client, site, eventId, input.quantity, input.accessRequestToken), mapCheckoutDatabaseError);
   }
   if (path.length === 2 && path[0] === "public" && path[1] === "orders") {
     const body = await readJsonBody(request);

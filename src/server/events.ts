@@ -7,6 +7,7 @@ import { getBusinessPool } from "./database";
 import { enqueueNotificationJob, supersedeUnsentNotificationJobs } from "./notifications";
 import type { EventNotificationDetails } from "./notifications";
 import type { AuthenticatedSite } from "./site-auth";
+import { enqueueWalletUpdateJobsForEvent } from "./wallet-data";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RFC3339_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
@@ -421,7 +422,7 @@ function eventData(row: EventRow, admin: boolean): Record<string, unknown> {
     is_archived: row.is_archived,
     ticket_offering: {
       price: amount === null || !row.currency ? null : { amount, currency: row.currency },
-      max_quantity_per_order: 1,
+      max_quantity_per_order: row.visibility === "private" ? 1 : 8,
     },
   };
   if (!admin) return data;
@@ -511,6 +512,16 @@ function changedArrivalFields(before: EventRow, after: EventRow): string[] {
   if (before.venue_name !== after.venue_name) changed.push("venue.name");
   if (before.venue_address !== after.venue_address) changed.push("venue.address");
   return changed;
+}
+
+function walletEventProjection(row: EventRow): Record<string, unknown> {
+  const projection = publicEventData(row);
+  delete projection.sales_status;
+  return projection;
+}
+
+function walletEventDataChanged(before: EventRow, after: EventRow): boolean {
+  return JSON.stringify(walletEventProjection(before)) !== JSON.stringify(walletEventProjection(after));
 }
 
 function eventNotificationDetails(row: EventRow, changedFields: string[]): EventNotificationDetails {
@@ -1032,7 +1043,11 @@ async function writeEventPatch(client: PoolClient, site: AuthenticatedSite, even
   void result;
   await client.query(`update hpos.ticket_offerings set sales_ever_configured=(sales_ever_configured or (price_amount is not null and capacity is not null and sales_opens_at is not null and sales_closes_at is not null)) where event_id=$1`, [eventId]);
   if (merged.publication_status === "published") {
-    await enqueueEventChangeNotifications(client, site.siteId, merged, changedArrivalFields(current, merged));
+    const changedFields = changedArrivalFields(current, merged);
+    await enqueueEventChangeNotifications(client, site.siteId, merged, changedFields);
+    if (walletEventDataChanged(current, merged)) {
+      await enqueueWalletUpdateJobsForEvent(client, site.siteId, eventId);
+    }
   }
   const event = await readAdminEvent(client, site.siteId, eventId);
   if (!event) throw new Error("Updated Event could not be read.");
@@ -1110,10 +1125,14 @@ async function writeEventAction(client: PoolClient, site: AuthenticatedSite, eve
     const canceledAt = canceled.rows[0]?.canceled_at;
     if (!canceledAt) throw new Error("The canceled Event timestamp could not be read.");
     await terminateCanceledEventCheckouts(client, site.siteId, eventId);
+    await enqueueWalletUpdateJobsForEvent(client, site.siteId, eventId);
     await enqueueEventCancellationNotifications(client, site.siteId, { ...current, is_canceled: true }, canceledAt);
   } else {
     if (column === null) throw new Error("The Event action has no state update.");
     await client.query(`update hpos.events set ${column}=$3, version=version+1, updated_at=clock_timestamp(), updated_actor_type=$4, updated_actor_reference=$5 where site_id=$1 and id=$2`, [site.siteId, eventId, value, actor.type, actor.reference]);
+    if (action === "archive") {
+      await enqueueWalletUpdateJobsForEvent(client, site.siteId, eventId);
+    }
   }
   const event = await readAdminEvent(client, site.siteId, eventId);
   if (!event) throw new Error("Changed Event could not be read.");

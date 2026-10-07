@@ -14,6 +14,7 @@ import { handleProviderMappingDelete, handleProviderMappingPut } from "@/server/
 import { handleFeeReportPost } from "@/server/fee-reports";
 import { handleAdminReportingGet } from "@/server/admin-reporting";
 import { handleAccessRequestGet, handleAccessRequestPost, handleAccessRequestPatch } from "@/server/access-requests";
+import { handleWalletDataGet } from "@/server/wallet-data";
 
 export const dynamic = "force-dynamic";
 
@@ -32,6 +33,9 @@ export async function GET(request: Request, context: RouteContext) {
 
     const buyerOrderResponse = await handleBuyerOrderGet(authentication.site, path);
     if (buyerOrderResponse) return buyerOrderResponse;
+
+    const walletDataResponse = await handleWalletDataGet(authentication.site, path);
+    if (walletDataResponse) return walletDataResponse;
 
     const buyerTicketResponse = await handleBuyerTicketGet(authentication.site, path);
     if (buyerTicketResponse) return buyerTicketResponse;
