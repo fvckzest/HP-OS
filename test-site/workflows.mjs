@@ -421,7 +421,7 @@ async function recoveryFrontier(a) {
     observed_at: iso(a.run.clock + 1000),
     payment_started_at: null,
     provider_can_take_payment: null,
-  });
+  }, [201]);
   const frontier = await a.read('verification-frontier', '/v1/admin/payment-attempts?requires_verification=true&limit=100');
   const discovered = frontier.data.find(row => row.attempt_id === at.attempt_id);
   a.check('verification frontier', discovered?.requires_verification === true
