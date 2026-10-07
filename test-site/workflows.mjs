@@ -120,7 +120,9 @@ function savedStepData(run, name) {
 function savedNotificationJob(value, jobId) {
   if (Array.isArray(value)) return value.map(item => savedNotificationJob(item, jobId)).find(Boolean) ?? null;
   if (!value || typeof value !== 'object') return null;
-  if (value.job_id === jobId && Array.isArray(value.dispatch_attempts)) return value;
+  // Order reads return a summary without dispatch_attempts or delivery_reports.
+  // The preceding outcome-report response carries that detailed evidence.
+  if (value.job_id === jobId) return value;
   return Object.values(value).map(item => savedNotificationJob(item, jobId)).find(Boolean) ?? null;
 }
 function provesSimulatedNoDispatch(run, jobId) {
@@ -145,7 +147,6 @@ function provesSimulatedNoDispatch(run, jobId) {
     && savedNotificationJob(step.actual?.response?.data, jobId));
   const observed = savedNotificationJob(observedStep?.actual?.response?.data, jobId);
   const reportedAttempt = reported?.dispatch_attempts?.at(-1);
-  const observedAttempt = observed?.dispatch_attempts?.at(-1);
   const noProviderReference = attempts => Array.isArray(attempts) && attempts.length > 0
     && attempts.every(attempt => attempt.outcome === 'unknown' && attempt.provider_message_reference === null);
   return claimedStep?.actual?.status === 200 && Boolean(claim?.claim_id) && claimed?.job_id === jobId
@@ -159,12 +160,8 @@ function provesSimulatedNoDispatch(run, jobId) {
     && reportedAttempt.claim_id === claim.claim_id && reportedAttempt.lease_fence === claimed.lease_fence
     && reportedAttempt.provider_message_reference === null
     && observed?.job_id === jobId && observed.requires_verification === true
-    && observed.provider_message_reference === null && noProviderReference(observed.dispatch_attempts)
-    && observedAttempt?.outcome === 'unknown'
-    && observedAttempt.claim_id === claim.claim_id && observedAttempt.lease_fence === claimed.lease_fence
-    && observedAttempt.provider_message_reference === null
-    && Array.isArray(reported.delivery_reports) && reported.delivery_reports.length === 0
-    && Array.isArray(observed.delivery_reports) && observed.delivery_reports.length === 0;
+    && observed.provider_message_reference === null
+    && Array.isArray(reported.delivery_reports) && reported.delivery_reports.length === 0;
 }
 async function verifiedSimulationUnknowns(a, frontier) {
   const pending = frontier.filter(job => job.status !== 'completed' && job.requires_verification);
