@@ -23,6 +23,7 @@ const env = {
 };
 const pool = new pg.Pool({ connectionString: databaseUrl, max: 8, connectionTimeoutMillis: 2_000 });
 const organizationIds = [];
+const siteIds = [];
 let app;
 const RFC3339_WITH_OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
@@ -120,6 +121,7 @@ function createSiteFixture() {
   const organization = runOperator(["organization", "create", "--name", `Issue 45 recovery ${randomUUID()}`, "--pilot-fee-rate-basis-points", "1000"]);
   organizationIds.push(organization.organization_id);
   const site = runOperator(["site", "create", "--organization", organization.organization_id, "--name", "Issue 45 recovery Site"]);
+  siteIds.push(site.site_id);
   const connection = runOperator([
     "payment-connection", "create", "--organization", organization.organization_id,
     "--provider", "square", "--environment", "test",
@@ -626,17 +628,64 @@ async function verify() {
   await runStage("unattended recovery", () => verifyUnattendedRecovery(site, fixture));
   await runStage("overlapping worker recovery", () => verifyWorkerOverlapAndUncertainCheckout(site, fixture));
   await runStage("cancellation, refunds, fees, and totals", () => verifyCancellationRefundsAndFees(site, fixture));
-  console.log("Issue #45 local recovery verification passed: overlapping bounded HP-OS workers, lost/uncertain Site reports, stale claims and payload fencing, issuance recovery, cancellation/late payment, refunds, fee completeness, and totals.");
-  console.log("External LMNL, hosted, provider, mailbox, Wallet/device, and cutover proof remains deferred by docs/release-and-cutover.md.");
 }
 
+async function cleanup() {
+  if (!organizationIds.length) return;
+  const ids = siteIds;
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    const tables = [
+      "hpos.admissions", "hpos.notification_delivery_events", "hpos.notification_dispatch_attempts",
+      "hpos.notification_jobs", "hpos.notification_claims", "hpos.order_recovery_actions",
+      "hpos.payment_report_issue_resolutions", "hpos.payment_report_issues", "hpos.refund_report_issues",
+      "hpos.fee_report_issues", "hpos.fee_confirmation_totals", "hpos.fee_confirmations", "hpos.fee_records",
+      "hpos.payment_attempt_closure_reports", "hpos.payment_attempt_reports", "hpos.refund_reports", "hpos.refunds",
+      "hpos.tickets", "hpos.payment_attempts", "hpos.reservations", "hpos.orders", "hpos.public_quotes",
+      "hpos.access_request_decisions", "hpos.access_request_approval_tokens", "hpos.access_requests", "hpos.buyers",
+      "hpos.ticket_offering_provider_mappings", "hpos.events",
+    ];
+    for (const table of tables) {
+      await client.query(`delete from ${table} where site_id = any($1::uuid[])`, [ids]).catch(async (error) => {
+        if (error?.code === "42P01") return;
+        throw error;
+      });
+    }
+    await client.query("delete from hpos.site_payment_connection_assignments where organization_id = any($1::uuid[])", [organizationIds]);
+    await client.query("delete from hpos.payment_connections where organization_id = any($1::uuid[])", [organizationIds]);
+    await client.query("delete from hpos.sites where organization_id = any($1::uuid[])", [organizationIds]);
+    await client.query("delete from hpos.organizations where id = any($1::uuid[])", [organizationIds]);
+    const remaining = await client.query(
+      "select count(*)::integer as count from hpos.organizations where id = any($1::uuid[])",
+      [organizationIds],
+    );
+    assert(remaining.rows[0]?.count === 0, "Synthetic recovery Organizations remained after cleanup.");
+    await client.query("commit");
+  } catch (error) {
+    await client.query("rollback").catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+let verificationError = null;
+let cleanupError = null;
 try {
   await verify();
 } catch (error) {
-  console.error(error instanceof Error ? error.message : "Recovery verification failed.");
-  process.exitCode = 1;
+  verificationError = error;
 } finally {
   await stopApp(app);
-  await pool.query("delete from hpos.organizations where id = any($1::uuid[])", [organizationIds]).catch(() => undefined);
-  await pool.end().catch(() => undefined);
+  try { await cleanup(); }
+  catch (error) { cleanupError = error; }
+  await pool.end();
+}
+if (verificationError) console.error(verificationError instanceof Error ? verificationError.message : "Recovery verification failed.");
+if (cleanupError) console.error(`Synthetic-fixture cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : "unknown cleanup failure"}`);
+if (verificationError || cleanupError) process.exitCode = 1;
+else {
+  console.log("Issue #45 local recovery verification passed: overlapping bounded HP-OS workers, lost/uncertain Site reports, stale claims and payload fencing, issuance recovery, cancellation/late payment, refunds, fee completeness, and totals.");
+  console.log("External LMNL, hosted, provider, mailbox, Wallet/device, and cutover proof remains deferred by docs/release-and-cutover.md.");
 }
