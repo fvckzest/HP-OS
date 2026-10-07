@@ -2,6 +2,19 @@ import { Pause, Blocked, Unknown } from './adapter.mjs';
 const human = { type: 'user', reference: 'fake-lmnl:local-staff' };
 const system = { type: 'system', reference: 'fake-lmnl:local-worker' };
 const iso = n => new Date(n).toISOString();
+function isoInTimeZone(n, timeZone) {
+  const date = new Date(n);
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(date).filter(part => part.type !== 'literal').map(part => [part.type, part.value]));
+  const milliseconds = date.getUTCMilliseconds();
+  const localAsUtc = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute), Number(parts.second), milliseconds);
+  const offsetMinutes = Math.round((localAsUtc - n) / 60_000);
+  const absoluteOffset = Math.abs(offsetMinutes);
+  const offset = `${offsetMinutes < 0 ? '-' : '+'}${String(Math.floor(absoluteOffset / 60)).padStart(2, '0')}:${String(absoluteOffset % 60).padStart(2, '0')}`;
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}.${String(milliseconds).padStart(3, '0')}${offset}`;
+}
 const id = x => encodeURIComponent(x);
 export async function settleRequests(requests) {
   const results = await Promise.allSettled(requests);
@@ -489,11 +502,12 @@ async function arrivalChange(a) {
   const before = await a.read('arrival-event-before', '/v1/admin/events/' + id(e.event_id));
   const starts = Date.parse(before.data.starts_at) + 3_600_000;
   const ends = Date.parse(before.data.ends_at) + 3_600_000;
+  const timeZone = 'America/Los_Angeles';
   const edited = await a.call('arrival-event-edit', '/v1/admin/events/' + id(e.event_id), {
     method: 'PATCH',
     body: {
       actor: human, expected_version: before.data.version,
-      starts_at: iso(starts), ends_at: iso(ends), time_zone: 'America/Los_Angeles',
+      starts_at: isoInTimeZone(starts, timeZone), ends_at: isoInTimeZone(ends, timeZone), time_zone: timeZone,
       venue: { name: 'Fake LMNL updated venue', address: '100 Synthetic Street' },
     },
   });
