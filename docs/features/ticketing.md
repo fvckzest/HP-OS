@@ -68,7 +68,7 @@ These separate totals show both historical sales and current entry rights withou
 
 ## Release proof
 
-[Ticket #12](https://github.com/fvckzest/HP-OS/issues/12) defines the [LMNL release checklist and cutover procedure](../release-and-cutover.md). Local and hosted tests precede a controlled real purchase and refund. Every required check must pass, and the user must explicitly approve opening sales. Cutover happens after all current Events are complete, with no active public sales; historical records remain in the existing system.
+Repository-wide, LMNL implementation/integration and all hosted, provider, email, Wallet/device, and cutover proof are deferred until the user explicitly declares the cutover window. These release checks do not block closure of a completed HP-OS implementation issue. [Ticket #12](https://github.com/fvckzest/HP-OS/issues/12) defines the later [LMNL release checklist and cutover procedure](../release-and-cutover.md). Once activated, local and hosted tests precede a controlled real purchase and refund. Every required check must pass, and the user must explicitly approve opening sales. Cutover happens after all current Events are complete, with no active public sales; historical records remain in the existing system.
 
 Before the first release, prove a complete single-ticket purchase, then a multi-ticket purchase, using provider-confirmed payment, the initial ticket email, Order page, separate QR pages, one successful Admission per Ticket, and an already-admitted repeat scan. Also prove private Access Request approval, email, one-ticket purchase, and prevention of a second successful use of the approval link.
 

@@ -1,14 +1,20 @@
 # LMNL release proof and cutover
 
-Settled guidance from [HP-OS ticket #12](https://github.com/fvckzest/HP-OS/issues/12). This defines required evidence; it does not claim that any checks have passed or that HP-OS is implemented.
+Settled guidance from [HP-OS ticket #12](https://github.com/fvckzest/HP-OS/issues/12). This document defines later release evidence; it does not claim that any checks have passed or that HP-OS is implemented.
 
 ## Scope and release rule
 
 LMNL is the only Site in this release proof. MASS is outside scope.
 
+## Repository-wide deferral and issue closure
+
+LMNL implementation and integration, hosted operation, external-provider, email, and Wallet/device verification, and release/cutover proof are deferred repository-wide until the user explicitly declares the cutover window. Keep any prepared LMNL pull requests in Draft and unmerged during this period.
+
+The evidence in this document is a later release gate, not a gate for closing an HP-OS implementation issue. Close an HP-OS issue when its HP-OS behavior, local verification, and affected documentation are complete. Do not keep an otherwise completed HP-OS issue open solely for repository-wide deferred proof. If HP-OS implementation work itself remains, keep that scope open or track it separately. This separation lets HP-OS work finish without implying that LMNL integration or release has been accepted.
+
 ## Development and LMNL merge timing
 
-HP-OS is the active development target for the current ticketing work. Use scoped LMNL draft pull requests to develop and exercise the Site integration against unreleased HP-OS behavior, including local and hosted test-payment proof. Keep those pull requests in Draft and unmerged through implementation and integration testing. This lets the team test the real cross-repository flow while keeping live LMNL on its current integration. This default was set while implementing [HP-OS issue #26](https://github.com/fvckzest/HP-OS/issues/26).
+HP-OS is the active development target for the current ticketing work. While the repository-wide deferral is active, do not implement or exercise LMNL integration as current ticket work. Keep any prepared, scoped LMNL changes in Draft and unmerged while HP-OS capabilities are developed. This keeps live LMNL on its current integration; the Draft workflow was established while implementing [HP-OS issue #26](https://github.com/fvckzest/HP-OS/issues/26).
 
 At the cutover window, after all current LMNL Events are complete and public sales are closed, mark the LMNL changes ready for review, complete required review and acceptance, then merge them as part of the controlled switch. Then verify the production configuration and complete the controlled real purchase and refund below while public sales remain closed. A merge does not authorize opening sales; the user's explicit approval in step 4 is still required.
 
