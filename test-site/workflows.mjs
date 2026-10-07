@@ -509,6 +509,10 @@ async function arrivalChange(a) {
       actor: human, expected_version: before.data.version,
       starts_at: isoInTimeZone(starts, timeZone), ends_at: isoInTimeZone(ends, timeZone), time_zone: timeZone,
       venue: { name: 'Fake LMNL updated venue', address: '100 Synthetic Street' },
+      ticket_offering: {
+        sales_opens_at: isoInTimeZone(Date.parse(before.data.ticket_offering.sales_opens_at), timeZone),
+        sales_closes_at: isoInTimeZone(Date.parse(before.data.ticket_offering.sales_closes_at), timeZone),
+      },
     },
   });
   a.check('default check-in follows start', edited.data.check_in_uses_event_start === true
