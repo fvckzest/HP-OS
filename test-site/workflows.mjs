@@ -519,10 +519,12 @@ async function arrivalChange(a) {
     && Date.parse(edited.data.check_in_opens_at) === Date.parse(edited.data.starts_at),
   'Default check-in opening follows the edited Event start', { usesEventStart: edited.data.check_in_uses_event_start, opensAt: edited.data.check_in_opens_at, startsAt: edited.data.starts_at });
   const changed = await a.read('arrival-notifications', '/v1/admin/notification-jobs?event_id=' + id(e.event_id) + '&kind=event_changed&limit=100');
-  const job = changed.data.find(item => item.order_id === order.order_id && !item.is_superseded);
+  const jobs = changed.data.filter(item => item.order_id === order.order_id && !item.is_superseded);
+  const job = jobs[0];
   const expectedFields = ['ends_at', 'starts_at', 'time_zone', 'venue.address', 'venue.name'];
-  a.check('per-Order Event change job', Boolean(job) && job.payload?.event?.changed_fields?.slice().sort().join('|') === expectedFields.join('|'),
-    'One durable notification records the exact changed Event fields for the paid Order', job?.payload?.event?.changed_fields);
+  a.check('per-Order Event change job', jobs.length === 1
+    && job.payload?.event?.changed_fields?.slice().sort().join('|') === expectedFields.join('|'),
+    'Exactly one active durable notification records the changed Event fields for the paid Order', jobs.map(item => item.payload?.event?.changed_fields));
   const publicWallet = await a.read('arrival-wallet-data', '/v1/public/tickets/' + id(ticket.ticket_token) + '/apple-wallet-data');
   const walletJobs = await a.read('arrival-wallet-jobs', '/v1/admin/notification-jobs?kind=wallet_update&limit=100');
   const walletJob = walletJobs.data.find(item => item.ticket_id === ticket.ticket_id && !item.is_superseded);
@@ -740,6 +742,18 @@ async function privatePurchase(a) {
   const completed = await a.read('private-approval-consumed', '/v1/public/access-requests/' + id(approved.token));
   a.check('approval consumed after purchase', completed.data.purchase_completed === true,
     'A successful paid Order consumes this approval', { purchaseCompleted: completed.data.purchase_completed });
+  const admission = await a.write('private-admission', '/v1/admin/events/' + id(approved.e.event_id) + '/admissions', {
+    actor: human, qr_token: ticket.qr_payload,
+  }, [201]);
+  const buyerPage = await a.read('private-admitted-ticket-page', '/v1/public/tickets/' + id(ticket.ticket_token), { fresh: true });
+  a.check('private Ticket admitted once', admission.data.ticket_id === ticket.ticket_id
+    && buyerPage.data.admission_status === 'admitted' && buyerPage.data.can_admit === false,
+  'The approved attendee Ticket is admitted and its buyer page reflects used eligibility', {
+    ticket_id: buyerPage.data.ticket_id, admission_status: buyerPage.data.admission_status, can_admit: buyerPage.data.can_admit,
+  });
+  await a.write('private-repeat-admission-blocked', '/v1/admin/events/' + id(approved.e.event_id) + '/admissions', {
+    actor: human, qr_token: ticket.qr_payload,
+  }, [409], { expectedError: 'already_admitted' });
   await a.write('second-private-purchase-blocked', '/v1/public/events/' + id(approved.e.event_id) + '/quotes', {
     quantity: 1, access_request_token: approved.token,
   }, [409], { expectedError: 'access_already_used' });
@@ -792,6 +806,11 @@ async function groupPurchase(a) {
   const e = await event(a, 'group-purchase', { capacity: 8 });
   const eventPath = '/v1/admin/events/' + id(e.event_id);
   const before = await a.read('group-capacity-before-quote', eventPath);
+  const quantityOne = await a.write('group-quantity-one-quote', '/v1/public/events/' + id(e.event_id) + '/quotes', { quantity: 1 }, [201]);
+  const quantityEight = await a.write('group-quantity-eight-quote', '/v1/public/events/' + id(e.event_id) + '/quotes', { quantity: 8 }, [201]);
+  await a.write('group-quantity-nine-rejected', '/v1/public/events/' + id(e.event_id) + '/quotes', { quantity: 9 }, [422], { expectedError: 'validation_failed' });
+  a.check('public quantity boundaries', quantityOne.data.quantity === 1 && quantityEight.data.quantity === 8,
+    'Public quotes accept the one- and eight-Ticket quantity boundaries and reject quantity nine', { accepted: [quantityOne.data.quantity, quantityEight.data.quantity], rejectedQuantity: 9 });
   const quote = await a.write('group-quote', '/v1/public/events/' + id(e.event_id) + '/quotes', { quantity: 3 }, [201]);
   const afterQuote = await a.read('group-capacity-after-quote', eventPath);
   a.check('group quote does not reserve', quote.data.quantity === 3
@@ -806,6 +825,16 @@ async function groupPurchase(a) {
     && order.reservation?.status === 'held' && order.tickets.length === 0
     && order.pricing.total.amount === quote.data.total.amount,
   'One unpaid Order holds all three Tickets at the accepted full quote total', { quantity: order.quantity, reservation: order.reservation, total: order.pricing.total, tickets: order.tickets.length });
+  const adminOrder = await a.read('group-order-identity-deadlines', '/v1/admin/orders/' + id(order.order_id));
+  a.check('group buyer identity and original deadlines', order.buyer_name === buyer.name && order.delivery_email === buyer.email
+    && adminOrder.data.checkout_identity?.name === buyer.name && adminOrder.data.checkout_identity?.email === buyer.email
+    && order.checkout_expires_at === order.reservation?.expires_at
+    && adminOrder.data.checkout_expires_at === order.checkout_expires_at
+    && adminOrder.data.reservation?.expires_at === order.checkout_expires_at,
+  'The Order preserves buyer identity and one original checkout deadline for its Reservation', {
+    buyerName: order.buyer_name, deliveryEmail: order.delivery_email,
+    checkoutDeadline: order.checkout_expires_at, reservationDeadline: order.reservation?.expires_at,
+  });
   const afterOrder = await a.read('group-capacity-after-order', eventPath);
   a.check('group Reservation capacity', afterOrder.data.ticket_offering.available_quantity === before.data.ticket_offering.available_quantity - 3,
     'Order creation reserves the full requested quantity atomically', { availableBefore: before.data.ticket_offering.available_quantity, availableAfter: afterOrder.data.ticket_offering.available_quantity });
@@ -817,16 +846,26 @@ async function groupPurchase(a) {
   const orderPage = await a.read('group-order-page', '/v1/public/orders/' + id(order.order_token), { fresh: true });
   a.check('Order page presents complete group', orderPage.data.quantity === 3
     && orderPage.data.tickets.length === 3
-    && orderPage.data.tickets.map(item => item.ticket_id).join('|') === tickets.map(item => item.ticket_id).join('|'),
-  'The Order page presents all three issued Tickets in stable order', { quantity: orderPage.data.quantity, ticketIds: orderPage.data.tickets.map(item => item.ticket_id) });
+    && orderPage.data.tickets.map(item => item.ticket_id).join('|') === tickets.map(item => item.ticket_id).join('|')
+    && orderPage.data.buyer_name === buyer.name && orderPage.data.delivery_email === buyer.email
+    && orderPage.data.checkout_expires_at === order.checkout_expires_at,
+  'The Order page retains buyer identity, the original deadline, and all issued Tickets in stable order', { quantity: orderPage.data.quantity, ticketIds: orderPage.data.tickets.map(item => item.ticket_id), checkoutDeadline: orderPage.data.checkout_expires_at });
   const ticketPages = [];
+  const walletPages = [];
   for (const ticket of tickets) {
     const page = await a.read('group-ticket-page-' + ticket.ordinal, '/v1/public/tickets/' + id(ticket.ticket_token));
     ticketPages.push(page.data);
+    const wallet = await a.read('group-wallet-data-' + ticket.ordinal, '/v1/public/tickets/' + id(ticket.ticket_token) + '/apple-wallet-data');
+    walletPages.push(wallet.data);
   }
   a.check('independent Ticket pages', ticketPages.length === 3
     && ticketPages.every((page, index) => page.ticket_id === tickets[index].ticket_id && page.ordinal === index + 1 && page.qr_payload === tickets[index].qr_payload),
   'Each group member has a separate page, Ticket identity, ordinal, and QR', ticketPages.map(page => ({ ticket_id: page.ticket_id, ordinal: page.ordinal })));
+  a.check('independent unsigned Wallet data', walletPages.length === 3
+    && walletPages.every((wallet, index) => wallet.ticket_id === tickets[index].ticket_id
+      && wallet.qr_payload === tickets[index].qr_payload && wallet.used === false && wallet.voided === false),
+  'Each group Ticket has separate current unsigned Wallet data with its stable QR and unused state',
+  walletPages.map(wallet => ({ ticket_id: wallet.ticket_id, used: wallet.used, voided: wallet.voided })));
   const staffLookup = await a.write('group-staff-lookup', eventPath + '/ticket-lookup', { order_reference: order.order_reference });
   a.check('staff lookup shows complete group', staffLookup.data.length === 1
     && staffLookup.data[0].tickets.length === 3
@@ -846,6 +885,32 @@ async function groupPurchase(a) {
     'Each Ticket can be admitted independently once', { ordinal: ticket.ordinal, status: page.data.admission_status, canAdmit: page.data.can_admit });
     await a.write('group-repeat-admission-' + ticket.ordinal, path, body, [409], { expectedError: 'already_admitted' });
   }
+  const raceEvent = await event(a, 'group-last-capacity', { capacity: 1 });
+  const racePath = '/v1/public/events/' + id(raceEvent.event_id) + '/quotes';
+  const raceQuotes = [
+    await a.write('group-last-capacity-quote-one', racePath, { quantity: 1 }, [201]),
+    await a.write('group-last-capacity-quote-two', racePath, { quantity: 1 }, [201]),
+  ];
+  const raceBuyer = { name: 'Fake LMNL Capacity Buyer', email: 'capacity-' + a.run.id.slice(0, 8) + '@fake-lmnl.test' };
+  const raceOrders = await settleRequests(raceQuotes.map((raceQuote, index) => a.write(
+    'group-last-capacity-order-' + (index + 1), '/v1/public/orders', { quote_id: raceQuote.data.quote_id, buyer: raceBuyer }, [201, 409],
+  )));
+  const acceptedOrders = raceOrders.filter(result => result.status === 201);
+  const rejectedOrders = raceOrders.filter(result => result.status === 409);
+  a.check('concurrent last-capacity Orders', acceptedOrders.length === 1 && rejectedOrders.length === 1
+    && rejectedOrders[0].error?.code === 'sold_out',
+  'Two simultaneous one-Ticket Orders for the last unit produce one Reservation and one sold-out response',
+  raceOrders.map(result => ({ status: result.status, error: result.error?.code, quantity: result.data?.quantity })));
+  const currentRaceEvent = await a.read('group-last-capacity-current-event', '/v1/admin/events/' + id(raceEvent.event_id));
+  const canceledRaceEvent = await a.write('group-last-capacity-cancel', '/v1/admin/events/' + id(raceEvent.event_id) + '/actions/cancel', {
+    actor: human, expected_version: currentRaceEvent.data.version,
+  }, [200]);
+  const finalRaceEvent = await a.read('group-last-capacity-after-release', '/v1/admin/events/' + id(raceEvent.event_id));
+  a.check('last-capacity fixture released', canceledRaceEvent.data.is_canceled === true
+    && finalRaceEvent.data.ticket_offering.available_quantity === 1,
+  'Canceling the unpaid synthetic race fixture releases its winning Reservation', {
+    canceled: canceledRaceEvent.data.is_canceled, available: finalRaceEvent.data.ticket_offering.available_quantity,
+  });
 }
 
 export async function execute(a) {

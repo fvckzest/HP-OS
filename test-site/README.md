@@ -62,10 +62,10 @@ The new local scenarios cover the implemented API boundaries for issues #40–44
 - **#43 reporting** reads Event Order/Ticket lists and totals, then reports synthetic fee components and explicit confirmations.
 - **#44 connection history** checks that changing an Event provider mapping affects future Orders while existing mapping snapshots stay frozen. The dashboard cannot switch the operator-managed active Site connection.
 - **#46 private approval** checks request, approval, rejection, undo, and link replacement through the Site API. It queues synthetic email work but sends no email.
-- **#47 private purchase** checks one approved private Ticket while keeping purchaser and attendee identity separate.
+- **#47 private purchase** checks one approved private Ticket, keeps purchaser and attendee identity separate, and admits the Ticket once.
 - **#48 Wallet data** checks unsigned public and admin reads, stable QR, and the used state after Admission.
 - **#49 Wallet update jobs** checks durable job payload versions after Admission and Event changes. The Apple signing and device update service remains outside this dashboard.
-- **#50 public group purchase** checks a quantity-three quote, full Reservation and accepted total, complete ordered Ticket issuance, one initial Order email, independent buyer pages, staff lookup, and separate Admission for each Ticket. Run it after the required single-ticket, recovery, private-purchase, and Wallet stages; synthetic local payment/email evidence does not establish provider, hosted, device, or cutover proof.
+- **#50 public group purchase** checks quantity limits, a quantity-three quote, full Reservation and accepted total, buyer identity and checkout deadlines, complete ordered Ticket issuance, one initial Order email, independent buyer pages and unsigned Wallet data, staff lookup, separate Admission for each Ticket, and competing requests for the last capacity. Run it after the required single-ticket, recovery, private-purchase, and Wallet stages; synthetic local payment/email evidence does not establish provider, hosted, device, or cutover proof.
 
 These workflows use synthetic local API data. Issue #45 remains blocked for its controlled interruption and integration acceptance; a dashboard pass never supplies hosted, provider, email, device, cutover, or release proof.
 
