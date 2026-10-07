@@ -60,7 +60,20 @@ export async function createDashboard({ config = loadConfig(), directory = fileU
           csrf, groups, routes, tickets: ticketChecklist(), source, dashboardHash,
           environment: { origin: config.origin, container: config.docker, configured: Boolean(config.siteKey), revisionNote: 'HP-OS source snapshot captured before image build. This is not verification of the running HP-OS server revision.' },
           workflows: workflows.map(w => ({ ...w, blockers: Object.fromEntries(['simulation', 'sandbox'].map(p => [p, blockers(w, p, config)])) })),
-          runs: saved.map(r => ({ ...publicRun(r, secrets), hasCheckout: Boolean(r.privateContext.square?.link?.url), hasOrder: Boolean(r.privateContext.order), hasTicket: Boolean(r.privateContext.ticket) })),
+          runs: saved.map(r => {
+            const resumableState = ['interrupted', 'unknown outcome', 'blocked'].includes(r.status);
+            const canResume = resumableState && r.fingerprint === config.fingerprint
+              && r.dashboardHash === dashboardHash && hash(r.source) === hash(source);
+            return {
+              ...publicRun(r, secrets), canResume,
+              resumeUnavailableReason: resumableState && !canResume
+                ? 'This run uses an older configuration or workflow revision. Its evidence is preserved; start a new workflow instead.'
+                : null,
+              hasCheckout: Boolean(r.privateContext.square?.link?.url),
+              hasOrder: Boolean(r.privateContext.order),
+              hasTicket: Boolean(r.privateContext.ticket),
+            };
+          }),
         });
       }
       if (req.method === 'GET' && /^\/api\/evidence\/[0-9a-f-]{36}$/.test(url.pathname)) {

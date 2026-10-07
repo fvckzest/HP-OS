@@ -113,19 +113,74 @@ async function fixture(a, { buyerEmail = null } = {}) {
   await configuration(a); const e = await event(a), { order } = await reserve(a, e, 'purchase', 'primary', buyerEmail), at = await attempt(a, order), reference = await checkout(a, at), payment = await paid(a, order, at, reference);
   return { e, order, at, reference, ...payment };
 }
+function savedStepData(run, name) {
+  const step = run.steps.find(item => item.name === name);
+  return step?.actual?.response?.data ?? null;
+}
+function provesSimulatedNoDispatch(run, jobId) {
+  if (run.profile !== 'simulation' || run.workflow !== 'unknown-email' || run.status !== 'passed') return false;
+  if (!Array.isArray(run.steps) || run.steps.some(step => step.provider !== 'hpos')) return false;
+  const listStep = run.steps.find(item => item.name === 'email-list');
+  const claim = savedStepData(run, 'email-claim');
+  const listed = savedStepData(run, 'email-list');
+  const reportStep = run.steps.find(item => item.name === 'email-dispatch');
+  const observedStep = run.steps.find(item => item.name === 'unknown-job');
+  const observed = savedStepData(run, 'unknown-job');
+  const reported = reportStep?.actual?.response?.data;
+  const reportedAttempt = reported?.dispatch_attempts?.at(-1);
+  const observedAttempt = observed?.dispatch_attempts?.at(-1);
+  const claimed = claim?.jobs?.find(item => item.job_id === jobId);
+  return listStep?.actual?.status === 200 && reportStep?.actual?.status === 200
+    && observedStep?.actual?.status === 200 && Boolean(claim?.claim_id) && claimed?.job_id === jobId
+    && reportStep?.request?.claim_id === claim?.claim_id
+    && reportStep?.request?.lease_fence === claimed.lease_fence
+    && reportStep.request?.outcome === 'unknown'
+    && reportStep.request.provider_message_reference === null
+    && Array.isArray(listed) && listed.some(item => item.job_id === jobId && item.kind === 'tickets_ready')
+    && reported?.job_id === jobId && reported.requires_verification === true
+    && reported.provider_message_reference === null && reportedAttempt?.outcome === 'unknown'
+    && reportedAttempt.claim_id === claim.claim_id && reportedAttempt.lease_fence === claimed.lease_fence
+    && reportedAttempt.provider_message_reference === null
+    && observed?.job_id === jobId && observed.requires_verification === true
+    && observed.provider_message_reference === null && observedAttempt?.outcome === 'unknown'
+    && observedAttempt.claim_id === claim.claim_id && observedAttempt.lease_fence === claimed.lease_fence
+    && observedAttempt.provider_message_reference === null
+    && (reported.delivery_reports?.length ?? 0) === 0
+    && (observed.delivery_reports?.length ?? 0) === 0;
+}
+async function verifiedSimulationUnknowns(a, frontier) {
+  const pending = frontier.filter(job => job.status !== 'completed' && job.requires_verification);
+  const proofs = new Map();
+  if (!pending.length) return proofs;
+  if (a.run.profile !== 'simulation') {
+    throw new Blocked('Unfinished jobs require provider or durable-log verification. Resolve their saved runs first; no blind resend is permitted.');
+  }
+  const savedRuns = await a.store.all();
+  for (const job of pending) {
+    const sourceRun = savedRuns.find(run => provesSimulatedNoDispatch(run, job.job_id));
+    if (!sourceRun) {
+      throw new Blocked(`Notification job ${job.job_id} requires verification. No matching saved Local simulation run proves that a provider dispatch was not made; no resend was attempted.`);
+    }
+    a.check(`saved simulation proves no provider dispatch ${job.job_id}`, true,
+      'The matching passed saved run used only the HP-OS API and recorded an unknown result without a provider message or delivery report',
+      { job_id: job.job_id, saved_run_id: sourceRun.id, profile: sourceRun.profile, workflow: sourceRun.workflow });
+    proofs.set(job.job_id, sourceRun.id);
+  }
+  return proofs;
+}
 async function deliver(a, f, { unknown = false, overlap = false, failure = false } = {}) {
   const jobs = await a.read('email-list', `/v1/admin/notification-jobs?order_id=${id(f.order.order_id)}&kind=tickets_ready`);
   const job = jobs.data.find(j => j.order_id === f.order.order_id && j.kind === 'tickets_ready');
   a.check('initial email job', jobs.data.length === 1 && Boolean(job), 'Exactly one initial email job for this Order', jobs.data.length);
-  const frontier = await a.read('email-frontier', '/v1/admin/notification-jobs?kind=tickets_ready&limit=100');
+  const frontier = await a.read('email-frontier', '/v1/admin/notification-jobs?kind=tickets_ready&limit=100', { fresh: true });
   if (frontier.envelope.pagination?.next_cursor) throw new Blocked('The worker frontier exceeds this bounded 100-job run. Resolve preceding work first.');
-  if (frontier.data.some(j => j.status !== 'completed' && j.requires_verification)) throw new Blocked('Unfinished jobs require dispatch verification. Resolve their saved runs first; no blind resend is permitted.');
+  const verifiedUnknowns = await verifiedSimulationUnknowns(a, frontier.data);
   if (a.run.profile === 'sandbox' && frontier.data.some(j => j.job_id !== job.job_id && j.status !== 'completed')) throw new Blocked('Other unfinished Ticket-email jobs exist. Resolve preceding simulated runs first; Sandbox cannot send unrelated notifications.');
   const claim = await a.write('email-claim', '/v1/admin/notification-jobs/claims', { actor: system, limit: 100, kinds: ['tickets_ready'] });
   const claimed = claim.data.jobs.find(j => j.job_id === job.job_id);
   if (!claimed) throw new Blocked('Target job is not claimable. Recover its existing claim before dispatch.');
   if (a.run.profile === 'simulation') for (const preceding of claim.data.jobs.filter(j => j.job_id !== job.job_id)) {
-    if (preceding.requires_verification) throw new Blocked('A preceding claimed job requires dispatch verification. No blind simulated resend.');
+    if (preceding.requires_verification && !verifiedUnknowns.has(preceding.job_id)) throw new Blocked('A newly claimed job requires provider or durable-log verification. No blind simulated resend.');
     const reference = `fake-email-${preceding.job_id}`;
     await a.write('backlog-dispatch-' + preceding.job_id, `/v1/admin/notification-jobs/${id(preceding.job_id)}/outcome-reports`, { actor: system, claim_id: claim.data.claim_id, lease_fence: preceding.lease_fence, outcome: 'completed', provider_message_reference: reference, observed_at: iso(a.run.clock + 2000), error_code: null });
     await a.write('backlog-delivery-' + preceding.job_id, `/v1/admin/notification-jobs/${id(preceding.job_id)}/delivery-reports`, { actor: system, outcome: 'delivered', provider_message_reference: reference, provider_event_reference: `fake-delivery-${preceding.job_id}`, observed_at: iso(a.run.clock + 3000) });

@@ -61,10 +61,12 @@ function render() {
     if (run.hasOrder) row.append(link('Open Fake LMNL Order page', '/buyer/order/' + run.id), el('br'));
     if (run.hasTicket) row.append(link('Open Fake LMNL Ticket page', '/buyer/ticket/' + run.id), el('br'));
     if (['interrupted', 'unknown outcome', 'blocked'].includes(run.status)) {
-      const payment = el('input'); payment.placeholder = 'Square Sandbox payment ID (when requested)'; payment.setAttribute('aria-label', 'Square Sandbox payment ID');
-      payment.dataset.runId = run.id; payment.value = paymentInputs.get(run.id) ?? '';
-      if (run.profile === 'sandbox') row.append(payment);
-      row.append(button('Resume saved run', () => action('/api/resume', { runId: run.id, ...(payment.value ? { paymentId: payment.value } : {}) })));
+      if (run.canResume) {
+        const payment = el('input'); payment.placeholder = 'Square Sandbox payment ID (when requested)'; payment.setAttribute('aria-label', 'Square Sandbox payment ID');
+        payment.dataset.runId = run.id; payment.value = paymentInputs.get(run.id) ?? '';
+        if (run.profile === 'sandbox') row.append(payment);
+        row.append(button('Resume saved run', () => action('/api/resume', { runId: run.id, ...(payment.value ? { paymentId: payment.value } : {}) })));
+      } else if (run.resumeUnavailableReason) row.append(el('p', run.resumeUnavailableReason, 'muted'));
     }
     if (run.status === 'running') row.append(button('Interrupt', () => action('/api/interrupt', { runId: run.id })));
     row.append(details('Redacted requests, responses and checks', el('pre', JSON.stringify(run, null, 2)))); runs.append(row);
