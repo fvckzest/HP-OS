@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 import { getBusinessPool } from "./database";
-import { apiFailure, apiSuccess } from "./api-response";
+import { apiFailure, apiSuccess, withRequestCorrelation } from "./api-response";
+import { apiFailureContract, classifyApiFailure, emitServerDiagnostic, requestId } from "./api-diagnostics";
 import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import type { AuthenticatedSite } from "./site-auth";
@@ -334,9 +335,9 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
-function mapUnexpectedNotificationError(error: unknown): Response {
+function mapUnexpectedNotificationError(error: unknown): Response | null {
   if (isPgCode(error, "23505")) return apiFailure(409, "claim_conflict", "A notification reference conflicts with an existing job or provider report.");
-  return apiFailure(503, "service_unavailable", "Notification processing is temporarily unavailable.", { retryAfter: 1 });
+  return null;
 }
 
 function actorFrom(value: unknown): Actor | null {
@@ -481,7 +482,7 @@ async function readJsonBody(request: Request): Promise<unknown | Response> {
 
 function errorResponse(error: unknown): Response {
   if (error instanceof NotificationError) return apiFailure(error.status, error.code, error.message, { details: error.details, retryAfter: error.status === 409 && error.code === "request_in_progress" ? 1 : undefined });
-  return apiFailure(503, "service_unavailable", "Notification processing is temporarily unavailable.", { retryAfter: 1 });
+  throw error;
 }
 
 async function listJobs(request: Request, site: AuthenticatedSite): Promise<Response> {
@@ -527,7 +528,7 @@ async function listJobs(request: Request, site: AuthenticatedSite): Promise<Resp
       stale: !(await accessApprovalIsCurrent(getBusinessPool(), row)),
     })));
     return apiSuccess(rowsWithFreshApprovalState.map(({ row, stale }) => jobObject(row, stale)), 200, { nextCursor: next });
-  } catch { return apiFailure(503, "service_unavailable", "Notification jobs are temporarily unavailable.", { retryAfter: 1 }); }
+  } catch (error) { throw error; }
 }
 
 function encodeCursor(siteId: string, filters: object, limit: number, row: { created_at: Date; created_cursor_time?: string; id: string }): string {
@@ -895,9 +896,8 @@ export interface ProcessingResult {
 }
 
 /** One bounded HP-OS recovery batch. It never calls a provider or Site worker. */
-export async function runBoundedProcessing(trigger: ProcessingTrigger): Promise<ProcessingResult> {
+export async function runBoundedProcessing(trigger: ProcessingTrigger, runId = requestId()): Promise<ProcessingResult> {
   const client = await getBusinessPool().connect();
-  const runId = randomUUID();
   try {
     await client.query("begin");
     const clock = await client.query<{ started_at: Date }>(`select clock_timestamp() as started_at`);
@@ -1061,17 +1061,36 @@ export async function runBoundedProcessing(trigger: ProcessingTrigger): Promise<
 }
 
 export async function handleScheduledProcessing(request: Request): Promise<Response> {
+  const correlationId = requestId();
+  const invocationId = requestId();
   const expected = process.env.CRON_SECRET;
   const production = process.env.NODE_ENV === "production";
   const requestHost = new URL(request.url).hostname.toLowerCase();
   const loopbackHost = requestHost === "127.0.0.1" || requestHost === "::1" || requestHost === "localhost";
   if ((expected && request.headers.get("authorization") !== `Bearer ${expected}`) || (!expected && production) || (!production && !loopbackHost)) {
-    return new Response("Unauthorized", { status: 401, headers: { "Cache-Control": "no-store" } });
+    const response = new Response("Unauthorized", { status: 401, headers: { "Cache-Control": "no-store" } });
+    return withRequestCorrelation(response, correlationId);
   }
   try {
-    const processing = await runBoundedProcessing(production ? "vercel_cron" : "local_scheduler");
+    const processing = await runBoundedProcessing(production ? "vercel_cron" : "local_scheduler", invocationId);
     const issuance = await (await import("./ticket-issuance")).processPendingTicketIssuance();
-    return apiSuccess({ ...processing, has_more: processing.has_more || issuance.has_more, ticket_issuance: issuance });
+    return withRequestCorrelation(apiSuccess({ ...processing, has_more: processing.has_more || issuance.has_more, ticket_issuance: issuance }, 200, { requestId: correlationId }), correlationId);
   }
-  catch { return apiFailure(503, "service_unavailable", "The bounded HP-OS processing cycle failed.", { retryAfter: 30 }); }
+  catch (error) {
+    const failureCategory = classifyApiFailure(error);
+    const failure = apiFailureContract(failureCategory, 30);
+    emitServerDiagnostic({
+      requestId: correlationId,
+      operation: "GET /api/cron/process",
+      failureCategory,
+      error,
+      runId: invocationId,
+    });
+    return withRequestCorrelation(apiFailure(
+      failure.status,
+      failure.code,
+      failureCategory === "temporary_dependency" ? "The bounded HP-OS processing cycle is temporarily unavailable." : "The bounded HP-OS processing cycle failed unexpectedly.",
+      { retryAfter: failure.retryAfter, requestId: correlationId },
+    ), correlationId);
+  }
 }

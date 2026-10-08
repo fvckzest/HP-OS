@@ -19,6 +19,22 @@ The following require LMNL or an actual integration in addition to the local API
 - Phone-camera scanning and manual door lookup require the intended LMNL device flow. The Admission endpoint and its atomic result remain locally testable.
 - Hosted Supabase connectivity, callbacks, Vercel Cron execution, hosted secrets, and a controlled real purchase/refund require hosted or production evidence. Local results do not imply those outcomes.
 
+## Issue #125 group and Wallet verifier
+
+`pnpm verify:group-wallet` runs the focused local regression command for the public group-checkout and unsigned Wallet paths. It starts the Next.js HTTP boundary against the dedicated local PostgreSQL database, creates synthetic Site and Organization records through the operator command, and removes the complete fixture graph in a transaction on both success and failure. A final cleanup assertion confirms that the run's Organizations and Sites are gone.
+
+The verifier proves the following through HTTP responses followed by public/admin reads and PostgreSQL state checks:
+
+- public quote and Order quantities `1`, `2`, and `8`, quantity rejection outside `1..8`, quantity-scaled unit price, tax, buyer fees, platform fee, Reservation quantity, and accepted terms;
+- complete eight-Ticket issuance after a deliberately interrupted payment report, duplicate payment reports while the Order is still unissued, overlapping scheduler recovery, stable ordinals, distinct Ticket page and QR tokens, and exactly one initial Order email job;
+- independent Ticket pages and one successful Admission per Ticket, repeated-Admission rejection, and concurrent last-capacity protection;
+- public-token and admin Wallet reads, current Event data, stable QR payloads, used and voided state, and wrong-Site rejection;
+- exactly counted per-Ticket Wallet update jobs, checked through PostgreSQL and the admin notification-job endpoint, whose `data_version` matches pass-visible Event edits, Admission, cancellation, archival, and full refund;
+- no Wallet update work for a partial refund, verified email correction, or a clock-only sales-status transition; and
+- approved private checkout limited to one Ticket.
+
+Payment, email, and notification reports in this command are synthetic local observations. The command does not prove provider payment or refund truth, email delivery, Apple signing or device updates, hosted LMNL behavior, or release/cutover readiness.
+
 ## Capability and evidence status
 
 As of this research date, the operations and processing below are **unimplemented**, not failing implemented features. Future evidence must distinguish an absent capability from an implemented operation that fails its expected outcome. Also distinguish an implemented check that has not run, a check blocked by missing configuration/service/device/specification, and a passed check with its specific revision and environment. This follows the current [repository status](../../README.md), [implementation specification](https://github.com/fvckzest/HP-OS/issues/22), and [release evidence rules](../release-and-cutover.md#scope-and-release-rule).
