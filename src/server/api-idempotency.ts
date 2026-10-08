@@ -167,9 +167,9 @@ export async function withApiIdempotency(
     }
     if (mapUnexpectedError) {
       const mapped = mapUnexpectedError(error);
-      if (mapped) return mapped;
+      if (mapped && mapped.status >= 400 && mapped.status < 500) return mapped;
     }
-    return apiFailure(503, "service_unavailable", "The requested API operation is temporarily unavailable.", { retryAfter: 1 });
+    throw error;
   } finally {
     client.release();
   }
