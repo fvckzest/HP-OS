@@ -125,8 +125,8 @@ Paths are relative to the base URL. `{...}` identifies a path parameter. All end
 | `POST /v1/admin/artworks/{artwork_id}/actions/{action}` | `publish` or `archive`. |
 | `GET /v1/admin/artworks/{artwork_id}/photos` | List Photos, including processing and replacement states. |
 | `POST /v1/admin/artworks/{artwork_id}/photos` | Upload one new Photo (`multipart/form-data`). |
-| `POST /v1/admin/artworks/{artwork_id}/photos/{photo_id}/actions/retry` | Reupload source to retry failed initial processing on the same Photo. |
-| `POST /v1/admin/artworks/{artwork_id}/photos/{photo_id}/replacement` | Replace bytes for the same Photo ID. |
+| `POST /v1/admin/artworks/{artwork_id}/photos/{photo_id}/actions/retry` | Retry failed initial processing or a failed replacement on the same Photo ID. |
+| `POST /v1/admin/artworks/{artwork_id}/photos/{photo_id}/replacement` | Begin a replacement for a ready Photo with no replacement attempt. |
 | `DELETE /v1/admin/artworks/{artwork_id}/photos/{photo_id}` | Remove a Photo; a published hero removal requires a replacement hero in the request. |
 | `PUT /v1/admin/artworks/{artwork_id}/photo-order` | Replace the full Photo order. |
 | `PUT /v1/admin/artworks/{artwork_id}/hero` | Select one ready Photo as hero. |
@@ -888,10 +888,10 @@ Each row lists operation-specific body fields/result data. Apply common headers 
 | Reorder Collection Artworks | `artwork_ids (complete unique membership list), expected_version, actor` | `AdminCollection; 200` |
 | Reorder Artwork Photos | `photo_ids (complete unique Photo list), expected_version, actor` | `AdminArtwork; 200` |
 | Select hero | `photo_id, expected_version, actor` | `AdminArtwork; 200; selected Photo must be ready` |
-| Remove Photo | `expected_version, actor, optional replacement_hero_photo_id` | `AdminArtwork; 200; published Artwork keeps one ready Photo and hero` |
+| Remove Photo | `expected_version (Photo), expected_artwork_version (Artwork), actor, optional replacement_hero_photo_id` | `AdminArtwork; 200; atomically guarded, published Artwork keeps one ready Photo and hero; stale version returns 409` |
 | Upload Photo | `multipart: file + metadata {expected_version (Artwork), actor}` | `AcceptedPhoto; 202; processing; returns new Artwork version` |
-| Retry Photo | `multipart: file + metadata {expected_version (Photo), actor}` | `AcceptedPhoto; 202; same Photo ID, processing` |
-| Replace Photo | `multipart: file + metadata {expected_version (Photo), actor}` | `AcceptedPhoto; 202; old variants remain until both new variants are ready` |
+| Retry Photo | `multipart: file + metadata {expected_version (Photo), actor}` | `AcceptedPhoto; 202; retries failed initial Photo or replacement on same Photo ID` |
+| Replace Photo | `multipart: file + metadata {expected_version (Photo), actor}` | `AcceptedPhoto; 202; for a ready Photo with no replacement, old variants remain until both new variants are ready` |
 | List public Artworks | Optional `collection_id, limit, cursor` | `Paginated PublicArtwork[]; 200` |
 | Read public Artwork | No body | `PublicArtwork; 200` |
 | List public Collections | Optional `limit, cursor` | `Paginated PublicCollection[]; 200` |
