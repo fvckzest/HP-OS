@@ -22,7 +22,8 @@
     "verify:recovery": "node scripts/verify-recovery.mjs",
     "verify:private-access": "node scripts/verify-private-access.mjs",
     "verify:historical-connections": "node scripts/verify-historical-connections.mjs",
-    "verify:fees": "node scripts/verify-fee-reporting.mjs"
+    "verify:fees": "node scripts/verify-fee-reporting.mjs",
+    "verify:group-wallet": "node scripts/verify-group-wallet.mjs"
   },
   "dependencies": {
     "next": "16.3.6",
