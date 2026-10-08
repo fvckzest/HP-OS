@@ -30,6 +30,155 @@ Each Site alone defines and enforces its staff permissions, including limited do
 
 HP-OS authenticates the Site API key, enforces Site ownership, and validates the requested operation against its business rules. Site authorization does not override capacity, payment, or Admission rules, or permit changes to operator-managed connection assignments and fee terms. See [ownership](../ownership.md#settled-rules).
 
+## Site-scoped portfolio API
+
+The portfolio contract adds Site-owned Artworks, Collections, Photos, and two public WebP delivery variants. A Site backend calls every route below with its private Site API key. The Site authenticates and authorizes its staff before making an admin request; HP-OS scopes every record lookup and write to the authenticated Site. A missing record and a record owned by another Site both return `404 not_found`. The browser never receives the Site key. These rules implement [portfolio decisions #111–#115](https://github.com/fvckzest/HP-OS/issues/110); this section and the [compact reference](api-ref.md) define the HTTP contract for [#117](https://github.com/fvckzest/HP-OS/issues/117).
+
+### Portfolio endpoints
+
+All paths are relative to the `/v1` base. All responses except the delivery-image byte route use the common JSON envelope. All writes require `Authorization: Bearer <site_api_key>` and a UUID `Idempotency-Key`; admin writes also include the `actor` field. Admin list and detail reads include drafts, archived records, inactive Collections, and incomplete Photo states. Public reads still require the Site key and are intended for the Site backend, which maps the response to its own public pages.
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /v1/admin/artworks` | List this Site's Artworks; filter by `publication_status`, `original_status`, and `collection_id`. |
+| `POST /v1/admin/artworks` | Create a draft Artwork. |
+| `GET /v1/admin/artworks/{artwork_id}` | Read an Artwork and its ordered Photos and Collection memberships. |
+| `PATCH /v1/admin/artworks/{artwork_id}` | Edit supplied Artwork fields. |
+| `POST /v1/admin/artworks/{artwork_id}/actions/{action}` | Publish or archive an Artwork. |
+| `GET /v1/admin/artworks/{artwork_id}/photos` | List Photos and their processing/replacement states. |
+| `POST /v1/admin/artworks/{artwork_id}/photos` | Upload a new Photo as `multipart/form-data`. |
+| `POST /v1/admin/artworks/{artwork_id}/photos/{photo_id}/actions/retry` | Reupload the source to retry a failed initial Photo on the same Photo ID. |
+| `POST /v1/admin/artworks/{artwork_id}/photos/{photo_id}/replacement` | Upload replacement bytes to a ready Photo ID. |
+| `DELETE /v1/admin/artworks/{artwork_id}/photos/{photo_id}` | Remove a Photo, with a replacement hero in the same operation when required. |
+| `PUT /v1/admin/artworks/{artwork_id}/photo-order` | Replace the complete Photo order. |
+| `PUT /v1/admin/artworks/{artwork_id}/hero` | Select one ready Photo as hero. |
+| `GET /v1/admin/collections` | List this Site's Collections, including inactive ones. |
+| `POST /v1/admin/collections` | Create an active Collection. |
+| `GET /v1/admin/collections/{collection_id}` | Read a Collection. |
+| `PATCH /v1/admin/collections/{collection_id}` | Edit its name, description, active state, or position. |
+| `GET /v1/admin/collections/{collection_id}/artworks` | List the Collection's Artwork memberships in order. |
+| `PUT /v1/admin/collections/{collection_id}/artworks/{artwork_id}` | Add an Artwork to a Collection; an existing membership is unchanged. |
+| `DELETE /v1/admin/collections/{collection_id}/artworks/{artwork_id}` | Remove an Artwork from a Collection. |
+| `PUT /v1/admin/collections/{collection_id}/artwork-order` | Replace the complete Artwork order for a Collection. |
+| `GET /v1/public/artworks` | List published Artworks in at least one active Collection; optional `collection_id` filter. |
+| `GET /v1/public/artworks/{artwork_id}` | Read one eligible public Artwork by its stable API ID. |
+| `GET /v1/public/collections` | List active Collections. |
+| `GET /v1/public/collections/{collection_id}` | Read active Collection metadata. |
+| `GET /v1/public/collections/{collection_id}/artworks` | List that Collection's eligible Artworks in membership order. |
+| `GET /v1/public/media/{photo_id}/variants/{variant}` | Read one public WebP delivery image as bytes; `variant` is `grid_400` or `artwork_1600`. |
+
+Artwork/Collection creation returns `201` with the created admin object. Reads, edits, membership changes, order/hero updates, publish/archive actions, and removals return `200` with their resulting admin object(s). Upload, Photo retry, and replacement return `202` with `{photo: AdminPhoto, artwork_version}`; processing completion is asynchronous and is read from the admin Photo list or Artwork detail. Creating a Photo advances the Artwork version and returns that new value; retry and replacement return the current Artwork version without changing it. Lists return the common `data` array and `pagination.next_cursor`. The delivery-image route returns `200` with image bytes rather than a JSON envelope.
+
+`GET /v1/admin/collections/{collection_id}/artworks` returns paginated `{position, artwork: AdminArtwork}` rows so the Site can edit membership order. `GET /v1/admin/artworks/{artwork_id}/photos` returns a paginated `AdminPhoto[]`. Public Collection Artwork lists return `PublicArtwork[]`; each response's `collections` entries include that Artwork's position in the requested Collection.
+
+`artwork_id`, `collection_id`, and `photo_id` are opaque, URL-safe HP-OS API identifiers, distinct from database identifiers. They are assigned by HP-OS, stable for the resource lifetime, and meaningful only within the owning Site. The displayed Artwork ID and `slug` are separate presentation fields. Artwork `slug` is optional on a draft, required before publication, and unique within the Site's Artworks; a Site may use it for its own page URL. Public API detail lookup uses `artwork_id`, so changing a slug does not change Artwork identity. Collection ordering is represented by `position`; new Collections are appended. A Collection's `position` edit moves it in the Site's ordered Collection list.
+
+### Artwork and Collection fields
+
+Create Artwork input is `{title, displayed_artwork_id, slug?, description?, medium?, dimensions?, created_on?, cardano_chain?, cardano_policy_id?, cardano_asset_id?, actor}`. `title` and `displayed_artwork_id` are required; displayed IDs are unique within the Site. `slug` may be omitted while the Artwork is a draft but must be supplied before publication; it is unique within the Site's Artworks. A duplicate slug returns `409 slug_conflict`; a duplicate displayed ID returns `409 validation_failed` with a `displayed_artwork_id` field detail. `description`, `medium`, dimensions, date, and Cardano identifiers may be omitted or cleared with `null`. `description` is plain text. `dimensions` is `{width, height, unit}`; width and height are positive numbers and unit is `mm`, `cm`, or `in`. `created_on` is a calendar date (`YYYY-MM-DD`). The Cardano fields are independent optional strings; HP-OS does not verify chain data. Text uses the existing limits: title, medium, and displayed ID are at most 200 characters; description is at most 20,000 characters. Text values are trimmed. Slugs are lowercase ASCII letters/digits separated by single hyphens, at most 120 characters.
+
+Artwork creation always produces `publication_status: "draft"`, `original_status: "available"`, `version: 1`, no Collection memberships, and no Photos. `PATCH` accepts any subset of the editable fields above, `original_status` (`available` or `sold`), `actor`, and required `expected_version`. Omitted fields are unchanged; `null` clears only nullable fields. Do not patch `artwork_id`, `publication_status`, version, memberships, Photo order, or hero. `sold` describes the original Artwork and does not describe prints or editions. Draft, published, and archived are the publication states; sold is an independent field. Published and archived Artworks remain editable. `publish` can publish a draft or republish an archived Artwork; `archive` hides a published Artwork while retaining its data and relationships.
+
+A duplicate `displayed_artwork_id` returns `422 validation_failed` with detail `{field: "displayed_artwork_id", code: "already_exists"}`. A malformed slug returns `422 validation_failed` with field `slug`; a duplicate slug returns `409 slug_conflict`. Attempting to archive an Artwork that is not published returns `409 invalid_state`.
+
+An Artwork response contains `{artwork_id, slug, displayed_artwork_id, title, description, medium, dimensions, created_on, cardano_chain, cardano_policy_id, cardano_asset_id, original_status, publication_status, collection_ids, photos, hero_photo_id, version}`. Optional values are returned as `null`. `photos` is ordered by `position`; each admin Photo includes its status and processing details below. Each Collection response contains `{collection_id, name, description, is_active, position, version}`. Collection creation requires `name` and `actor`; `description` is optional, position is assigned at the end, and a new Collection is active. Collection patch requires `expected_version` and `actor`; supplied `name`, `description`, `is_active`, and `position` fields are changed together. Names are trimmed and limited to 200 characters. A Collection membership is ordered within that Collection, independently of other memberships. Collection positions are consecutive and one-based; moving a Collection shifts the intervening positions and advances the versions of every Collection whose position changes. The requested destination position must be between 1 and the current Collection count.
+
+Membership `PUT` and `DELETE` require `actor`, `expected_version` for the Collection, and `expected_artwork_version` for the Artwork; both versions are checked even for a repeated add. Adding a new membership appends it and advances both versions; `PUT` on an existing membership returns the current objects without changing versions. Removing a nonexistent membership returns `404 not_found`, and removing a membership compacts the remaining positions. Artwork-order input is `{artwork_ids, expected_version, actor}`; it must contain every current member ID exactly once and no other IDs. Photo-order input is `{photo_ids, expected_version, actor}` with the same complete-list rule. Order positions are consecutive and one-based. Moving a Collection or Artwork within an order shifts intervening positions atomically. `PUT .../hero` input is `{photo_id, expected_version, actor}` and accepts only a ready Photo belonging to that Artwork. All edit, membership, ordering, hero, and lifecycle operations are atomic; a stale version returns `409 version_conflict` and changes nothing. Artwork version advances on Artwork field edits, Photo addition/removal, Photo order/hero changes, and Collection membership changes. A Photo processing/replacement state change advances only that Photo's version; publication checks the latest Photo states in its guarded transaction.
+
+Deactivating a Collection retains its Artwork memberships but hides the Collection from public reads. If a published Artwork then has no active Collection, it is omitted from the public catalog while its `publication_status` remains `published`; it becomes public again if it later belongs to an active Collection. Publishing requires a nonempty title, a valid unique slug, at least one active Collection, at least one Photo, both delivery variants ready for every Photo, and exactly one ready hero. A blocked publish returns `409 publication_incomplete` with field details identifying each unmet condition. Archive and publish actions require `{expected_version, actor}`. An Artwork with no active Collection, or any draft or archived Artwork, is never returned by a public Artwork or Collection read.
+
+### Photo upload, processing, and replacement
+
+Photo upload, retry, and replacement use `multipart/form-data` with exactly one binary `file` part and one JSON `metadata` part. For a new Photo, metadata is `{expected_version, actor}` using the current Artwork version. For retry or replacement, it is `{expected_version, actor}` using the current Photo version. `file` must be a complete JPEG, PNG, WebP, or TIFF image and no larger than 50 MiB. HP-OS determines the actual image type from the decoded content; the client filename and declared media type are not trusted. The multipart envelope may add at most 64 KiB beyond the file limit. The 64 KiB JSON-body limit for other routes does not replace the media limit.
+
+HP-OS creates no Photo and schedules no processing until the complete upload has arrived and passed source validation. A disconnected or incomplete transfer creates no Photo. Abandoned temporary upload bytes are deleted within 24 hours. A new Photo is appended to the Artwork's Photo order. An accepted complete upload returns `202 Accepted` and an admin Photo in `processing` state. HP-OS creates `grid_400` (WebP, with the longest edge up to 400 px) and `artwork_1600` (WebP, with the longest edge up to 1,600 px) delivery variants, preserving the image aspect ratio and not forcing a crop. A Photo becomes `ready` only after both are ready. The original source is retained only while its processing attempt is active and is deleted when that attempt succeeds or fails; HP-OS does not retain a private master. Exact encoder settings are implementation choices, and the operator keeps the reliable source copy outside HP-OS, as decided in [#111](https://github.com/fvckzest/HP-OS/issues/111).
+
+The admin Photo object is `{photo_id, position, status, ready_variants, failure_code, retryable, replacement, version}`. `status` is `processing`, `ready`, or `failed`. `ready_variants` is a subset of `["grid_400", "artwork_1600"]` and reports completed variants to the admin caller; a partial set is never public. `failure_code` is `delivery_variants_failed` or `null`; `retryable` is true for this recoverable failure or false when no failure exists. `replacement` is `null` or `{status, ready_variants, failure_code, retryable}` with the same failure-code rule. While a ready Photo is being replaced, its main `status` remains `ready` and its existing delivery variants remain in service; `replacement.status` is `processing` or `failed`. Once both replacement variants are ready, HP-OS swaps them together, clears `replacement`, and preserves the Photo ID, order, hero selection, and delivery references. A new Photo, replacement attempt, or retry increments the Photo version; asynchronous state changes increment it again.
+
+If an accepted initial Photo fails processing, it remains as a `failed` Photo record. Retry it by reuploading the source to the same Photo ID through `actions/retry`, with a new idempotency key and current Photo version. If replacement processing fails, the old ready variants remain public and the replacement can be reuploaded to that same Photo ID, again with a new key and current version. A Photo in `processing` or `failed` can be removed. A request whose outcome is unknown is different: resend the identical bytes and metadata with the same key to recover the original result; do not create a new key. These duplicate-safe rules and the 24-hour temporary cleanup are settled in [#115](https://github.com/fvckzest/HP-OS/issues/115).
+
+An unsupported actual image format or unsupported request encoding returns `415 unsupported_media_type`; a corrupt or undecodable image in an accepted format returns `422 image_invalid`, without creating a Photo. A missing/extra multipart part or invalid metadata returns `422 validation_failed`. A file or request over its limit returns `413 request_too_large`. The Photo upload returns `202` after complete acceptance, not after image processing. Clients re-read the Photo list or Artwork detail to observe completion. `GET /v1/public/media/{photo_id}/variants/{variant}` requires the Site key and serves only a currently public Photo's complete variant. It returns the WebP bytes with `Content-Type: image/webp`, `Cache-Control: no-store`, and an `X-Request-Id`; it returns `404 not_found` for an unavailable Photo, unpublished Artwork, inactive-only membership, or incomplete variant. The corresponding `image_refs` in public JSON are stable API-relative paths to this route. The Site backend resolves them and serves images through its own public site; it never sends the Site key to a browser. A successful replacement changes both byte responses together without changing their references.
+
+Only one processing or replacement attempt may be active for a Photo. Retrying a Photo that is not `failed`, replacing a Photo that is not `ready`, or starting another replacement while one is processing returns `409 invalid_state`. An invalid/foreign identifier in any path, including the `collection_id` list filter, returns `404 not_found`; a public read of an inactive Collection returns `404` as well. These failures disclose no other Site's data.
+
+Removing a Photo compacts the remaining Photo positions to consecutive one-based values. Removing a Photo from a published Artwork must leave at least one ready Photo and one ready hero. Removing the current hero requires `replacement_hero_photo_id` naming another ready Photo in the same DELETE body; this change and removal are one atomic operation. Removing any other Photo must not remove the last ready Photo. Drafts may have no hero or Photos. `PUT .../hero` always requires a ready Photo. Incomplete new Photos are excluded from public responses; an already-published Artwork continues to serve its other ready Photos while another Photo processes or fails.
+
+A Photo removal that would leave a published Artwork without a ready Photo and exactly one ready hero returns `409 publication_incomplete` and makes no change. Omitting `replacement_hero_photo_id` when removing the hero has the same result. A replacement ID that is missing or belongs to another Site returns `404 not_found`; one that is not a different ready Photo on this Artwork returns `422 validation_failed` with a field detail. `replacement_hero_photo_id` is invalid when the removed Photo is not the current hero.
+
+### Portfolio visibility and public projection
+
+Public Artwork list/detail and Collection Artwork-list responses include only published Artworks that belong to at least one active Collection. An active Collection's public Artwork list is ordered by its membership positions; the unfiltered Artwork list is ordered by `artwork_id`. Admin Artwork lists are ordered by `updated_at` descending and then `artwork_id`; admin Collection lists use `position` ascending. `AdminArtwork.collection_ids` and `PublicArtwork.collections` are ordered by Collection `position`. All lists use the standard signed cursor and `limit` (default 50, maximum 100); repeat the same filters and limit with the returned cursor. Unknown filters and invalid cursors return `422` errors. The `collection_id` public filter returns only eligible members of that active Collection. A Collection read returns metadata; its `/artworks` child route returns the ordered list.
+
+`PublicArtwork` is `{artwork_id, slug, displayed_artwork_id, title, description, medium, dimensions, created_on, cardano_chain, cardano_policy_id, cardano_asset_id, original_status, collections, photos, hero_photo_id}`. `collections` contains only active memberships, each `{collection_id, name, position}`. `photos` contains only ready Photos, ordered by `position`, each `{photo_id, position, is_hero, image_refs: {grid_400, artwork_1600}}`; each image ref is the stable relative API path described above. `hero_photo_id` identifies the one ready hero. A `PublicCollection` is `{collection_id, name, position}`; its ordered Artworks are returned as a paginated `PublicArtwork[]` from `/v1/public/collections/{collection_id}/artworks`. Public responses never include processing state, failure details, version, actor/audit data, internal database identifiers, source images, credentials, print data, or sales data. `original_status: "sold"` remains visible and does not imply print or edition availability. These projections follow [#113](https://github.com/fvckzest/HP-OS/issues/113) and [#114](https://github.com/fvckzest/HP-OS/issues/114).
+
+### Portfolio examples
+
+Create an Artwork with the common JSON envelope:
+
+```http
+POST /v1/admin/artworks
+Authorization: Bearer <site_api_key>
+Idempotency-Key: 123e4567-e89b-42d3-a456-426614174000
+Content-Type: application/json
+
+{"title":"Blue Study","displayed_artwork_id":"X-0073","slug":"blue-study","actor":{"type":"user","reference":"user:42"}}
+```
+
+An image upload sends one file and one JSON metadata part:
+
+```http
+POST /v1/admin/artworks/art_example_1/photos
+Authorization: Bearer <site_api_key>
+Idempotency-Key: 123e4567-e89b-42d3-a456-426614174001
+Content-Type: multipart/form-data; boundary=hp-os-upload-01
+
+--hp-os-upload-01
+Content-Disposition: form-data; name="file"; filename="blue-study.tif"
+Content-Type: image/tiff
+
+<complete image bytes>
+--hp-os-upload-01
+Content-Disposition: form-data; name="metadata"; filename="metadata.json"
+Content-Type: application/json
+
+{"expected_version":1,"actor":{"type":"user","reference":"user:42"}}
+--hp-os-upload-01--
+```
+
+HP-OS checks the decoded file bytes; the filename and declared file media type are not trusted.
+
+If the response is lost, retry the same route with the same key and same JSON. For a file upload, its idempotency fingerprint includes the HTTP method, route, canonical JSON metadata, and SHA-256 of the complete file bytes; the client filename is not included. A replay must have identical bytes and metadata. A same-key call still running returns `409 request_in_progress` with `Retry-After`; changed content or metadata with that key returns `409 idempotency_conflict`. Replays return the stored result for seven days after completion; after that the key remains remembered and returns `409 idempotency_expired`, so the caller must read the current Photo before starting a new operation. A failed post-acceptance processing attempt is retried against its existing `photo_id` with a new key.
+
+An incomplete publish returns a normal error envelope and changes nothing:
+
+```json
+{"error":{"code":"publication_incomplete","message":"The Artwork does not meet the publication requirements.","details":[{"field":"photos","code":"delivery_not_ready","message":"Every Photo must have both delivery variants ready."},{"field":"hero_photo_id","code":"hero_required","message":"Select exactly one ready hero Photo."}]},"request_id":"<request-id>"}
+```
+
+The successful create response uses `201 Created` and the same JSON envelope:
+
+```json
+{"data":{"artwork_id":"art_example_1","slug":"blue-study","displayed_artwork_id":"X-0073","title":"Blue Study","description":null,"medium":null,"dimensions":null,"created_on":null,"cardano_chain":null,"cardano_policy_id":null,"cardano_asset_id":null,"original_status":"available","publication_status":"draft","collection_ids":[],"photos":[],"hero_photo_id":null,"version":1},"request_id":"<request-id>"}
+```
+
+An accepted upload returns `202 Accepted` before processing finishes:
+
+```json
+{"data":{"photo":{"photo_id":"photo_example_1","position":1,"status":"processing","ready_variants":[],"failure_code":null,"retryable":false,"replacement":null,"version":1},"artwork_version":2},"request_id":"<request-id>"}
+```
+
+After an accepted attempt fails, the Site reads the same Photo with `status: "failed"`, `failure_code: "delivery_variants_failed"`, and `retryable: true`, then posts a new multipart upload to that same Photo ID with a new idempotency key. If that retry's HTTP response is lost, the Site replays that retry's exact bytes and metadata with its original key.
+
+A Site-scoped identifier that is absent or belongs to another Site returns the same non-disclosing response:
+
+```json
+{"error":{"code":"not_found","message":"The requested record was not found.","details":[]},"request_id":"<request-id>"}
+```
+
+The transition policy in [#112](https://github.com/fvckzest/HP-OS/issues/112) remains separate: there is no automatic catalog import or synchronization, current ZEST pages keep serving the existing catalog, and the operator manually enters works after the tool is built. Existing 2,600 px images remain available on ZEST through transition/rollback, and current image URLs stay available through that period. This contract authorizes no cutover or deletion.
+
+The API reference lists every portfolio route, request field, response shape, and status alongside the existing `/v1` contract. The API decisions needed by a Site client are settled here; these implementation questions remain open for the later implementation issue: Which object-storage service will hold delivery variants? Which encoder settings will preserve detail and color within the agreed sizes? Which worker mechanism will produce variants and remove abandoned bytes? Which deployment hostname will serve the `/v1` API? Those choices must satisfy this contract but do not change its caller-visible routes or payloads.
+
 ## Safe retries
 
 Requests that create records or perform actions use a unique idempotency key supplied by the Site backend. Keys share one namespace per Site across write routes, including Event and notification operations. Within the replay period defined below, retrying the same operation with the same key and request details reuses the original operation and returns its original result without repeating its effects. Definitive 4xx domain outcomes also replay, so retrying a rejected publish or stale edit returns the same result. For example, retrying checkout creation returns the existing Order and Reservation rather than creating another pair. Reusing the key with different request details returns an error. This prevents duplicate actions when HP-OS completes a request but its response does not reach the Site, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10) and implemented across Site writes in [ticket #26](https://github.com/fvckzest/HP-OS/issues/26).

@@ -1,6 +1,6 @@
 # HP-OS API reference
 
-Compact lookup sheet for the `/v1` API contract. The [full contract](api.md) defines validation, ordering, and recovery rules and identifies which portions have local implementation evidence; local evidence does not prove hosted operation. Contract decisions: [issue #10](https://github.com/fvckzest/HP-OS/issues/10).
+Compact lookup sheet for the `/v1` API contract. The [full contract](api.md) defines validation, ordering, and recovery rules and identifies which portions have local implementation evidence; local evidence does not prove hosted operation. Contract decisions: [issue #10](https://github.com/fvckzest/HP-OS/issues/10) and the portfolio API contract in [issue #117](https://github.com/fvckzest/HP-OS/issues/117).
 
 ## Contents
 
@@ -69,8 +69,8 @@ Shape: `https://<host>/v1/<namespace>/<resource>/<identifier>?<query>`; deployme
 | `GET` | Read a record or list; no state change. |
 | `POST` | Create, perform an action, or submit a report; manual lookup is a read-only exception. |
 | `PATCH` | Edit supplied fields; omitted fields stay unchanged. |
-| `PUT` | Register or replace a provider mapping. |
-| `DELETE` | Remove a provider mapping; this contract includes a JSON body. |
+| `PUT` | Register or replace a provider mapping, Collection membership, or ordered list. |
+| `DELETE` | Remove a provider mapping, portfolio Photo, or Collection membership; guarded writes include JSON fields in the body. |
 
 ## Endpoints
 
@@ -86,6 +86,12 @@ Paths are relative to the base URL. `{...}` identifies a path parameter. All end
 | `GET /v1/public/tickets/{ticket_token}` | Read one independently shareable Ticket. |
 | `GET /v1/public/access-requests/{access_request_token}` | Read approved attendee and checkout eligibility. |
 | `GET /v1/public/tickets/{ticket_token}/apple-wallet-data` | Read unsigned data for a buyer Wallet pass. |
+| `GET /v1/public/artworks` | List published Artworks in active Collections; optional `collection_id`, `limit`, and `cursor`. |
+| `GET /v1/public/artworks/{artwork_id}` | Read one eligible public Artwork by stable API ID. |
+| `GET /v1/public/collections` | List active Collections in display order. |
+| `GET /v1/public/collections/{collection_id}` | Read active Collection metadata. |
+| `GET /v1/public/collections/{collection_id}/artworks` | List eligible Artworks in Collection order. |
+| `GET /v1/public/media/{photo_id}/variants/{variant}` | Read public `grid_400` or `artwork_1600` WebP bytes; Site key required. |
 
 ### Public submissions
 
@@ -107,6 +113,31 @@ Paths are relative to the base URL. `{...}` identifies a path parameter. All end
 | `POST /v1/admin/events/{event_id}/actions/{action}` | Publish, archive, cancel, stop sales, or resume sales using a guarded action. |
 | `PUT /v1/admin/events/{event_id}/provider-mappings/{connection_id}` | Set a verified provider resource mapping. |
 | `DELETE /v1/admin/events/{event_id}/provider-mappings/{connection_id}` | Remove a mapping for future Orders. |
+
+### Admin portfolio operations
+
+| Endpoint | Meaning |
+| --- | --- |
+| `GET /v1/admin/artworks` | List Artworks; optional `publication_status`, `original_status`, `collection_id`, `limit`, `cursor`. |
+| `POST /v1/admin/artworks` | Create a draft Artwork. |
+| `GET /v1/admin/artworks/{artwork_id}` | Read Artwork, ordered Photos, and Collection memberships. |
+| `PATCH /v1/admin/artworks/{artwork_id}` | Edit supplied Artwork fields. |
+| `POST /v1/admin/artworks/{artwork_id}/actions/{action}` | `publish` or `archive`. |
+| `GET /v1/admin/artworks/{artwork_id}/photos` | List Photos, including processing and replacement states. |
+| `POST /v1/admin/artworks/{artwork_id}/photos` | Upload one new Photo (`multipart/form-data`). |
+| `POST /v1/admin/artworks/{artwork_id}/photos/{photo_id}/actions/retry` | Reupload source to retry failed initial processing on the same Photo. |
+| `POST /v1/admin/artworks/{artwork_id}/photos/{photo_id}/replacement` | Replace bytes for the same Photo ID. |
+| `DELETE /v1/admin/artworks/{artwork_id}/photos/{photo_id}` | Remove a Photo; a published hero removal requires a replacement hero in the request. |
+| `PUT /v1/admin/artworks/{artwork_id}/photo-order` | Replace the full Photo order. |
+| `PUT /v1/admin/artworks/{artwork_id}/hero` | Select one ready Photo as hero. |
+| `GET /v1/admin/collections` | List active and inactive Collections. |
+| `POST /v1/admin/collections` | Create a Collection at the end of the order. |
+| `GET /v1/admin/collections/{collection_id}` | Read a Collection. |
+| `PATCH /v1/admin/collections/{collection_id}` | Edit name, description, active state, or display position. |
+| `GET /v1/admin/collections/{collection_id}/artworks` | List Artwork memberships in order. |
+| `PUT /v1/admin/collections/{collection_id}/artworks/{artwork_id}` | Add a membership at the end; existing membership is unchanged. |
+| `DELETE /v1/admin/collections/{collection_id}/artworks/{artwork_id}` | Remove a membership. |
+| `PUT /v1/admin/collections/{collection_id}/artwork-order` | Replace the full Artwork order in a Collection. |
 
 ### Admin Orders, Tickets, and entry
 
@@ -171,6 +202,8 @@ Claims and reports require a Site API key, a UUID `Idempotency-Key`, and a syste
 | Event | `cancel` | Stop new Orders and Admission, retain uncertain payment holds, and queue paid-buyer notices; does not refund. |
 | Event | `stop_sales` | Pause new checkout for an eligible published Event. |
 | Event | `resume_sales` | Resume a paused Event when its window and capacity permit sales. |
+| Artwork | `publish` | Publish a valid draft or republish an archived Artwork. |
+| Artwork | `archive` | Hide a published Artwork while retaining its data and relationships. |
 | Order | `retry_ticket_issuance` | Retry the complete Ticket set for verified payment. |
 | Order | `resend_ticket_email` | Queue another email for existing Tickets. |
 | Order | `correct_delivery_email` | Replace buyer page links and resend to a verified address. |
@@ -195,6 +228,10 @@ The local Event handler supports `publish`, `archive`, `cancel`, `stop_sales`, a
 | `connection_id` | Payment connection ID. |
 | `job_id` | Notification job ID. |
 | `claim_id` | Notification lease/claim ID. |
+| `artwork_id` | Opaque Site-scoped Artwork API ID; not the displayed Artwork ID or a database ID. |
+| `collection_id` | Opaque Site-scoped Collection API ID. |
+| `photo_id` | Opaque Site-scoped Photo API ID. |
+| `variant` | Delivery variant: `grid_400` or `artwork_1600`. |
 | `action` | Supported action name for the resource. |
 | `order_token` | Normal or temporary recovery access to a whole Order. |
 | `ticket_token` | Access to one Ticket page. |
@@ -211,6 +248,9 @@ The local Event handler supports `publish`, `archive`, `cancel`, `stop_sales`, a
 | `visibility` | Admin Events | public or private. |
 | `is_archived` | Admin Events | Archive flag; defaults false. |
 | `is_canceled` | Admin Events | Cancellation flag. |
+| `publication_status` | Admin Artworks | `draft`, `published`, or `archived`. |
+| `original_status` | Artworks | `available` or `sold`; independent from publication state. |
+| `collection_id` | Artwork list filters | Restrict results to one Site-scoped Collection. |
 | `payment_status` | Orders | Filter payment state. |
 | `issuance_status` | Orders | Filter Ticket issuance state. |
 | `delivery_status` | Orders | Filter ticket-email state. |
@@ -226,7 +266,7 @@ The local Event handler supports `publish`, `archive`, `cancel`, `stop_sales`, a
 | `order_id` | Jobs | Restrict to one Order. |
 | `requires_verification` | Attempts/jobs | Select unresolved provider outcomes. |
 
-Event list endpoints reject unknown or invalid parameters with `422 validation_failed`. Their cursors are signed using the current Site API key and bound to the Site, endpoint, filters, ordering, and page size; they remain valid for one hour. After rotating the Site API key, start pagination again. Invalid, expired, or mismatched Event cursors return `422 invalid_cursor`.
+Event and portfolio list endpoints reject unknown or invalid parameters with `422 validation_failed`. Their cursors are signed using the current Site API key and bound to the Site, endpoint, filters, ordering, and page size; they remain valid for one hour. After rotating the Site API key, start pagination again. Invalid, expired, or mismatched cursors return `422 invalid_cursor`.
 
 ## Headers
 
@@ -235,10 +275,11 @@ Event list endpoints reject unknown or invalid parameters with `422 validation_f
 | Header | Direction | Meaning |
 | --- | --- | --- |
 | `Authorization` | Request | Bearer <site_api_key>; backend-only Site authentication. |
-| `Content-Type` | Both | application/json for JSON bodies. |
+| `Content-Type` | Request | `application/json`, or `multipart/form-data` for a portfolio upload with one `file` and one JSON `metadata` part. |
 | `Idempotency-Key` | Write request | UUID for one intentional operation; reuse unchanged on retry. |
 | `Retry-After` | Response | Seconds to wait for 429, temporary 503, or request_in_progress. |
-| `Cache-Control` | Response | no-store for buyer access and operational reads. |
+| `Cache-Control` | Response | no-store for buyer access, operational reads, and Site-authenticated portfolio projections/media. |
+| `X-Request-Id` | Response | HTTP tracing ID for raw WebP media responses, which do not use a JSON envelope. |
 
 ## HTTP statuses
 
@@ -246,15 +287,15 @@ Event list endpoints reject unknown or invalid parameters with `422 validation_f
 
 | Status | Meaning |
 | --- | --- |
-| `200 OK` | Read/edit/action completed; repeated source report accepted. |
-| `201 Created` | New record, Admission, or newly recorded domain report. |
-| `202 Accepted` | Recovery, issuance retry, or resend work accepted. |
+| `200 OK` | Read/edit/action completed; portfolio mutation/removal completed; repeated source report accepted; public media read returns WebP bytes. |
+| `201 Created` | New record, Admission, or newly recorded domain report; portfolio Artwork/Collection creation. |
+| `202 Accepted` | Recovery, issuance retry, resend, or portfolio Photo upload/retry/replacement accepted for processing. |
 | `400 Bad Request` | Unreadable JSON or malformed request. |
 | `401 Unauthorized` | Missing, invalid, or revoked Site key. |
 | `404 Not Found` | Record/token unavailable within the authenticated Site. |
 | `409 Conflict` | Business-state, version, idempotency, or provider-evidence conflict. |
-| `413 Content Too Large` | JSON body exceeds 64 KiB. |
-| `415 Unsupported Media Type` | Body format is not supported JSON. |
+| `413 Content Too Large` | JSON body exceeds 64 KiB or portfolio upload exceeds its size limit. |
+| `415 Unsupported Media Type` | Request encoding or uploaded image format is unsupported. |
 | `422 Unprocessable Content` | Readable request with invalid fields/filter/cursor. |
 | `429 Too Many Requests` | Site request budget exceeded. |
 | `500 Internal Server Error` | Unexpected HP-OS failure. |
@@ -273,8 +314,8 @@ Use `error.code` for program logic; use `error.message` for explanation. Retry n
 | `unauthorized` | Site key rejected. |
 | `not_found` | Record/token unavailable; does not disclose other Sites. |
 | `invalid_cursor` | Expired, invalid, or mismatched pagination cursor. |
-| `request_too_large` | Body size exceeded. |
-| `unsupported_media_type` | Unsupported body format. |
+| `request_too_large` | JSON body exceeds 64 KiB or portfolio image/multipart body exceeds its limit. |
+| `unsupported_media_type` | Unsupported request encoding or an uploaded format other than JPEG, PNG, WebP, or TIFF. |
 | `rate_limited` | Request budget exceeded. |
 | `internal_error` | Unexpected server failure. |
 | `service_unavailable` | Temporary service failure. |
@@ -315,6 +356,9 @@ Use `error.code` for program logic; use `error.message` for explanation. Retry n
 | `check_in_not_open` | Before the check-in opening instant. |
 | `check_in_closed` | After the Event end instant. |
 | `ticket_event_mismatch` | Ticket belongs to a different Event on this Site. |
+| `publication_incomplete` | Artwork lacks an active Collection, complete ready Photo variants, or exactly one ready hero. |
+| `slug_conflict` | Artwork slug is already assigned within the Site. |
+| `image_invalid` | An accepted-format image is corrupt or cannot be decoded. |
 
 ## Lifetimes and limits
 
@@ -335,6 +379,8 @@ Use `error.code` for program logic; use `error.message` for explanation. Retry n
 | Private quantity | Exactly 1 Ticket per Order. |
 | List/claim size | Default 50; maximum 100. |
 | JSON body | Maximum 64 KiB. |
+| Portfolio image | One JPEG, PNG, WebP, or TIFF file up to 50 MiB; multipart metadata/envelope may add at most 64 KiB. |
+| Temporary upload bytes | Abandoned incomplete bytes are removed within 24 hours; accepted source is deleted after its processing attempt. |
 | Site request budget | Default 1,200/minute across keys; operator configurable. |
 | Recovery emails | Coalesced to 1/minute and 5/hour per Site/email; generic response. |
 | Request retry | Up to 5 retries with 1/2/4/8/16-second delays plus jitter; honor Retry-After. |
@@ -422,6 +468,51 @@ Text limits: name/title 200 characters; description 20,000; venue address 1,000;
 | `updated_at` | timestamp; admin | Latest update instant. |
 | `sales_paused` | boolean; admin | Manual stop flag. |
 | `check_in_uses_event_start` | boolean; admin | Opening follows Event start rather than an explicit time. |
+
+### Artwork, Collection, and Photo
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `artwork_id` | string | Stable opaque Site-scoped HP-OS API ID; distinct from displayed ID and database IDs. |
+| `slug` | string? | Site-facing Artwork reference; required before publication and unique within the Site. |
+| `displayed_artwork_id` | string | Operator-visible Artwork identifier such as `X-0073`; independent from `artwork_id`. |
+| `title` | string | Required Artwork title; maximum 200 characters. |
+| `description` | string? | Optional plain text; maximum 20,000 characters. |
+| `medium` | string? | Optional medium; maximum 200 characters. |
+| `dimensions` | object? | `{width, height, unit}`; positive values, unit `mm`, `cm`, or `in`. |
+| `created_on` | date? | Artwork creation date in `YYYY-MM-DD`. |
+| `cardano_chain` | string? | Optional Cardano chain metadata; not verified by HP-OS. |
+| `cardano_policy_id` | string? | Optional Cardano policy identifier. |
+| `cardano_asset_id` | string? | Optional Cardano asset identifier. |
+| `publication_status` | enum | `draft`, `published`, or `archived`; independent from sold status. |
+| `original_status` | enum | `available` or `sold`; original-piece status, not print availability. |
+| `collection_ids` | string[]; admin | This Artwork's Collection memberships. |
+| `hero_photo_id` | string? | The one selected ready Photo, or null for an unpublished incomplete draft. |
+| `AdminArtwork.photos` | `AdminPhoto[]` | All Photos in one-based order, including incomplete states. |
+| `AdminArtwork.version` | integer | Guarded version for Artwork edits and actions. |
+| `AdminArtwork` | object | `{artwork_id, slug, displayed_artwork_id, title, description, medium, dimensions, created_on, cardano_chain, cardano_policy_id, cardano_asset_id, original_status, publication_status, collection_ids, photos, hero_photo_id, version}`. |
+| `collection_id` | string | Stable opaque Site-scoped Collection API ID. |
+| `Collection.name` | string | Required trimmed name; maximum 200 characters. |
+| `Collection.description` | string? | Optional Collection description. |
+| `Collection.is_active` | boolean | Inactive Collections retain memberships but are hidden publicly. |
+| `Collection.position` | integer | One-based display position; artwork positions are independent per Collection. |
+| `Collection.version` | integer | Guarded version for Collection fields and membership order. |
+| `AdminCollection` | object | `{collection_id, name, description, is_active, position, version}`. |
+| `photo_id` | string | Stable opaque Site-scoped Photo API ID. |
+| `Photo.position` | integer | One-based order within the Artwork. |
+| `Photo.version` | integer | Guarded version for retry and replacement attempts. |
+| `AdminPhoto` | object | `{photo_id, position, status, ready_variants, failure_code, retryable, replacement, version}`. |
+| `AcceptedPhoto` | object | `{photo: AdminPhoto, artwork_version}` returned by upload, retry, and replacement. |
+| `Photo.status` | enum | `processing`, `ready`, or `failed`; ready requires both variants. |
+| `Photo.ready_variants` | string[] | Subset of `grid_400`, `artwork_1600`; admin status only. Public variants are WebP with longest edge up to 400 or 1,600 px and preserved aspect ratio. |
+| `Photo.failure_code` | string? | `delivery_variants_failed` or null. |
+| `Photo.retryable` | boolean | Whether an accepted failed attempt can be retried from the source copy. |
+| `Photo.replacement` | object? | `{status, ready_variants, failure_code, retryable}` for an active or failed replacement; null otherwise. |
+| `Photo.image_refs` | object; public | Stable `{grid_400, artwork_1600}` API-relative paths to public WebP variants. |
+| `expected_artwork_version` | integer; membership input | Artwork version required with the Collection `expected_version`. |
+| `CollectionArtwork` | object; admin list row | `{position, artwork: AdminArtwork}` for one membership in its Collection order. |
+| `PublicArtwork` | object | `{artwork_id, slug, displayed_artwork_id, title, description, medium, dimensions, created_on, cardano_chain, cardano_policy_id, cardano_asset_id, original_status, collections, photos, hero_photo_id}`; no version or operational state. |
+| `PublicCollection` | object | `{collection_id, name, position}`; its ordered public Artworks come from `/collections/{collection_id}/artworks`. |
 
 ### Ticket offering and provider mapping
 
@@ -778,12 +869,35 @@ Audit history retains actor, operation, timestamp, prior/new versions, and non-s
 
 ## Request and response bodies
 
-Each row lists operation-specific body fields/result data. Apply common headers and admin `actor` separately. `expected_version` is required for guarded edits/actions; creation, provider reports, claims, and Admission do not generally use it.
+Each row lists operation-specific body fields/result data. Apply common headers and admin `actor` separately. `expected_version` is required for guarded edits/actions; portfolio Photo creation also requires the current Artwork version, while provider reports, claims, and Admission do not generally use it.
 
 
 
 | Operation | JSON input | Result inside data |
 | --- | --- | --- |
+| List admin Artworks | Optional `publication_status, original_status, collection_id, limit, cursor` | `Paginated AdminArtwork[]; 200` |
+| Create Artwork | `title, displayed_artwork_id, optional slug/description/medium/dimensions/created_on/Cardano IDs, actor` | `AdminArtwork; 201; draft, available, empty memberships/photos` |
+| Edit Artwork | `Changed Artwork fields, original_status, expected_version, actor` | `AdminArtwork; 200` |
+| Artwork action | `expected_version, actor` | `AdminArtwork; 200; publish or archive` |
+| Read admin Artwork | No body | `AdminArtwork; 200` |
+| List admin Photos | Optional `limit, cursor` | `Paginated AdminPhoto[]; 200` |
+| Create Collection | `name, optional description, actor` | `AdminCollection; 201; active and appended` |
+| Edit Collection | `Changed name/description/is_active/position, expected_version, actor` | `AdminCollection; 200` |
+| Add/remove membership | `expected_version (Collection), expected_artwork_version, actor` | `{collection: AdminCollection, artwork: AdminArtwork}; 200` |
+| List admin Collection Artworks | `limit, cursor` | `Paginated CollectionArtwork[]; 200` |
+| Reorder Collection Artworks | `artwork_ids (complete unique membership list), expected_version, actor` | `AdminCollection; 200` |
+| Reorder Artwork Photos | `photo_ids (complete unique Photo list), expected_version, actor` | `AdminArtwork; 200` |
+| Select hero | `photo_id, expected_version, actor` | `AdminArtwork; 200; selected Photo must be ready` |
+| Remove Photo | `expected_version, actor, optional replacement_hero_photo_id` | `AdminArtwork; 200; published Artwork keeps one ready Photo and hero` |
+| Upload Photo | `multipart: file + metadata {expected_version (Artwork), actor}` | `AcceptedPhoto; 202; processing; returns new Artwork version` |
+| Retry Photo | `multipart: file + metadata {expected_version (Photo), actor}` | `AcceptedPhoto; 202; same Photo ID, processing` |
+| Replace Photo | `multipart: file + metadata {expected_version (Photo), actor}` | `AcceptedPhoto; 202; old variants remain until both new variants are ready` |
+| List public Artworks | Optional `collection_id, limit, cursor` | `Paginated PublicArtwork[]; 200` |
+| Read public Artwork | No body | `PublicArtwork; 200` |
+| List public Collections | Optional `limit, cursor` | `Paginated PublicCollection[]; 200` |
+| Read public Collection | No body | `PublicCollection; 200` |
+| List Collection Artworks | Optional `limit, cursor` | `Paginated PublicArtwork[]; 200; membership order` |
+| Read public image variant | `variant` path is `grid_400` or `artwork_1600` | `image/webp bytes; 200; Site key required` |
 | Create draft | `Event/offering fields; may all be omitted` | `AdminEvent; 201` |
 | Edit Event | `Changed Event/offering fields + expected_version` | `AdminEvent; 200` |
 | Event action | `expected_version` | `AdminEvent; 200` |
