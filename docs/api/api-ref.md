@@ -279,7 +279,7 @@ Event and portfolio list endpoints reject unknown or invalid parameters with `42
 | `Idempotency-Key` | Write request | UUID for one intentional operation; reuse unchanged on retry. |
 | `Retry-After` | Response | Seconds to wait for 429, temporary 503, or request_in_progress. |
 | `Cache-Control` | Response | no-store for buyer access, operational reads, and Site-authenticated portfolio projections/media. |
-| `X-Request-Id` | Response | HTTP tracing ID for raw WebP media responses, which do not use a JSON envelope. |
+| `X-Request-Id` | Response | HTTP tracing ID. For JSON, it repeats the body `request_id`; raw WebP media responses use this header because they have no JSON envelope. |
 
 ## HTTP statuses
 
@@ -298,12 +298,12 @@ Event and portfolio list endpoints reject unknown or invalid parameters with `42
 | `415 Unsupported Media Type` | Request encoding or uploaded image format is unsupported. |
 | `422 Unprocessable Content` | Readable request with invalid fields/filter/cursor. |
 | `429 Too Many Requests` | Site request budget exceeded. |
-| `500 Internal Server Error` | Unexpected HP-OS failure. |
-| `503 Service Unavailable` | Temporary dependency/configuration failure. |
+| `500 Internal Server Error` | Unexpected HP-OS application failure; inspect the matching `request_id` and do not retry automatically. |
+| `503 Service Unavailable` | Temporary dependency/configuration failure; honor `Retry-After` and reuse the original idempotency key. |
 
 ## Error codes
 
-Use `error.code` for program logic; use `error.message` for explanation. Retry network errors, 429, 500, 503, and the specific `request_in_progress` conflict with the same write key.
+Use `error.code` for program logic; use `error.message` for explanation. Retry network errors, 429, 503, and the specific `request_in_progress` conflict with the same write key. Investigate `500 internal_error` with its request ID before choosing whether to repeat an operation.
 
 
 

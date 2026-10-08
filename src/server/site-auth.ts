@@ -46,8 +46,8 @@ export async function authenticateSiteRequest(request: Request): Promise<SiteAut
       };
     }
     return { site: { siteId: row.site_id, cursorSigningKey: calculatedHash }, error: null };
-  } catch {
-    return { site: null, error: apiFailure(503, "service_unavailable", "Site authentication is temporarily unavailable.", { retryAfter: 1 }) };
+  } catch (error) {
+    throw error;
   }
 }
 
