@@ -19,6 +19,7 @@
     "verify:local": "node scripts/verify-local.mjs",
     "verify:notifications": "node scripts/verify-notifications.mjs",
     "verify:events": "node scripts/verify-events.mjs",
+    "benchmark:events": "node scripts/benchmark-event-fanout.mjs",
     "verify:recovery": "node scripts/verify-recovery.mjs",
     "verify:private-access": "node scripts/verify-private-access.mjs",
     "verify:historical-connections": "node scripts/verify-historical-connections.mjs",
