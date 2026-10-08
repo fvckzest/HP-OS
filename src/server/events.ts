@@ -4,7 +4,7 @@ import { apiFailure, apiSuccess } from "./api-response";
 import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
-import { enqueueNotificationJob, supersedeUnsentNotificationJobs } from "./notifications";
+import { enqueueEventNotificationJobs, supersedeUnsentNotificationJobs } from "./notifications";
 import type { EventNotificationDetails } from "./notifications";
 import type { AuthenticatedSite } from "./site-auth";
 import { enqueueWalletUpdateJobsForEvent } from "./wallet-data";
@@ -551,26 +551,7 @@ async function enqueueEventChangeNotifications(
   if (changedFields.length === 0) return;
   await supersedeUnsentNotificationJobs(client, { siteId, eventId: event.id, kinds: ["event_changed"] });
   const details = eventNotificationDetails(event, changedFields);
-  const orders = await client.query<{ id: string; order_reference: string; delivery_email: string }>(
-    `select id, order_reference, delivery_email
-     from hpos.orders
-     where site_id = $1 and event_id = $2 and payment_status = 'paid'
-     order by created_at, id`,
-    [siteId, event.id],
-  );
-  for (const order of orders.rows) {
-    await enqueueNotificationJob(client, {
-      siteId,
-      kind: "event_changed",
-      eventId: event.id,
-      orderId: order.id,
-      payload: {
-        recipient_email: order.delivery_email,
-        order: { order_id: order.id, order_reference: order.order_reference },
-        event: details,
-      },
-    });
-  }
+  await enqueueEventNotificationJobs(client, { siteId, eventId: event.id, kind: "event_changed", event: details });
 }
 
 async function terminateCanceledEventCheckouts(client: PoolClient, siteId: string, eventId: string): Promise<void> {
@@ -671,27 +652,13 @@ async function enqueueEventCancellationNotifications(
     time_zone: fullDetails.time_zone,
     venue: fullDetails.venue,
   };
-  const orders = await client.query<{ id: string; order_reference: string; delivery_email: string }>(
-    `select id, order_reference, delivery_email
-     from hpos.orders
-     where site_id = $1 and event_id = $2 and payment_status = 'paid'
-     order by created_at, id`,
-    [siteId, event.id],
-  );
-  for (const order of orders.rows) {
-    await enqueueNotificationJob(client, {
-      siteId,
-      kind: "event_canceled",
-      eventId: event.id,
-      orderId: order.id,
-      payload: {
-        recipient_email: order.delivery_email,
-        order: { order_id: order.id, order_reference: order.order_reference },
-        event: details,
-        canceled_at: canceledAt.toISOString(),
-      },
-    });
-  }
+  await enqueueEventNotificationJobs(client, {
+    siteId,
+    eventId: event.id,
+    kind: "event_canceled",
+    event: details,
+    canceledAt: canceledAt.toISOString(),
+  });
 }
 
 async function createDraft(client: PoolClient, site: AuthenticatedSite, input: EventInput): Promise<{ status: number; data: unknown }> {

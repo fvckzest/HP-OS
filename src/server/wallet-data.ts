@@ -9,6 +9,61 @@ import type { AuthenticatedSite } from "./site-auth";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,128}$/;
 
+function walletTimestampSql(value: string, offset: string): string {
+  const minutes = `coalesce(${offset}, 0)`;
+  const utc = `timezone('UTC', ${value})`;
+  return `(case when ${value} is null then null else
+    regexp_replace(to_char(${utc} + make_interval(mins => ${minutes}), 'YYYY-MM-DD"T"HH24:MI:SS.MS'), '\\.000$', '')
+    || case when ${minutes} = 0 then 'Z'
+       when ${minutes} > 0 then '+' || lpad((floor(${minutes} / 60))::text, 2, '0') || ':' || lpad((${minutes} % 60)::text, 2, '0')
+       else '-' || lpad((floor(abs(${minutes}) / 60))::text, 2, '0') || ':' || lpad((abs(${minutes}) % 60)::text, 2, '0')
+       end end)`;
+}
+
+/**
+ * This is the SQL equivalent of dataVersion(walletData(row)). Keeping the
+ * digest calculation in the INSERT ... SELECT lets Event fan-out process
+ * large Ticket sets without materialising every Wallet payload in Node.js.
+ */
+function walletDataVersionSql(): string {
+  const eventStarts = walletTimestampSql("event_row.starts_at", "event_row.starts_at_offset_minutes");
+  const eventEnds = walletTimestampSql("event_row.ends_at", "event_row.ends_at_offset_minutes");
+  const checkIn = walletTimestampSql(
+    "coalesce(event_row.check_in_opens_at, event_row.starts_at)",
+    "coalesce(event_row.check_in_opens_offset_minutes, event_row.starts_at_offset_minutes)",
+  );
+  const scalar = (expression: string): string => `coalesce(to_json(${expression})::text, 'null')`;
+  // json_build_object(... )::text inserts spaces around punctuation. Build the
+  // small, fixed object explicitly so the bytes match JSON.stringify exactly;
+  // each scalar is still escaped by PostgreSQL's JSON encoder.
+  const json = `(
+    '{"ticket_id":' || ${scalar("ticket.id")} ||
+    ',"event":{"event_id":' || ${scalar("event_row.id")} ||
+    ',"title":' || ${scalar("event_row.title")} ||
+    ',"description":' || ${scalar("event_row.description")} ||
+    ',"venue":{"name":' || ${scalar("event_row.venue_name")} ||
+    ',"address":' || ${scalar("event_row.venue_address")} || '}' ||
+    ',"starts_at":' || ${scalar(eventStarts)} ||
+    ',"ends_at":' || ${scalar(eventEnds)} ||
+    ',"time_zone":' || ${scalar("event_row.time_zone")} ||
+    ',"check_in_opens_at":' || ${scalar(checkIn)} ||
+    ',"visibility":' || ${scalar("event_row.visibility")} ||
+    ',"purchase_mode":' || ${scalar("case when event_row.visibility = 'private' then 'access_request' else 'public_checkout' end")} ||
+    ',"is_canceled":' || ${scalar("event_row.is_canceled")} ||
+    ',"is_archived":' || ${scalar("event_row.is_archived")} ||
+    ',"ticket_offering":{"price":' ||
+      case when offering.price_amount is null or offering.currency is null then 'null'
+        else '{"amount":' || ${scalar("offering.price_amount::bigint")} ||
+             ',"currency":' || ${scalar("offering.currency")} || '}' end ||
+      ',"max_quantity_per_order":' || ${scalar("case when event_row.visibility = 'private' then 1 else 8 end")} || '}' ||
+    '},"qr_payload":' || ${scalar("ticket.qr_payload")} ||
+    ',"attendee_name":' || ${scalar("ticket.attendee_name")} ||
+    ',"used":' || ${scalar("admission.id is not null")} ||
+    ',"voided":' || ${scalar("event_row.is_canceled or order_row.refund_status = 'full'")} || '}'
+  )`;
+  return `rtrim(replace(replace(encode(digest(${json}, 'sha256'), 'base64'), '+', '-'), '/', '_'), '=')`;
+}
+
 interface WalletDataRow extends QueryResultRow {
   ticket_id: string;
   qr_payload: string;
@@ -207,11 +262,27 @@ export async function enqueueWalletUpdateJobsForEvent(
   siteId: string,
   eventId: string,
 ): Promise<void> {
-  const tickets = await client.query<{ id: string }>(
-    `select id from hpos.tickets where site_id = $1 and event_id = $2 order by id`,
+  await client.query(
+    `insert into hpos.notification_jobs (
+       site_id, kind, ticket_id, available_at, payload
+     )
+     select ticket.site_id, 'wallet_update', ticket.id, clock_timestamp(),
+       jsonb_build_object('ticket_id', ticket.id, 'data_version', ${walletDataVersionSql()}::text)
+     from hpos.tickets ticket
+     join hpos.orders order_row
+       on order_row.id = ticket.order_id and order_row.site_id = ticket.site_id
+     join hpos.events event_row
+       on event_row.id = ticket.event_id and event_row.site_id = ticket.site_id
+     join hpos.ticket_offerings offering
+       on offering.id = ticket.offering_id
+      and offering.event_id = ticket.event_id
+      and offering.site_id = ticket.site_id
+     left join hpos.admissions admission
+       on admission.site_id = ticket.site_id and admission.ticket_id = ticket.id
+     where ticket.site_id = $1 and ticket.event_id = $2
+     order by ticket.id`,
     [siteId, eventId],
   );
-  await enqueueWalletUpdateJobs(client, siteId, tickets.rows.map((ticket) => ticket.id));
 }
 
 export async function enqueueWalletUpdateJobsForOrder(

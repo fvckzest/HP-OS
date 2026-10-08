@@ -3173,8 +3173,8 @@ async function verifyEventChangeNotifications(site) {
     await pool.query(`drop function ${functionName}()`);
     await pool.query(`drop sequence ${sequenceName}`);
   }
-  assert(interrupted.status === 503 && interrupted.data.error.code === "service_unavailable",
-    "An interrupted Event notification fan-out did not fail safely.");
+  assert(interrupted.status === 500 && interrupted.data.error.code === "internal_error",
+    "An injected Event notification fan-out failure did not use the unexpected-application error contract.");
   const rolledBack = await pool.query(
     `select version, starts_at, ends_at, venue_name, venue_address
      from hpos.events where site_id = $1 and id = $2`,
@@ -3361,7 +3361,7 @@ async function verifyEventCancellation(site) {
      where site_id = $1 and event_id = $2 and kind = 'event_canceled'`,
     [site.siteId, event.event_id],
   );
-  assert(interrupted.status === 503 && interrupted.data.error.code === "service_unavailable"
+  assert(interrupted.status === 500 && interrupted.data.error.code === "internal_error"
     && afterInterruptedCancel.rows[0]?.is_canceled === false
     && afterInterruptedCancel.rows[0]?.sales_paused === false
     && afterInterruptedCancel.rows[0]?.version === event.version
