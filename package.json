@@ -23,6 +23,7 @@
     "verify:private-access": "node scripts/verify-private-access.mjs",
     "verify:historical-connections": "node scripts/verify-historical-connections.mjs",
     "verify:fees": "node scripts/verify-fee-reporting.mjs",
+    "verify:group-wallet": "node scripts/verify-group-wallet.mjs",
     "verify:diagnostics": "node --experimental-strip-types scripts/verify-diagnostics.mjs"
   },
   "dependencies": {
