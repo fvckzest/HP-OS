@@ -1,6 +1,6 @@
-# HP-OS events and ticketing language
+# HP-OS domain language
 
-This glossary names the first-release business concepts. The [ownership decision](https://github.com/fvckzest/HP-OS/issues/3#issuecomment-5848567711), [first-release jobs decision](https://github.com/fvckzest/HP-OS/issues/6#issuecomment-5848947118), [domain-language decision](https://github.com/fvckzest/HP-OS/issues/7#issuecomment-5848989424), and [ticketing journey](https://github.com/fvckzest/HP-OS/issues/8) provide the decision history.
+This glossary names the shared domain concepts. The [ownership decision](https://github.com/fvckzest/HP-OS/issues/3#issuecomment-5848567711), [first-release jobs decision](https://github.com/fvckzest/HP-OS/issues/6#issuecomment-5848947118), [domain-language decision](https://github.com/fvckzest/HP-OS/issues/7#issuecomment-5848989424), [ticketing journey](https://github.com/fvckzest/HP-OS/issues/8), and [portfolio decisions](https://github.com/fvckzest/HP-OS/issues/110) provide the decision history.
 
 ## Language
 
@@ -11,6 +11,22 @@ _Avoid_: Customer, account
 **Site**:
 An organization-owned public and staff-facing experience, such as LMNL, that owns its own events, buyers, orders, tickets, and admission records.
 _Avoid_: Organization, website account
+
+**Artwork**:
+A Site-scoped creative work record with stable API identity, a displayed Artwork ID, public metadata, and an independent original-sale status.
+_Avoid_: Photo, print listing
+
+**Collection**:
+A named, ordered group of Artworks used for public browsing. One Artwork may belong to multiple Collections; inactive Collections keep their memberships but are hidden publicly.
+_Avoid_: Artwork category field
+
+**Photo**:
+A Site-scoped image resource attached to an Artwork, with a stable ID and `processing`, `ready`, or `failed` delivery state. A ready Photo has 400 px and 1,600 px WebP variants; its source is not retained as an HP-OS master.
+_Avoid_: Private master, print edition
+
+**Hero Photo**:
+The one ready Photo selected to represent an Artwork as its primary image.
+_Avoid_: first Photo, collection thumbnail
 
 **Event**:
 A Site-owned occasion for which admission may be sold.
@@ -48,6 +64,8 @@ _Avoid_: Order, public checkout attempt
 
 - One **Customer organization** owns one or more **Sites**; each Site belongs to exactly one organization.
 - Each **Site** owns its **Events**, **Buyers**, **Orders**, **Tickets**, and **Admissions**. Records are not shared between Sites, even when they share a payment connection.
+- Each **Site** owns its **Artworks**, **Collections**, and **Photos**. An **Artwork** may have multiple **Photos** and belong to multiple **Collections**. Publication requires at least one active Collection, all Photos ready at both delivery sizes, and one ready **Hero Photo**.
+- A **Photo** keeps its stable identity, order, hero selection, and public delivery references when its images are replaced. Replacement bytes become current only after both WebP variants are ready; an existing published Artwork continues serving its old ready variants if replacement fails.
 - An **Event** has exactly one **Ticket offering** in the first release. Its **Orders** and **Tickets** belong to that same Event and Site.
 - An **Order** belongs to one **Buyer** and one **Event**. It may have no issued Tickets before payment; a paid Order can issue one or more independently usable Tickets. Public checkout may sell multiple Tickets, while an approved private Access Request initially permits one.
 - An **Order** holds a **Reservation** for its requested quantity during checkout. The Reservation prevents another checkout from claiming the same capacity and releases its claim if checkout ends without payment. It is not an issued Ticket.
