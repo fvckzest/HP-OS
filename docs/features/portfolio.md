@@ -1,5 +1,7 @@
 # Portfolio
 
+## Purpose and ownership
+
 Issue [#117](https://github.com/fvckzest/HP-OS/issues/117) defines the planned Site-scoped portfolio API. HP-OS owns each Site's Artwork, Collection, Photo, publication state, and delivery images. The Site authenticates its staff and owns public presentation. The decisions in [#111](https://github.com/fvckzest/HP-OS/issues/111), [#113](https://github.com/fvckzest/HP-OS/issues/113), [#114](https://github.com/fvckzest/HP-OS/issues/114), and [#115](https://github.com/fvckzest/HP-OS/issues/115) inform the contract; the separate [transition policy in #112](https://github.com/fvckzest/HP-OS/issues/112) governs existing catalog data. See the [domain glossary](../../CONTEXT.md) and [full API contract](../api/api.md#site-scoped-portfolio-api).
 
 ## Artwork and Collection records
