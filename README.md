@@ -46,6 +46,7 @@ Tool configuration, dependency files, `README.md`, and `AGENTS.md` remain at the
 | Customer organization, Site data separation, payment connections, and Site payment execution | [Ownership](docs/ownership.md) |
 | Meanings and relationships of event and ticketing terms | [Domain language](CONTEXT.md) |
 | Event rules | [Events](docs/features/events.md) |
+| Portfolio rules | [Portfolio](docs/features/portfolio.md) |
 | Ticketing rules | [Ticketing](docs/features/ticketing.md) |
 | API components, endpoints, fields, and data formats at a glance | [API reference](docs/api/api-ref.md) |
 | Exact Site-to-HP-OS request, response, permission, and error rules | [API contract](docs/api/api.md) |
