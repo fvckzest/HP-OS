@@ -99,6 +99,7 @@ export function operationForV1(method: string, path: string[]): string {
   const safePath = path.map((segment) => {
     if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(segment)) return ":id";
     if (/^[A-Za-z0-9_-]{32,200}$/.test(segment)) return ":token";
+    if (/^(?:art|col|photo)_[A-Za-z0-9_-]{22}$/.test(segment)) return ":resource_id";
     if (!/^[A-Za-z0-9._~-]{1,40}$/.test(segment)) return ":value";
     return segment;
   });

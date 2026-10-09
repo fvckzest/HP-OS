@@ -16,6 +16,9 @@ import { handleFeeReportPost } from "@/server/fee-reports";
 import { handleAdminReportingGet } from "@/server/admin-reporting";
 import { handleAccessRequestGet, handleAccessRequestPost, handleAccessRequestPatch } from "@/server/access-requests";
 import { handleWalletDataGet } from "@/server/wallet-data";
+import { handleArtworkActionPost, handleArtworkGet, handleArtworkPost, handleArtworkPatch } from "@/server/artworks";
+import { handleCollectionDelete, handleCollectionGet, handleCollectionPatch, handleCollectionPost, handleCollectionPut } from "@/server/collections";
+import { handlePhotoDelete, handlePhotoGet, handlePhotoPost, handlePhotoPut } from "@/server/photo-routes";
 
 export const dynamic = "force-dynamic";
 
@@ -73,6 +76,12 @@ export async function GET(request: Request, context: RouteContext): Promise<Resp
     if (adminReportingResponse) return adminReportingResponse;
     const eventResponse = await handleEventGet(request, authentication.site, path);
     if (eventResponse) return eventResponse;
+    const artworkResponse = await handleArtworkGet(request, authentication.site, path);
+    if (artworkResponse) return artworkResponse;
+    const photoResponse = await handlePhotoGet(request, authentication.site, path);
+    if (photoResponse) return photoResponse;
+    const collectionResponse = await handleCollectionGet(request, authentication.site, path);
+    if (collectionResponse) return collectionResponse;
     const notificationResponse = await handleNotificationGet(request, authentication.site, path);
     if (notificationResponse) return notificationResponse;
     const paymentInvestigationResponse = await handlePaymentInvestigationGet(request, authentication.site, path);
@@ -122,6 +131,14 @@ export async function POST(request: Request, context: RouteContext): Promise<Res
     const eventResponse = await handleEventPost(request, authentication.site, path)
       ?? await handleEventActionPost(request, authentication.site, path);
     if (eventResponse) return eventResponse;
+    const artworkResponse = await handleArtworkPost(request, authentication.site, path);
+    if (artworkResponse) return artworkResponse;
+    const artworkActionResponse = await handleArtworkActionPost(request, authentication.site, path);
+    if (artworkActionResponse) return artworkActionResponse;
+    const photoResponse = await handlePhotoPost(request, authentication.site, path);
+    if (photoResponse) return photoResponse;
+    const collectionResponse = await handleCollectionPost(request, authentication.site, path);
+    if (collectionResponse) return collectionResponse;
     const notificationResponse = await handleNotificationPost(request, authentication.site, path);
     return notificationResponse ?? apiFailure(404, "not_found", "The requested API operation is unavailable.");
   });
@@ -131,6 +148,10 @@ export async function PUT(request: Request, context: RouteContext): Promise<Resp
   return handleV1Request(request, "PUT", context, async (path) => {
     const authentication = await authenticateSiteRequest(request);
     if (authentication.error) return authentication.error;
+    const photoResponse = await handlePhotoPut(request, authentication.site, path);
+    if (photoResponse) return photoResponse;
+    const collectionResponse = await handleCollectionPut(request, authentication.site, path);
+    if (collectionResponse) return collectionResponse;
     const response = await handleProviderMappingPut(request, authentication.site, path);
     return response ?? apiFailure(404, "not_found", "The requested API operation is unavailable.");
   });
@@ -140,6 +161,10 @@ export async function DELETE(request: Request, context: RouteContext): Promise<R
   return handleV1Request(request, "DELETE", context, async (path) => {
     const authentication = await authenticateSiteRequest(request);
     if (authentication.error) return authentication.error;
+    const photoResponse = await handlePhotoDelete(request, authentication.site, path);
+    if (photoResponse) return photoResponse;
+    const collectionResponse = await handleCollectionDelete(request, authentication.site, path);
+    if (collectionResponse) return collectionResponse;
     const response = await handleProviderMappingDelete(request, authentication.site, path);
     return response ?? apiFailure(404, "not_found", "The requested API operation is unavailable.");
   });
@@ -152,6 +177,8 @@ export async function PATCH(request: Request, context: RouteContext): Promise<Re
     const accessRequestResponse = await handleAccessRequestPatch(request, authentication.site, path);
     if (accessRequestResponse) return accessRequestResponse;
     const eventResponse = await handleEventPatch(request, authentication.site, path);
-    return eventResponse ?? apiFailure(404, "not_found", "The requested API operation is unavailable.");
+    const artworkResponse = await handleArtworkPatch(request, authentication.site, path);
+    const collectionResponse = await handleCollectionPatch(request, authentication.site, path);
+    return eventResponse ?? artworkResponse ?? collectionResponse ?? apiFailure(404, "not_found", "The requested API operation is unavailable.");
   });
 }

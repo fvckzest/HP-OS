@@ -34,6 +34,8 @@ assert.deepEqual(apiFailureContract("temporary_dependency", 30), {
   retryAfter: 30,
 });
 assert.equal(operationForV1("GET", ["public", "orders", "a-very-long-secret-token-value-that-must-not-be-logged"]), "GET /v1/public/orders/:token");
+assert.equal(operationForV1("GET", ["admin", "artworks", `art_${"a".repeat(22)}`, "photos"]), "GET /v1/admin/artworks/:resource_id/photos");
+assert.equal(operationForV1("GET", ["public", "media", `photo_${"a".repeat(22)}`, "variants", "grid_400"]), "GET /v1/public/media/:resource_id/variants/grid_400");
 
 const output = [];
 const originalConsoleError = console.error;
