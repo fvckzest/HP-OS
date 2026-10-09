@@ -1,6 +1,6 @@
 # HP-OS API reference
 
-Compact lookup sheet for the `/v1` API contract. The [full contract](api.md) defines validation, ordering, and recovery rules and identifies which portions have local implementation evidence; local evidence does not prove hosted operation. Contract decisions: [issue #10](https://github.com/fvckzest/HP-OS/issues/10) and the portfolio API contract in [issue #117](https://github.com/fvckzest/HP-OS/issues/117). See the [portfolio feature summary](../features/portfolio.md) for the ownership and lifecycle overview.
+Compact lookup sheet for the `/v1` API contract. The [full contract](api.md) defines validation, ordering, and recovery rules and identifies which portions have local implementation evidence; local evidence does not prove hosted operation. Contract decisions: [issue #10](https://github.com/fvckzest/HP-OS/issues/10) and the portfolio API contract in [issue #117](https://github.com/fvckzest/HP-OS/issues/117). The proposed portfolio routes and media processing are planned in [issue #119](https://github.com/fvckzest/HP-OS/issues/119) and its focused issues #120–124; they are not implemented yet. See the [portfolio feature summary](../features/portfolio.md) for the ownership and lifecycle overview.
 
 ## Contents
 

@@ -8,7 +8,7 @@ HP-OS is a shared cultural operations engine for LMNL-built websites. LMNL is th
 
 [Issue #110](https://github.com/fvckzest/HP-OS/issues/110) defines a planned Site-scoped portfolio API, with HP-OS owning Artwork, Collection, Photo processing, and publication state. The API decisions in [#111](https://github.com/fvckzest/HP-OS/issues/111), [#113](https://github.com/fvckzest/HP-OS/issues/113), [#114](https://github.com/fvckzest/HP-OS/issues/114), and [#115](https://github.com/fvckzest/HP-OS/issues/115) feed the full [API contract](docs/api/api.md#site-scoped-portfolio-api) and [compact API reference](docs/api/api-ref.md); the separate transition policy is recorded in [#112](https://github.com/fvckzest/HP-OS/issues/112). This is API design documentation; portfolio routes and media processing are not implemented, and the decision authorizes no catalog import, public-read switch, cutover, or deletion.
 
-The current contract work is tracked in [issue #117](https://github.com/fvckzest/HP-OS/issues/117). HP-OS API implementation follows after this contract is reviewed and closed.
+The portfolio API contract was completed in [issue #117](https://github.com/fvckzest/HP-OS/issues/117). Its implementation is planned in [issue #119](https://github.com/fvckzest/HP-OS/issues/119) and its focused issues #120–124. These issues cover Artwork drafts, Collections, Photo processing and recovery, and public portfolio delivery; the routes and media processing are not yet implemented.
 
 ## Current development boundary
 
