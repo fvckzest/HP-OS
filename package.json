@@ -25,13 +25,20 @@
     "verify:historical-connections": "node scripts/verify-historical-connections.mjs",
     "verify:fees": "node scripts/verify-fee-reporting.mjs",
     "verify:group-wallet": "node scripts/verify-group-wallet.mjs",
-    "verify:diagnostics": "node --experimental-strip-types scripts/verify-diagnostics.mjs"
+    "verify:diagnostics": "node --experimental-strip-types scripts/verify-diagnostics.mjs",
+    "verify:photo-processing": "node --experimental-transform-types --experimental-loader ./scripts/ts-extension-loader.mjs scripts/verify-photo-processing.mjs",
+    "verify:photo-curation": "node --experimental-transform-types --experimental-loader ./scripts/ts-extension-loader.mjs scripts/verify-photo-curation.mjs",
+    "verify:photo-http": "node --experimental-transform-types --experimental-loader ./scripts/ts-extension-loader.mjs scripts/verify-photo-http.mjs",
+    "verify:artwork-drafts": "node scripts/verify-artwork-drafts.mjs",
+    "verify:collections": "node scripts/verify-collections.mjs",
+    "verify:portfolio-public": "node scripts/verify-portfolio-public.mjs"
   },
   "dependencies": {
     "next": "16.3.6",
     "pg": "8.23.0",
     "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react-dom": "19.3.0",
+    "sharp": "0.33.5"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

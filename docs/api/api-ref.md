@@ -43,13 +43,13 @@ Compact lookup sheet for the `/v1` API contract. The [full contract](api.md) def
 
 ## URL components
 
-Shape: `https://<host>/v1/<namespace>/<resource>/<identifier>?<query>`; deployment hostname is not assigned here.
+Shape: `https://hp-os.dev/v1/<namespace>/<resource>/<identifier>?<query>` is the current intended base URL. A dedicated API hostname can be assigned later without changing the `/v1` paths.
 
 
 
 | Part | Meaning |
 | --- | --- |
-| `https://<host>` | Base URL; scheme and server address. |
+| `https://hp-os.dev` | Current intended HP-OS host; the Site backend adds `/v1` and the requested route. |
 | `/v1` | Contract version. |
 | `/public` | Visitor-facing data; still requires backend Site authentication. |
 | `/admin` | Operational data/actions; Site authorizes its users. |
