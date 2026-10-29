@@ -25,6 +25,8 @@ interface EventRow extends QueryResultRow {
   ticket_offering_id: string;
   title: string | null;
   description: string | null;
+  event_type: string | null;
+  logo_path: string | null;
   venue_name: string | null;
   venue_address: string | null;
   starts_at: Date | null;
@@ -281,7 +283,7 @@ async function readIssuanceRow(client: PoolClient, siteId: string, orderId: stri
             order_row.version as order_version,
             reservation.id as reservation_id, reservation.status as reservation_status,
             reservation.expires_at as reservation_expires_at, reservation.awaiting_provider_verification,
-            event_row.title, event_row.description, event_row.venue_name, event_row.venue_address,
+            event_row.title, event_row.description, event_row.event_type, event_row.logo_path, event_row.venue_name, event_row.venue_address,
             event_row.starts_at, event_row.starts_at_offset_minutes, event_row.ends_at,
             event_row.ends_at_offset_minutes, event_row.time_zone, event_row.check_in_opens_at,
             event_row.check_in_opens_offset_minutes, event_row.visibility,
@@ -518,7 +520,7 @@ async function readBuyerOrder(site: AuthenticatedSite, token: string): Promise<R
               order_row.delivery_status, order_row.refund_status, order_row.checkout_expires_at,
               order_row.created_at as order_created_at, order_row.updated_at as order_updated_at,
               reservation.id as reservation_id, reservation.status as reservation_status,
-              event_row.title, event_row.description, event_row.venue_name, event_row.venue_address,
+              event_row.title, event_row.description, event_row.event_type, event_row.logo_path, event_row.venue_name, event_row.venue_address,
               event_row.starts_at, event_row.starts_at_offset_minutes, event_row.ends_at,
               event_row.ends_at_offset_minutes, event_row.time_zone, event_row.check_in_opens_at,
               event_row.check_in_opens_offset_minutes, event_row.visibility,
@@ -655,7 +657,7 @@ export async function handleBuyerTicketGet(site: AuthenticatedSite, path: string
             ticket.qr_payload, ticket.attendee_name, ticket.approved_attendee_email, ticket.version,
             admission.id as admission_id, admission.admitted_at,
             order_row.refund_status, event_row.is_canceled,
-            event_row.title, event_row.description, event_row.venue_name, event_row.venue_address,
+            event_row.title, event_row.description, event_row.event_type, event_row.logo_path, event_row.venue_name, event_row.venue_address,
             event_row.starts_at, event_row.starts_at_offset_minutes, event_row.ends_at,
             event_row.ends_at_offset_minutes, event_row.time_zone, event_row.check_in_opens_at,
             event_row.check_in_opens_offset_minutes, event_row.visibility,

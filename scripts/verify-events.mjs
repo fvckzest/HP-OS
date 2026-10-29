@@ -144,6 +144,51 @@ async function verifyDraftCreationAndReplay(site) {
   return first.data.data;
 }
 
+async function verifyEventType(site) {
+  const actor = { type: "user", reference: "test:event-type" };
+  const create = await api(site, "/v1/admin/events", { method: "POST", idempotencyKey: randomUUID(), body: { actor, event_type: "festival" } });
+  assert(create.status === 201 && create.data.data.event_type === "festival", "Draft creation did not persist Event type.");
+  const id = create.data.data.event_id;
+  let version = create.data.data.version;
+  for (const type of ["concert", "exhibition", "club", null]) {
+    const edit = await api(site, `/v1/admin/events/${id}`, { method: "PATCH", idempotencyKey: randomUUID(), body: { actor, expected_version: version, event_type: type } });
+    assert(edit.status === 200 && edit.data.data.event_type === type, "Event type edit or clear failed.");
+    version = edit.data.data.version;
+  }
+  for (const invalid of ["other", "Festival", "", 3, {}]) {
+    const edit = await api(site, `/v1/admin/events/${id}`, { method: "PATCH", idempotencyKey: randomUUID(), body: { actor, expected_version: version, event_type: invalid } });
+    assert(edit.status === 422 && edit.data.error.code === "validation_failed", "An invalid Event type was accepted.");
+  }
+  const event = await createPublishedEvent(site, { title: "Event type verification", startsAt: "2033-04-21T19:00:00-07:00", endsAt: "2033-04-21T22:00:00-07:00" });
+  assert(event.event_type === null, "An omitted Event type was not null at publication.");
+  const edit = await api(site, `/v1/admin/events/${event.event_id}`, { method: "PATCH", idempotencyKey: randomUUID(), body: { actor, expected_version: event.version, event_type: "concert" } });
+  assert(edit.status === 200 && edit.data.data.event_type === "concert", "A published Event type could not be set.");
+  const detail = await api(site, `/v1/public/events/${event.event_id}`);
+  const list = await api(site, "/v1/public/events?period=current");
+  assert(detail.status === 200 && detail.data.data.event_type === "concert" && list.data.data.some(item => item.event_id === event.event_id && item.event_type === "concert"), "Public Event reads did not include the saved type.");
+  const cleared = await api(site, `/v1/admin/events/${event.event_id}`, { method: "PATCH", idempotencyKey: randomUUID(), body: { actor, expected_version: edit.data.data.version, event_type: null } });
+  assert(cleared.status === 200 && cleared.data.data.event_type === null, "A published Event type could not be cleared.");
+}
+
+async function verifyEventLogoPath(site) {
+  const actor = { type: "user", reference: "test:event-logo" };
+  const create = await api(site, "/v1/admin/events", { method: "POST", idempotencyKey: randomUUID(), body: { actor, logo_path: "/media/events/space.png" } });
+  assert(create.status === 201 && create.data.data.logo_path === "/media/events/space.png", "Draft Event logo path was not saved.");
+  const id = create.data.data.event_id;
+  for (const invalid of ["https://example.com/a.png", "//example.com/a.png", "/media/../x", "/media/a?x=1", "", 42]) {
+    const edit = await api(site, `/v1/admin/events/${id}`, { method: "PATCH", idempotencyKey: randomUUID(), body: { actor, expected_version: create.data.data.version, logo_path: invalid } });
+    assert(edit.status === 422, "An invalid logo path was accepted.");
+  }
+  const clear = await api(site, `/v1/admin/events/${id}`, { method: "PATCH", idempotencyKey: randomUUID(), body: { actor, expected_version: create.data.data.version, logo_path: null } });
+  assert(clear.status === 200 && clear.data.data.logo_path === null, "The logo path could not be cleared.");
+  const event = await createPublishedEvent(site, { title: "Logo verification", startsAt: "2033-04-21T19:00:00-07:00", endsAt: "2033-04-21T22:00:00-07:00" });
+  assert(event.logo_path === null, "An omitted logo path must be null.");
+  const edit = await api(site, `/v1/admin/events/${event.event_id}`, { method: "PATCH", idempotencyKey: randomUUID(), body: { actor, expected_version: event.version, logo_path: "/media/events/bloom.png" } });
+  const detail = await api(site, `/v1/public/events/${event.event_id}`);
+  const list = await api(site, "/v1/public/events?period=current");
+  assert(edit.status === 200 && detail.data.data.logo_path === "/media/events/bloom.png" && list.data.data.some(item => item.event_id === event.event_id && item.logo_path === "/media/events/bloom.png"), "Public Event reads did not return the saved logo path.");
+}
+
 async function verifyPreconfiguredDraftCannotClearSales(site) {
   const created = await api(site, "/v1/admin/events", {
     method: "POST",
@@ -2927,12 +2972,28 @@ async function verifyEventLifecycleAndDiscovery(site) {
   const draft = await verifyDraftCreationAndReplay(site);
   const hiddenDraft = await api(site, "/v1/public/events/" + draft.event_id);
   assert(hiddenDraft.status === 404, "An incomplete draft was visible to public detail lookup.");
-  const archiveDraft = await api(site, "/v1/admin/events/" + draft.event_id + "/actions/archive", {
-    method: "POST",
-    idempotencyKey: randomUUID(),
-    body: { actor: { type: "user", reference: "test:issue-26" }, expected_version: 1 },
-  });
-  assert(archiveDraft.status === 409 && archiveDraft.data.error.code === "invalid_state", "An unpublished draft was archived.");
+  const disposable = (await api(site, "/v1/admin/events", { method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "user", reference: "test:draft-actions" } } })).data.data;
+  const actionBody = { actor: { type: "user", reference: "test:draft-actions" }, expected_version: disposable.version };
+  const actionPath = `/v1/admin/events/${disposable.event_id}/actions/`;
+  const crossSiteDraft = await api(createSiteFixture(), actionPath + "archive", { method: "POST", idempotencyKey: randomUUID(), body: actionBody });
+  assert(crossSiteDraft.status === 404, "Another Site could archive a draft.");
+  const crossSiteDelete = await api(createSiteFixture(), actionPath + "delete", { method: "POST", idempotencyKey: randomUUID(), body: actionBody });
+  assert(crossSiteDelete.status === 404, "Another Site could delete a draft.");
+  const staleArchive = await api(site, actionPath + "archive", { method: "POST", idempotencyKey: randomUUID(), body: { ...actionBody, expected_version: disposable.version + 1 } });
+  assert(staleArchive.status === 409 && staleArchive.data.error.code === "version_conflict", "Stale draft archive was accepted.");
+  const archiveKey = randomUUID();
+  const archivedDraft = await api(site, actionPath + "archive", { method: "POST", idempotencyKey: archiveKey, body: actionBody });
+  const archiveRetry = await api(site, actionPath + "archive", { method: "POST", idempotencyKey: archiveKey, body: actionBody });
+  assert(archivedDraft.status === 200 && archivedDraft.data.data.is_archived && archiveRetry.data.data.version === archivedDraft.data.data.version, "Draft archive or replay failed.");
+  const archivedPublish = await api(site, actionPath + "publish", { method: "POST", idempotencyKey: randomUUID(), body: { ...actionBody, expected_version: archivedDraft.data.data.version } });
+  assert(archivedPublish.status === 409 && archivedPublish.data.error.code === "invalid_state", "An archived draft was published.");
+  const staleDelete = await api(site, actionPath + "delete", { method: "POST", idempotencyKey: randomUUID(), body: actionBody });
+  assert(staleDelete.status === 409 && staleDelete.data.error.code === "version_conflict", "Stale draft deletion was accepted.");
+  const deleteKey = randomUUID(), deleteBody = { ...actionBody, expected_version: archivedDraft.data.data.version };
+  const deleted = await api(site, actionPath + "delete", { method: "POST", idempotencyKey: deleteKey, body: deleteBody });
+  const deleteRetry = await api(site, actionPath + "delete", { method: "POST", idempotencyKey: deleteKey, body: deleteBody });
+  assert(deleted.status === 200 && deleted.data.data.deleted && deleteRetry.status === 200 && deleteRetry.data.data.event_id === disposable.event_id, "Draft deletion or replay failed.");
+  assert((await api(site, `/v1/admin/events/${disposable.event_id}`)).status === 404, "Deleted draft remains available.");
 
   const invalidPublishKey = randomUUID();
   const invalidPublishBody = { actor: { type: "user", reference: "test:issue-26" }, expected_version: 1 };
@@ -3024,6 +3085,8 @@ async function verifyEventLifecycleAndDiscovery(site) {
     body: { actor: { type: "user", reference: "test:issue-26" }, expected_version: 3 },
   });
   assert(published.status === 200 && published.data.data.publication_status === "published", "A complete draft could not be published.");
+  const deletePublished = await api(site, `/v1/admin/events/${draft.event_id}/actions/delete`, { method: "POST", idempotencyKey: randomUUID(), body: { actor: { type: "user", reference: "test:draft-actions" }, expected_version: published.data.data.version } });
+  assert(deletePublished.status === 409 && deletePublished.data.error.code === "invalid_state", "A published Event was deleted.");
   const lockedVisibility = await api(site, "/v1/admin/events/" + draft.event_id, {
     method: "PATCH",
     idempotencyKey: randomUUID(),
@@ -3643,6 +3706,8 @@ async function main() {
     const site = createSiteFixture();
     await verifyPreconfiguredDraftCannotClearSales(site);
     await verifyEventLifecycleAndDiscovery(site);
+    await verifyEventType(createSiteFixture());
+    await verifyEventLogoPath(createSiteFixture());
     await verifyEventChangeNotifications(site);
     await verifyEventCancellation(site);
     await verifySalesControlsAndCapacity(site);

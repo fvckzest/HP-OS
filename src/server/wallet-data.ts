@@ -41,6 +41,7 @@ function walletDataVersionSql(): string {
     ',"event":{"event_id":' || ${scalar("event_row.id")} ||
     ',"title":' || ${scalar("event_row.title")} ||
     ',"description":' || ${scalar("event_row.description")} ||
+    ',"event_type":' || ${scalar("event_row.event_type")} ||
     ',"venue":{"name":' || ${scalar("event_row.venue_name")} ||
     ',"address":' || ${scalar("event_row.venue_address")} || '}' ||
     ',"starts_at":' || ${scalar(eventStarts)} ||
@@ -74,6 +75,8 @@ interface WalletDataRow extends QueryResultRow {
   event_id: string;
   title: string | null;
   description: string | null;
+  event_type: string | null;
+  logo_path: string | null;
   venue_name: string | null;
   venue_address: string | null;
   starts_at: Date | null;
@@ -109,7 +112,7 @@ interface WalletDataRow extends QueryResultRow {
 
 const WALLET_SELECT = `select ticket.id as ticket_id, ticket.qr_payload, ticket.attendee_name,
                    admission.id as admission_id, order_row.refund_status,
-                   event_row.site_id, event_row.id as event_id, event_row.title, event_row.description,
+                   event_row.site_id, event_row.id as event_id, event_row.title, event_row.description, event_row.event_type, event_row.logo_path,
                    event_row.venue_name, event_row.venue_address, event_row.starts_at,
                    event_row.starts_at_offset_minutes, event_row.ends_at,
                    event_row.ends_at_offset_minutes, event_row.time_zone,
@@ -161,6 +164,7 @@ function dataVersion(data: Omit<WalletData, "data_version">): string {
   // not receive a new Wallet version merely because time has passed.
   const stable = { ...data, event: { ...data.event } };
   delete stable.event.sales_status;
+  delete stable.event.logo_path;
   return createHash("sha256")
     .update(JSON.stringify(stable), "utf8")
     .digest("base64url");
@@ -183,6 +187,8 @@ function walletData(row: WalletDataRow): WalletData {
     ticket_offering_id: "",
     title: row.title,
     description: row.description,
+    event_type: row.event_type,
+    logo_path: row.logo_path,
     venue_name: row.venue_name,
     venue_address: row.venue_address,
     starts_at: row.starts_at,

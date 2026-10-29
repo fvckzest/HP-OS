@@ -529,7 +529,7 @@ async function verifyGroupOrder(site, otherSite) {
   });
   assert(edited.status === 200 && edited.data.data.venue?.name === "Issue #125 changed Wallet venue"
     && edited.data.data.venue?.address === "Local synthetic address", "A pass-visible Event edit could not be applied.");
-  const editedWalletEvent = edited.data.data;
+  let editedWalletEvent = edited.data.data;
   for (const ticket of tickets) {
     const wallet = await api(site, `/v1/admin/tickets/${ticket.ticket_id}/apple-wallet-data`);
     const publicWallet = await api(site, `/v1/public/tickets/${ticket.ticket_token}/apple-wallet-data`);
@@ -543,6 +543,26 @@ async function verifyGroupOrder(site, otherSite) {
     await assertWalletJobState(site, ticket.ticket_id, expectedJobCount, wallet.data.data.data_version, `Event change for Ticket ${ticket.ordinal}`);
     walletJobCounts.set(ticket.ticket_id, expectedJobCount);
   }
+
+  const typeEdit = await api(site, `/v1/admin/events/${event.event_id}`, {
+    method: "PATCH", idempotencyKey: randomUUID(), body: { actor: human, expected_version: editedWalletEvent.version, event_type: "festival" },
+  });
+  assert(typeEdit.status === 200 && typeEdit.data.data.event_type === "festival", "Event type edit failed.");
+  for (const ticket of tickets) {
+    const wallet = await api(site, `/v1/admin/tickets/${ticket.ticket_id}/apple-wallet-data`);
+    assert(wallet.status === 200 && wallet.data.data.event.event_type === "festival", "Wallet Event type was not updated.");
+    const count = walletJobCounts.get(ticket.ticket_id) + 1;
+    await assertWalletJobState(site, ticket.ticket_id, count, wallet.data.data.data_version, "Event type change");
+    walletJobCounts.set(ticket.ticket_id, count);
+  }
+  editedWalletEvent = typeEdit.data.data;
+
+  const beforeLogoJobs = (await currentWalletJobs(site)).length;
+  const beforeLogoWallet = await api(site, `/v1/admin/tickets/${tickets[0].ticket_id}/apple-wallet-data`);
+  const logoEdit = await api(site, `/v1/admin/events/${event.event_id}`, { method: "PATCH", idempotencyKey: randomUUID(), body: { actor: human, expected_version: editedWalletEvent.version, logo_path: "/media/events/example.png" } });
+  const afterLogoWallet = await api(site, `/v1/admin/tickets/${tickets[0].ticket_id}/apple-wallet-data`);
+  assert(logoEdit.status === 200 && afterLogoWallet.data.data.event.logo_path === "/media/events/example.png" && afterLogoWallet.data.data.data_version === beforeLogoWallet.data.data.data_version && (await currentWalletJobs(site)).length === beforeLogoJobs, "A Site logo path changed Wallet version or queued work.");
+  editedWalletEvent = logoEdit.data.data;
 
   const walletCountBeforePartial = (await currentWalletJobs(site)).length;
   const partialAmount = 1000;

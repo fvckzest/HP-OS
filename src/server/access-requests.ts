@@ -43,6 +43,8 @@ interface EventAccessRow extends QueryResultRow {
   site_id: string;
   title: string | null;
   description: string | null;
+  event_type: string | null;
+  logo_path: string | null;
   venue_name: string | null;
   venue_address: string | null;
   starts_at: Date | null;
@@ -134,6 +136,8 @@ function publicEventData(row: EventAccessRow): Record<string, unknown> {
     event_id: row.id,
     title: row.title,
     description: row.description,
+    event_type: row.event_type,
+    logo_path: row.logo_path,
     venue: { name: row.venue_name, address: row.venue_address },
     starts_at: iso(row.starts_at, row.starts_at_offset_minutes),
     ends_at: iso(row.ends_at, row.ends_at_offset_minutes),
@@ -193,7 +197,7 @@ function parseSubmission(value: Record<string, unknown>): { name: string; email:
 
 async function lockEvent(client: PoolClient, siteId: string, eventId: string): Promise<EventAccessRow> {
   const result = await client.query<EventAccessRow>(
-    `select e.id, e.site_id, e.title, e.description, e.venue_name, e.venue_address,
+    `select e.id, e.site_id, e.title, e.description, e.event_type, e.logo_path, e.venue_name, e.venue_address,
             e.starts_at, e.starts_at_offset_minutes, e.ends_at, e.ends_at_offset_minutes,
             e.time_zone, e.check_in_opens_at, e.check_in_opens_offset_minutes,
             e.visibility, e.publication_status, e.is_canceled, e.is_archived, e.sales_paused,
@@ -571,7 +575,7 @@ async function lookupApproval(site: AuthenticatedSite, token: string): Promise<R
   const result = await getBusinessPool().query<AccessRequestRow & EventAccessRow & { token_id: string; checkout_in_progress: boolean }>(
     `select r.id, r.site_id, r.event_id, r.name, r.email, r.normalized_email, r.status,
             r.version, r.decision_at, r.paid_order_id, r.created_at, r.updated_at,
-            e.title, e.description, e.venue_name, e.venue_address,
+            e.title, e.description, e.event_type, e.logo_path, e.venue_name, e.venue_address,
             e.starts_at, e.starts_at_offset_minutes, e.ends_at, e.ends_at_offset_minutes,
             e.time_zone, e.check_in_opens_at, e.check_in_opens_offset_minutes,
             e.visibility, e.publication_status, e.is_canceled, e.is_archived, e.sales_paused,
