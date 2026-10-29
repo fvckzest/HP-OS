@@ -1,0 +1,9 @@
+drop table hpos.photo_media_cleanup;
+drop table hpos.photo_storage_cleanup_cursors;
+drop table hpos.photo_upload_staging;
+drop table hpos.photo_processing_jobs;
+drop table hpos.photo_variants;
+drop table hpos.photos;
+drop table hpos.collection_artworks;
+drop table hpos.collections;
+drop table hpos.artworks;

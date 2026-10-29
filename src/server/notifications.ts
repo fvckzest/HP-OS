@@ -1074,18 +1074,10 @@ export async function handleScheduledProcessing(request: Request): Promise<Respo
   try {
     const processing = await runBoundedProcessing(production ? "vercel_cron" : "local_scheduler", invocationId);
     const issuance = await (await import("./ticket-issuance")).processPendingTicketIssuance();
-    const { cleanupAbandonedPhotoUploads, cleanupCompletedPhotoSources, photoCleanupHasMore, processPhotoJobs } = await import("./photos");
-    const photoProcessing = await processPhotoJobs();
-    const abandonedPhotoUploads = await cleanupAbandonedPhotoUploads();
-    const completedPhotoSources = await cleanupCompletedPhotoSources();
-    const photoCleanupHasMoreWork = await photoCleanupHasMore();
     return withRequestCorrelation(apiSuccess({
       ...processing,
-      has_more: processing.has_more || issuance.has_more || photoProcessing.has_more || photoCleanupHasMoreWork,
+      has_more: processing.has_more || issuance.has_more,
       ticket_issuance: issuance,
-      photo_processing: photoProcessing,
-      photo_upload_cleanup: abandonedPhotoUploads,
-      photo_source_cleanup: completedPhotoSources,
     }, 200, { requestId: correlationId }), correlationId);
   }
   catch (error) {
