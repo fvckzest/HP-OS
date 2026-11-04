@@ -17,7 +17,7 @@ async function retryTicketIssuance(client: PoolClient, site: AuthenticatedSite, 
   if (!hasOnlyKeys(body, ["actor", "expected_version"])) {
     throw new ApiOperationError(422, "validation_failed", "Only actor and expected_version are accepted for this action.");
   }
-  const parsedActor = parseSiteActor(body.actor);
+  const parsedActor = parseSiteActor(body.actor, { trimReference: false });
   if (!parsedActor) throw new ApiOperationError(422, "validation_failed", "Provide a valid Site-local actor reference.", [{ field: "actor", code: "invalid_actor", message: "Use {type, reference} with a non-secret reference." }]);
   const expected = expectedVersion(body.expected_version);
   if (!expected) throw new ApiOperationError(422, "validation_failed", "expected_version must be a positive integer.", [{ field: "expected_version", code: "required", message: "Use the current Order version." }]);
@@ -96,7 +96,7 @@ function ticketEmailPayload(row: IssuanceRow) {
 
 function assertRecoveryActorAndVersion(body: Record<string, unknown>, allowed: string[]): { actor: { type: "user" | "system"; reference: string }; version: number } {
   if (!hasOnlyKeys(body, allowed)) throw new ApiOperationError(422, "validation_failed", "The recovery action contains an unsupported field.");
-  const parsedActor = parseSiteActor(body.actor);
+  const parsedActor = parseSiteActor(body.actor, { trimReference: false });
   if (!parsedActor) throw new ApiOperationError(422, "validation_failed", "Provide a valid Site-local actor reference.", [{ field: "actor", code: "invalid_actor", message: "Use {type, reference} with a non-secret reference." }]);
   const version = expectedVersion(body.expected_version);
   if (!version) throw new ApiOperationError(422, "validation_failed", "expected_version must be a positive integer.", [{ field: "expected_version", code: "required", message: "Use the current Order version." }]);
