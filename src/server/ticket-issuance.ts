@@ -4,7 +4,8 @@ import { apiFailure, apiSuccess } from "./api-response";
 import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
-import { publicEventData } from "./events";
+import { publicEventData } from "./event-projection";
+import type { PublicEventProjectionRow } from "./event-projection";
 import { enqueueNotificationJob, supersedeUnsentNotificationJobs } from "./notifications";
 import { readFeeRecords } from "./fee-reports";
 import type { AuthenticatedSite } from "./site-auth";
@@ -19,28 +20,10 @@ function noStore(response: Response): Response {
   return response;
 }
 
-interface EventRow extends QueryResultRow {
-  id: string;
+interface EventRow extends QueryResultRow, PublicEventProjectionRow {
   site_id: string;
   ticket_offering_id: string;
-  title: string | null;
-  description: string | null;
-  event_type: string | null;
-  logo_path: string | null;
-  venue_name: string | null;
-  venue_address: string | null;
-  starts_at: Date | null;
-  starts_at_offset_minutes: number | null;
-  ends_at: Date | null;
-  ends_at_offset_minutes: number | null;
-  time_zone: string | null;
-  check_in_opens_at: Date | null;
-  check_in_opens_offset_minutes: number | null;
-  visibility: "public" | "private" | null;
   publication_status: "draft" | "published";
-  is_canceled: boolean;
-  is_archived: boolean;
-  sales_paused: boolean;
   version: number;
   created_at: Date;
   updated_at: Date;
@@ -48,16 +31,6 @@ interface EventRow extends QueryResultRow {
   created_actor_reference: string;
   updated_actor_type: "user" | "system";
   updated_actor_reference: string;
-  price_amount: string | null;
-  currency: string | null;
-  tax_amount: string | null;
-  buyer_fees: Array<{ code: string; label: string; amount: number; currency: string }> | null;
-  capacity: string | null;
-  reserved_quantity: string;
-  sales_opens_at: Date | null;
-  sales_opens_offset_minutes: number | null;
-  sales_closes_at: Date | null;
-  sales_closes_offset_minutes: number | null;
 }
 
 interface IssuanceRow extends EventRow {

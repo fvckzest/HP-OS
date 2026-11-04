@@ -4,8 +4,8 @@ import { apiFailure } from "./api-response";
 import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
-import { salesStatus } from "./events";
-import type { EventSalesState } from "./events";
+import { salesStatus } from "./event-projection";
+import type { EventSalesState } from "./event-projection";
 import type { AuthenticatedSite } from "./site-auth";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;

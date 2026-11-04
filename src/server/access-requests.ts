@@ -4,6 +4,8 @@ import { apiFailure, apiSuccess } from "./api-response";
 import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
+import { publicEventData } from "./event-projection";
+import type { PublicEventProjectionRow } from "./event-projection";
 import { enqueueNotificationJob, supersedeUnsentNotificationJobs } from "./notifications";
 import type { AuthenticatedSite } from "./site-auth";
 
@@ -38,37 +40,11 @@ interface AccessRequestRow extends QueryResultRow {
   created_cursor_time?: string;
 }
 
-interface EventAccessRow extends QueryResultRow {
-  id: string;
+type EventAccessRow = Omit<PublicEventProjectionRow, "id"> & {
   site_id: string;
-  title: string | null;
-  description: string | null;
-  event_type: string | null;
-  logo_path: string | null;
-  venue_name: string | null;
-  venue_address: string | null;
-  starts_at: Date | null;
-  starts_at_offset_minutes: number | null;
-  ends_at: Date | null;
-  ends_at_offset_minutes: number | null;
-  time_zone: string | null;
-  check_in_opens_at: Date | null;
-  check_in_opens_offset_minutes: number | null;
-  visibility: "public" | "private" | null;
   publication_status: "draft" | "published";
-  is_canceled: boolean;
-  is_archived: boolean;
-  sales_paused: boolean;
-  price_amount: string | null;
-  currency: string | null;
-  tax_amount: string | null;
-  buyer_fees: Array<{ code: string; label: string; amount: number; currency: string }> | null;
-  capacity: string | null;
-  reserved_quantity: string;
-  sales_opens_at: Date | null;
-  sales_closes_at: Date | null;
   ticket_offering_id: string;
-}
+};
 
 class AccessRequestError extends ApiOperationError {}
 
@@ -101,58 +77,6 @@ function tokenHash(token: string): string {
 
 function normalizedEmail(email: string): string {
   return email.trim().toLowerCase();
-}
-
-function iso(value: Date | null, offsetMinutes: number | null): string | null {
-  if (!value) return null;
-  const offset = Number(offsetMinutes ?? 0);
-  const local = new Date(value.getTime() + offset * 60_000).toISOString().replace(/Z$/, "").replace(/\.000$/, "");
-  const suffix = offset === 0
-    ? "Z"
-    : `${offset < 0 ? "-" : "+"}${String(Math.floor(Math.abs(offset) / 60)).padStart(2, "0")}:${String(Math.abs(offset) % 60).padStart(2, "0")}`;
-  return local + suffix;
-}
-
-function safeNumber(value: string | null): number | null {
-  if (value === null) return null;
-  const number = Number(value);
-  return Number.isSafeInteger(number) ? number : null;
-}
-
-function eventSalesStatus(row: EventAccessRow, now = Date.now()): string {
-  if (row.is_canceled) return "canceled";
-  if (row.ends_at && row.ends_at.getTime() <= now) return "closed";
-  if (row.price_amount === null || row.tax_amount === null || row.buyer_fees === null || row.capacity === null || !row.sales_opens_at || !row.sales_closes_at) return "not_configured";
-  if (row.sales_closes_at.getTime() <= now) return "closed";
-  if (row.sales_opens_at.getTime() > now) return "scheduled";
-  if (row.sales_paused) return "paused";
-  if (Number(row.reserved_quantity) >= Number(row.capacity)) return "sold_out";
-  return "open";
-}
-
-function publicEventData(row: EventAccessRow): Record<string, unknown> {
-  const amount = safeNumber(row.price_amount);
-  return {
-    event_id: row.id,
-    title: row.title,
-    description: row.description,
-    event_type: row.event_type,
-    logo_path: row.logo_path,
-    venue: { name: row.venue_name, address: row.venue_address },
-    starts_at: iso(row.starts_at, row.starts_at_offset_minutes),
-    ends_at: iso(row.ends_at, row.ends_at_offset_minutes),
-    time_zone: row.time_zone,
-    check_in_opens_at: iso(row.check_in_opens_at ?? row.starts_at, row.check_in_opens_at ? row.check_in_opens_offset_minutes : row.starts_at_offset_minutes),
-    visibility: row.visibility,
-    purchase_mode: row.visibility === "private" ? "access_request" : "public_checkout",
-    sales_status: eventSalesStatus(row),
-    is_canceled: row.is_canceled,
-    is_archived: row.is_archived,
-    ticket_offering: {
-      price: amount === null || !row.currency ? null : { amount, currency: row.currency },
-      max_quantity_per_order: 1,
-    },
-  };
 }
 
 function actorFrom(value: unknown): Actor | null {
@@ -580,7 +504,8 @@ async function lookupApproval(site: AuthenticatedSite, token: string): Promise<R
             e.time_zone, e.check_in_opens_at, e.check_in_opens_offset_minutes,
             e.visibility, e.publication_status, e.is_canceled, e.is_archived, e.sales_paused,
             o.id as ticket_offering_id, o.price_amount, o.currency, o.tax_amount, o.buyer_fees,
-            o.capacity, o.reserved_quantity, o.sales_opens_at, o.sales_closes_at,
+            o.capacity, o.reserved_quantity, o.sales_opens_at, o.sales_opens_offset_minutes,
+            o.sales_closes_at, o.sales_closes_offset_minutes,
             token.id as token_id,
             exists (
               select 1 from hpos.orders active_order
@@ -610,7 +535,7 @@ async function lookupApproval(site: AuthenticatedSite, token: string): Promise<R
   if (!row) return apiFailure(404, "not_found", "The approval link is not available.");
   return apiSuccess({
     request_id: row.id,
-    event: publicEventData({ ...row, id: row.event_id }),
+    event: publicEventData({ ...row, id: row.event_id } as PublicEventProjectionRow),
     approved_attendee: { name: row.name, email: row.email },
     max_quantity_per_order: 1,
     purchase_completed: Boolean(row.paid_order_id),

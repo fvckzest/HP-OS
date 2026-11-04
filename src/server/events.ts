@@ -7,7 +7,18 @@ import { getBusinessPool } from "./database";
 import { enqueueEventNotificationJobs, supersedeUnsentNotificationJobs } from "./notifications";
 import type { EventNotificationDetails } from "./notifications";
 import type { AuthenticatedSite } from "./site-auth";
+import {
+  eventTimestamp,
+  publicEventData,
+  safeEventNumber,
+  salesStatus,
+  walletEventProjection as projectWalletEvent,
+} from "./event-projection";
+import type { PublicEventProjectionRow } from "./event-projection";
 import { enqueueWalletUpdateJobsForEvent } from "./wallet-data";
+
+export { publicEventData, salesStatus } from "./event-projection";
+export type { EventSalesState, SalesStatus } from "./event-projection";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RFC3339_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
@@ -24,28 +35,10 @@ interface ParsedTimestamp {
   offsetMinutes: number;
 }
 
-interface EventRow extends QueryResultRow {
-  id: string;
+interface EventRow extends QueryResultRow, PublicEventProjectionRow {
   site_id: string;
   ticket_offering_id: string;
-  title: string | null;
-  description: string | null;
-  event_type: string | null;
-  logo_path: string | null;
-  venue_name: string | null;
-  venue_address: string | null;
-  starts_at: Date | null;
-  starts_at_offset_minutes: number | null;
-  ends_at: Date | null;
-  ends_at_offset_minutes: number | null;
-  time_zone: string | null;
-  check_in_opens_at: Date | null;
-  check_in_opens_offset_minutes: number | null;
-  visibility: "public" | "private" | null;
   publication_status: "draft" | "published";
-  is_canceled: boolean;
-  is_archived: boolean;
-  sales_paused: boolean;
   version: number;
   created_at: Date;
   updated_at: Date;
@@ -53,16 +46,6 @@ interface EventRow extends QueryResultRow {
   created_actor_reference: string;
   updated_actor_type: Actor["type"];
   updated_actor_reference: string;
-  price_amount: string | null;
-  currency: string | null;
-  tax_amount: string | null;
-  buyer_fees: Array<{ code: string; label: string; amount: number; currency: string }> | null;
-  capacity: string | null;
-  reserved_quantity: string;
-  sales_opens_at: Date | null;
-  sales_opens_offset_minutes: number | null;
-  sales_closes_at: Date | null;
-  sales_closes_offset_minutes: number | null;
   sales_ever_configured?: boolean;
   created_cursor_time?: string;
   starts_cursor_time?: string;
@@ -74,21 +57,6 @@ interface ProviderMappingRow extends QueryResultRow {
   resource_type: string;
   resource_reference: string;
   verified_at: Date;
-}
-
-export type SalesStatus = "canceled" | "closed" | "not_configured" | "scheduled" | "paused" | "sold_out" | "open";
-
-export interface EventSalesState {
-  is_canceled: boolean;
-  ends_at: Date | null;
-  price_amount: string | null;
-  tax_amount: string | null;
-  buyer_fees: EventRow["buyer_fees"];
-  capacity: string | null;
-  sales_opens_at: Date | null;
-  sales_closes_at: Date | null;
-  sales_paused: boolean;
-  reserved_quantity: string;
 }
 
 interface EventInput {
@@ -390,56 +358,10 @@ async function readJsonBody(request: Request): Promise<Record<string, unknown> |
   return value;
 }
 
-function iso(value: Date | null, offsetMinutes: number | null = 0): string | null {
-  if (!value) return null;
-  const offset = Number(offsetMinutes ?? 0);
-  const local = new Date(value.getTime() + offset * 60_000).toISOString().replace(/\.000Z$/, "Z");
-  const suffix = offset === 0 ? "Z" : `${offset < 0 ? "-" : "+"}${String(Math.floor(Math.abs(offset) / 60)).padStart(2, "0")}:${String(Math.abs(offset) % 60).padStart(2, "0")}`;
-  return local.replace(/Z$/, suffix);
-}
-
-function safeNumber(value: string | null): number | null {
-  if (value === null) return null;
-  const parsed = Number(value);
-  return Number.isSafeInteger(parsed) ? parsed : null;
-}
-
-export function salesStatus(row: EventSalesState, now = Date.now()): SalesStatus {
-  if (row.is_canceled) return "canceled";
-  if (row.ends_at && row.ends_at.getTime() <= now) return "closed";
-  if (row.price_amount === null || row.tax_amount === null || row.buyer_fees === null || row.capacity === null || !row.sales_opens_at || !row.sales_closes_at) return "not_configured";
-  if (row.sales_closes_at.getTime() <= now) return "closed";
-  if (row.sales_opens_at.getTime() > now) return "scheduled";
-  if (row.sales_paused) return "paused";
-  if (Number(row.reserved_quantity) >= Number(row.capacity)) return "sold_out";
-  return "open";
-}
-
 function eventData(row: EventRow, admin: boolean): Record<string, unknown> {
-  const amount = safeNumber(row.price_amount);
-  const capacity = safeNumber(row.capacity);
-  const reserved = safeNumber(row.reserved_quantity) ?? 0;
-  const data: Record<string, unknown> = {
-    event_id: row.id,
-    title: row.title,
-    description: row.description,
-    event_type: row.event_type,
-    logo_path: row.logo_path,
-    venue: { name: row.venue_name, address: row.venue_address },
-    starts_at: iso(row.starts_at, row.starts_at_offset_minutes),
-    ends_at: iso(row.ends_at, row.ends_at_offset_minutes),
-    time_zone: row.time_zone,
-    check_in_opens_at: iso(row.check_in_opens_at ?? row.starts_at, row.check_in_opens_offset_minutes ?? row.starts_at_offset_minutes),
-    visibility: row.visibility,
-    purchase_mode: row.visibility === "private" ? "access_request" : "public_checkout",
-    sales_status: salesStatus(row),
-    is_canceled: row.is_canceled,
-    is_archived: row.is_archived,
-    ticket_offering: {
-      price: amount === null || !row.currency ? null : { amount, currency: row.currency },
-      max_quantity_per_order: row.visibility === "private" ? 1 : 8,
-    },
-  };
+  const capacity = safeEventNumber(row.capacity);
+  const reserved = safeEventNumber(row.reserved_quantity) ?? 0;
+  const data = publicEventData(row);
   if (!admin) return data;
   data.version = row.version;
   data.publication_status = row.publication_status;
@@ -452,18 +374,13 @@ function eventData(row: EventRow, admin: boolean): Record<string, unknown> {
     capacity,
     reserved_quantity: reserved,
     available_quantity: capacity === null ? null : Math.max(0, capacity - reserved),
-    sales_opens_at: iso(row.sales_opens_at, row.sales_opens_offset_minutes),
-    sales_closes_at: iso(row.sales_closes_at, row.sales_closes_offset_minutes),
-    tax_amount: safeNumber(row.tax_amount),
+    sales_opens_at: eventTimestamp(row.sales_opens_at, row.sales_opens_offset_minutes),
+    sales_closes_at: eventTimestamp(row.sales_closes_at, row.sales_closes_offset_minutes),
+    tax_amount: safeEventNumber(row.tax_amount),
     buyer_fees: row.buyer_fees,
     provider_mappings: [],
   });
   return data;
-}
-
-/** Public Event details reused by buyer Order and Ticket reads. */
-export function publicEventData(row: EventRow): Record<string, unknown> {
-  return eventData(row, false);
 }
 
 function providerMappingData(mapping: ProviderMappingRow): Record<string, unknown> {
@@ -529,20 +446,13 @@ function changedArrivalFields(before: EventRow, after: EventRow): string[] {
   return changed;
 }
 
-function walletEventProjection(row: EventRow): Record<string, unknown> {
-  const projection = publicEventData(row);
-  delete projection.sales_status;
-  delete projection.logo_path;
-  return projection;
-}
-
 function walletEventDataChanged(before: EventRow, after: EventRow): boolean {
-  return JSON.stringify(walletEventProjection(before)) !== JSON.stringify(walletEventProjection(after));
+  return JSON.stringify(projectWalletEvent(before)) !== JSON.stringify(projectWalletEvent(after));
 }
 
 function eventNotificationDetails(row: EventRow, changedFields: string[]): EventNotificationDetails {
-  const startsAt = iso(row.starts_at, row.starts_at_offset_minutes);
-  const endsAt = iso(row.ends_at, row.ends_at_offset_minutes);
+  const startsAt = eventTimestamp(row.starts_at, row.starts_at_offset_minutes);
+  const endsAt = eventTimestamp(row.ends_at, row.ends_at_offset_minutes);
   if (!row.title || !startsAt || !endsAt || !row.time_zone || !row.venue_name) {
     throw new Error("A published Event is missing required buyer notification details.");
   }
