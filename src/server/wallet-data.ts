@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { PoolClient, QueryResultRow } from "pg";
 import { apiFailure, apiSuccess } from "./api-response";
 import { getBusinessPool } from "./database";
-import { publicEventData } from "./events";
+import { publicEventData } from "./event-projection";
 import { enqueueNotificationJob } from "./notification-queue";
 import type { AuthenticatedSite } from "./site-auth";
 
@@ -183,8 +183,6 @@ export interface WalletData {
 function walletData(row: WalletDataRow): WalletData {
   const event = publicEventData({
     id: row.event_id,
-    site_id: row.site_id,
-    ticket_offering_id: "",
     title: row.title,
     description: row.description,
     event_type: row.event_type,
@@ -199,17 +197,9 @@ function walletData(row: WalletDataRow): WalletData {
     check_in_opens_at: row.check_in_opens_at,
     check_in_opens_offset_minutes: row.check_in_opens_offset_minutes,
     visibility: row.visibility,
-    publication_status: row.publication_status,
     is_canceled: row.is_canceled,
     is_archived: row.is_archived,
     sales_paused: row.sales_paused,
-    version: row.event_version,
-    created_at: row.event_created_at,
-    updated_at: row.event_updated_at,
-    created_actor_type: row.created_actor_type,
-    created_actor_reference: row.created_actor_reference,
-    updated_actor_type: row.updated_actor_type,
-    updated_actor_reference: row.updated_actor_reference,
     price_amount: row.price_amount,
     currency: row.currency,
     tax_amount: row.tax_amount,

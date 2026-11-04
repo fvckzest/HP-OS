@@ -1,7 +1,7 @@
 import type { PoolClient } from "pg";
 import { apiFailure, apiSuccess } from "./api-response";
 import { getBusinessPool } from "./database";
-import { publicEventData } from "./events";
+import { publicEventData } from "./event-projection";
 import { readFeeRecords } from "./fee-reports";
 import type { AuthenticatedSite } from "./site-auth";
 import {

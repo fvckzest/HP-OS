@@ -1,6 +1,6 @@
 import { apiFailure, apiSuccess } from "./api-response";
 import { getBusinessPool } from "./database";
-import { publicEventData } from "./events";
+import { publicEventData } from "./event-projection";
 import type { AuthenticatedSite } from "./site-auth";
 import {
   ReadOrderRow, TicketRow, EventRow, TOKEN_PATTERN, currentDeliveryStatus, hashToken, noStore, publicTicketData, safeNumber,

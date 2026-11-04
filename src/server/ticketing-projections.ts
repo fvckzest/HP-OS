@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { PoolClient, QueryResultRow } from "pg";
 import { apiFailure } from "./api-response";
 import { getBusinessPool } from "./database";
+import type { PublicEventProjectionRow } from "./event-projection";
 
 export const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 export const TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,128}$/;
@@ -13,28 +14,10 @@ export function noStore(response: Response): Response {
   return response;
 }
 
-export interface EventRow extends QueryResultRow {
-  id: string;
+export interface EventRow extends QueryResultRow, PublicEventProjectionRow {
   site_id: string;
   ticket_offering_id: string;
-  title: string | null;
-  description: string | null;
-  event_type: string | null;
-  logo_path: string | null;
-  venue_name: string | null;
-  venue_address: string | null;
-  starts_at: Date | null;
-  starts_at_offset_minutes: number | null;
-  ends_at: Date | null;
-  ends_at_offset_minutes: number | null;
-  time_zone: string | null;
-  check_in_opens_at: Date | null;
-  check_in_opens_offset_minutes: number | null;
-  visibility: "public" | "private" | null;
   publication_status: "draft" | "published";
-  is_canceled: boolean;
-  is_archived: boolean;
-  sales_paused: boolean;
   version: number;
   created_at: Date;
   updated_at: Date;
@@ -42,16 +25,6 @@ export interface EventRow extends QueryResultRow {
   created_actor_reference: string;
   updated_actor_type: "user" | "system";
   updated_actor_reference: string;
-  price_amount: string | null;
-  currency: string | null;
-  tax_amount: string | null;
-  buyer_fees: Array<{ code: string; label: string; amount: number; currency: string }> | null;
-  capacity: string | null;
-  reserved_quantity: string;
-  sales_opens_at: Date | null;
-  sales_opens_offset_minutes: number | null;
-  sales_closes_at: Date | null;
-  sales_closes_offset_minutes: number | null;
 }
 
 export interface IssuanceRow extends EventRow {

@@ -3,7 +3,7 @@ import type { PoolClient } from "pg";
 import { apiFailure } from "./api-response";
 import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
-import { publicEventData } from "./events";
+import { publicEventData } from "./event-projection";
 import { enqueueNotificationJob, supersedeUnsentNotificationJobs } from "./notification-queue";
 import type { AuthenticatedSite } from "./site-auth";
 import { readAdminOrder } from "./admin-order";
