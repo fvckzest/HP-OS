@@ -71,6 +71,13 @@ const chunked = await readJsonObject(new Request("http://localhost/v1/test", {
 }), messages);
 assert.deepEqual(chunked, { chunked: true });
 
+const bom = await readJsonObject(request(new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode('{"bom":true}')])), messages);
+assert.deepEqual(bom, { bom: true });
+
+const lockedRequest = request('{"locked":true}');
+lockedRequest.body.getReader();
+await errorCode(await readJsonObject(lockedRequest, messages), 400, "invalid_request");
+
 const actor = parseSiteActor({ type: "system", reference: " worker:local " });
 assert.deepEqual(actor, { type: "system", reference: "worker:local" });
 assert.equal(parseSiteActor({ type: "system", reference: " worker:local " }, { trimReference: false }), null);

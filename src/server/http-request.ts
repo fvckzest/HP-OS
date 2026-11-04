@@ -43,7 +43,12 @@ export async function readJson(request: Request, messages: JsonBodyMessages): Pr
     return apiFailure(415, "unsupported_media_type", messages.unsupportedMediaType);
   }
 
-  const reader = request.body?.getReader();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  try {
+    reader = request.body?.getReader() ?? null;
+  } catch {
+    return apiFailure(400, "invalid_request", messages.readError);
+  }
   if (!reader) {
     if (messages.missingBody) return apiFailure(400, "invalid_request", messages.missingBody);
     return apiFailure(400, "invalid_request", messages.invalidJson);
@@ -68,7 +73,7 @@ export async function readJson(request: Request, messages: JsonBodyMessages): Pr
 
   let value: unknown;
   try {
-    value = JSON.parse(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8"));
+    value = JSON.parse(new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)))));
   } catch {
     return apiFailure(400, "invalid_request", messages.invalidJson);
   }
