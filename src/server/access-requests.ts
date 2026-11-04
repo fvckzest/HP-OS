@@ -6,7 +6,7 @@ import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
 import { publicEventData } from "./event-projection";
 import type { PublicEventProjectionRow } from "./event-projection";
-import { enqueueNotificationJob, supersedeUnsentNotificationJobs } from "./notifications";
+import { enqueueNotificationJob, supersedeUnsentNotificationJobs } from "./notification-queue";
 import type { AuthenticatedSite } from "./site-auth";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;

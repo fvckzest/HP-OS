@@ -1,4 +1,4 @@
-import { handleScheduledProcessing } from "@/server/notifications";
+import { handleScheduledProcessing } from "@/server/notification-processing";
 
 export const dynamic = "force-dynamic";
 

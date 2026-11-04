@@ -6,7 +6,7 @@ import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
 import { publicEventData } from "./event-projection";
 import type { PublicEventProjectionRow } from "./event-projection";
-import { enqueueNotificationJob, supersedeUnsentNotificationJobs } from "./notifications";
+import { enqueueNotificationJob, supersedeUnsentNotificationJobs } from "./notification-queue";
 import { readFeeRecords } from "./fee-reports";
 import type { AuthenticatedSite } from "./site-auth";
 

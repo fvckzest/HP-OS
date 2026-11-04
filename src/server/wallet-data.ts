@@ -3,7 +3,7 @@ import type { PoolClient, QueryResultRow } from "pg";
 import { apiFailure, apiSuccess } from "./api-response";
 import { getBusinessPool } from "./database";
 import { publicEventData } from "./event-projection";
-import { enqueueNotificationJob } from "./notifications";
+import { enqueueNotificationJob } from "./notification-queue";
 import type { AuthenticatedSite } from "./site-auth";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;

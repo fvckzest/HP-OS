@@ -4,8 +4,8 @@ import { apiFailure, apiSuccess } from "./api-response";
 import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
-import { enqueueEventNotificationJobs, supersedeUnsentNotificationJobs } from "./notifications";
-import type { EventNotificationDetails } from "./notifications";
+import { enqueueEventNotificationJobs, supersedeUnsentNotificationJobs } from "./notification-queue";
+import type { EventNotificationDetails } from "./notification-contract";
 import type { AuthenticatedSite } from "./site-auth";
 import {
   eventTimestamp,

@@ -3,7 +3,7 @@ import type { PoolClient } from "pg";
 import { apiFailure } from "./api-response";
 import { withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
-import { enqueueNotificationJob } from "./notifications";
+import { enqueueNotificationJob } from "./notification-queue";
 import type { AuthenticatedSite } from "./site-auth";
 
 const MAX_BODY_BYTES = 64 * 1024;
