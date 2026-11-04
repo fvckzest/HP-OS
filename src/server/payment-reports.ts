@@ -10,8 +10,8 @@ import { issuePaidOrder } from "./ticket-issuance-service";
 import { paymentAttemptData } from "./payment-attempts";
 import type { AttemptRow } from "./payment-attempts";
 import type { AuthenticatedSite } from "./site-auth";
+import { isObject as object, isUuid, readJsonObject } from "./http-request";
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RFC3339_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 const OUTCOMES = new Set(["processing", "paid", "failed", "canceled", "unknown"]);
 
@@ -126,10 +126,6 @@ interface PaymentIssueRow {
   resolution_created_at: Date | null;
 }
 
-function object(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
 function validTimestamp(value: unknown): value is string {
   return typeof value === "string" && RFC3339_PATTERN.test(value) && Number.isFinite(Date.parse(value));
 }
@@ -150,7 +146,7 @@ function parseInput(value: Record<string, unknown>): ReportInput | Response {
   if (required.some((key) => !Object.hasOwn(value, key))) {
     return apiFailure(422, "validation_failed", "A payment report must include every required field, using null for unknown values.");
   }
-  if (typeof value.connection_id !== "string" || !UUID_PATTERN.test(value.connection_id)) {
+  if (!isUuid(value.connection_id)) {
     return apiFailure(422, "validation_failed", "connection_id must be a UUID.");
   }
   if (!validReference(value.source_reference) || !validReference(value.provider_checkout_reference)) {
@@ -243,18 +239,12 @@ function parseResolutionInput(value: Record<string, unknown>): ResolutionInput |
 }
 
 async function readJsonBody(request: Request): Promise<Record<string, unknown> | Response> {
-  if (request.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "application/json") {
-    return apiFailure(415, "unsupported_media_type", "Send payment-resolution fields as application/json.");
-  }
-  let bodyText: string;
-  try { bodyText = await request.text(); }
-  catch { return apiFailure(400, "invalid_request", "The payment-resolution body could not be read."); }
-  if (Buffer.byteLength(bodyText, "utf8") > 64 * 1024) return apiFailure(413, "request_too_large", "The request body exceeds 64 KiB.");
-  let body: unknown;
-  try { body = JSON.parse(bodyText); }
-  catch { return apiFailure(400, "invalid_request", "The payment-resolution body must contain readable JSON."); }
-  if (!object(body)) return apiFailure(400, "invalid_request", "The payment-resolution body must be a JSON object.");
-  return body;
+  return readJsonObject(request, {
+    unsupportedMediaType: "Send payment-resolution fields as application/json.",
+    readError: "The payment-resolution body could not be read.",
+    invalidJson: "The payment-resolution body must contain readable JSON.",
+    nonObject: "The payment-resolution body must be a JSON object.",
+  });
 }
 
 function fingerprint(input: ReportInput): string {
@@ -748,18 +738,14 @@ async function maybeIssuePaidOrder(response: Response, site: AuthenticatedSite):
 export async function handlePaymentReportPost(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
   if (request.method !== "POST" || path.length !== 4 || path[0] !== "admin"
     || path[1] !== "payment-attempts" || path[3] !== "payment-reports") return null;
-  if (!UUID_PATTERN.test(path[2])) return apiFailure(404, "not_found", "The payment attempt is not available to this Site.");
-  if (request.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "application/json") {
-    return apiFailure(415, "unsupported_media_type", "Send payment-report fields as application/json.");
-  }
-  let bodyText: string;
-  try { bodyText = await request.text(); }
-  catch { return apiFailure(400, "invalid_request", "The payment-report body could not be read."); }
-  if (Buffer.byteLength(bodyText, "utf8") > 64 * 1024) return apiFailure(413, "request_too_large", "The request body exceeds 64 KiB.");
-  let body: unknown;
-  try { body = JSON.parse(bodyText); }
-  catch { return apiFailure(400, "invalid_request", "The payment-report body must contain readable JSON."); }
-  if (!object(body)) return apiFailure(400, "invalid_request", "The payment-report body must be a JSON object.");
+  if (!isUuid(path[2])) return apiFailure(404, "not_found", "The payment attempt is not available to this Site.");
+  const body = await readJsonObject(request, {
+    unsupportedMediaType: "Send payment-report fields as application/json.",
+    readError: "The payment-report body could not be read.",
+    invalidJson: "The payment-report body must contain readable JSON.",
+    nonObject: "The payment-report body must be a JSON object.",
+  });
+  if (body instanceof Response) return body;
   const input = parseInput(body);
   if (input instanceof Response) return input;
 
@@ -772,7 +758,7 @@ export async function handlePaymentReportPost(request: Request, site: Authentica
 export async function handlePaymentResolutionPost(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
   if (request.method !== "POST" || path.length !== 5 || path[0] !== "admin"
     || path[1] !== "payment-attempts" || path[3] !== "actions" || path[4] !== "resolve") return null;
-  if (!UUID_PATTERN.test(path[2])) return apiFailure(404, "not_found", "The payment attempt is not available to this Site.");
+  if (!isUuid(path[2])) return apiFailure(404, "not_found", "The payment attempt is not available to this Site.");
   const body = await readJsonBody(request);
   if (body instanceof Response) return body;
   const input = parseResolutionInput(body);
@@ -786,7 +772,7 @@ export async function handlePaymentResolutionPost(request: Request, site: Authen
 
 export async function handlePaymentInvestigationGet(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
   if (request.method !== "GET" || path.length !== 3 || path[0] !== "admin"
-    || path[1] !== "payment-attempts" || !UUID_PATTERN.test(path[2])) return null;
+    || path[1] !== "payment-attempts" || !isUuid(path[2])) return null;
   const client = await getBusinessPool().connect();
   try {
     const result = await client.query<LockedAttempt>(

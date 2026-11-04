@@ -3,8 +3,7 @@ import type { PoolClient } from "pg";
 import { getBusinessPool } from "./database";
 import { apiFailure, apiSuccess } from "./api-response";
 import type { AuthenticatedSite } from "./site-auth";
-
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+import { isUuid } from "./http-request";
 
 export interface IdempotentResult {
   data: unknown;
@@ -70,7 +69,7 @@ export async function withApiIdempotency(
   legacyPostBody?: unknown,
 ): Promise<Response> {
   const key = request.headers.get("idempotency-key") ?? "";
-  if (!UUID_PATTERN.test(key)) {
+  if (!isUuid(key)) {
     return apiFailure(422, "validation_failed", "Idempotency-Key must be a UUID.", {
       details: [{ field: "headers.Idempotency-Key", code: "invalid_uuid", message: "Provide a UUID for this operation." }],
     });

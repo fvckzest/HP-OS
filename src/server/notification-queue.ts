@@ -1,8 +1,7 @@
 import type { PoolClient } from "pg";
+import { isUuid, MAX_JSON_BODY_BYTES } from "./http-request";
 import {
-  MAX_BODY_BYTES,
   NOTIFICATION_KINDS,
-  UUID_PATTERN,
   expectedRecordIds,
   type EventNotificationBatch,
   type NewNotificationJob,
@@ -18,7 +17,7 @@ import {
  * must call this before committing the business change that requires delivery.
  */
 export async function enqueueNotificationJob(client: PoolClient, input: NewNotificationJob): Promise<string> {
-  if (!UUID_PATTERN.test(input.siteId) || !NOTIFICATION_KINDS.includes(input.kind)) throw new Error("Notification producer supplied an invalid Site ID or notification kind.");
+  if (!isUuid(input.siteId) || !NOTIFICATION_KINDS.includes(input.kind)) throw new Error("Notification producer supplied an invalid Site ID or notification kind.");
   if (!expectedRecordIds(input.kind, input)) throw new Error("Notification producer supplied record references that do not match the job kind.");
   if (!validateNotificationPayload(input.kind, input.payload)) throw new Error("Notification producer supplied a payload that does not match the documented job kind.");
   const computedAccessTokenHash = input.kind === "access_approved"
@@ -27,7 +26,7 @@ export async function enqueueNotificationJob(client: PoolClient, input: NewNotif
   if (input.kind !== "access_approved" && input.accessRequestTokenHash != null) throw new Error("Only access approval jobs may carry an approval token digest.");
   if (computedAccessTokenHash !== null && input.accessRequestTokenHash != null && computedAccessTokenHash !== input.accessRequestTokenHash) throw new Error("Notification producer supplied an approval token digest that does not match its payload.");
   if (input.availableAt && !Number.isFinite(input.availableAt.getTime())) throw new Error("Notification producer supplied an invalid availability time.");
-  if (Buffer.byteLength(JSON.stringify(input.payload), "utf8") > MAX_BODY_BYTES) throw new Error("Notification producer supplied a payload larger than 64 KiB.");
+  if (Buffer.byteLength(JSON.stringify(input.payload), "utf8") > MAX_JSON_BODY_BYTES) throw new Error("Notification producer supplied a payload larger than 64 KiB.");
   const result = await client.query<{ id: string }>(
     `insert into hpos.notification_jobs (
        site_id, kind, event_id, order_id, access_request_id, access_request_token_hash, ticket_id,
@@ -47,7 +46,7 @@ export async function enqueueNotificationJob(client: PoolClient, input: NewNotif
  * partial fan-out cannot commit independently of the Event mutation.
  */
 export async function enqueueEventNotificationJobs(client: PoolClient, input: EventNotificationBatch): Promise<number> {
-  if (!UUID_PATTERN.test(input.siteId) || !UUID_PATTERN.test(input.eventId)) {
+  if (!isUuid(input.siteId) || !isUuid(input.eventId)) {
     throw new Error("Event notification batch supplied an invalid Site or Event ID.");
   }
   if (input.event.event_id !== input.eventId) {
@@ -109,7 +108,7 @@ export async function enqueueEventNotificationJobs(client: PoolClient, input: Ev
 
 /** Supersede only unsent work; unknown or completed provider effects stay visible. */
 export async function supersedeUnsentNotificationJobs(client: PoolClient, input: { siteId: string; kinds: NotificationKind[]; orderId?: string; accessRequestId?: string; eventId?: string }): Promise<number> {
-  if (!UUID_PATTERN.test(input.siteId) || input.kinds.length === 0
+  if (!isUuid(input.siteId) || input.kinds.length === 0
     || (!input.orderId && !input.accessRequestId && !input.eventId)) return 0;
   const result = await client.query(
     `update hpos.notification_jobs

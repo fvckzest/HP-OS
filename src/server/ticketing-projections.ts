@@ -1,13 +1,10 @@
 import { createHash } from "node:crypto";
 import type { PoolClient, QueryResultRow } from "pg";
-import { apiFailure } from "./api-response";
 import { getBusinessPool } from "./database";
 import type { PublicEventProjectionRow } from "./event-projection";
 
-export const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 export const TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,128}$/;
 export const MAX_ISSUANCE_BATCH = 50;
-export const MAX_BODY_BYTES = 64 * 1024;
 
 export function noStore(response: Response): Response {
   response.headers.set("Cache-Control", "no-store");
@@ -80,21 +77,6 @@ export function safeNumber(value: string | number | null): number | null {
   return Number.isSafeInteger(parsed) ? parsed : null;
 }
 
-export function object(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-export function hasOnlyKeys(value: Record<string, unknown>, allowed: string[]): boolean {
-  return Object.keys(value).every((key) => allowed.includes(key));
-}
-
-export function actor(value: unknown): { type: "user" | "system"; reference: string } | null {
-  if (!object(value) || !hasOnlyKeys(value, ["type", "reference"])) return null;
-  if ((value.type !== "user" && value.type !== "system") || typeof value.reference !== "string") return null;
-  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(value.reference)) return null;
-  return { type: value.type, reference: value.reference.trim() };
-}
-
 export function expectedVersion(value: unknown): number | null {
   return Number.isSafeInteger(value) && Number(value) > 0 ? Number(value) : null;
 }
@@ -111,21 +93,6 @@ export function recoveryText(value: unknown, maximum = 500): value is string {
     && value.trim().length > 0
     && value.length <= maximum
     && !/[\u0000-\u001f\u007f]/.test(value);
-}
-
-export async function readJsonBody(request: Request): Promise<Record<string, unknown> | Response> {
-  if (request.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "application/json") {
-    return apiFailure(415, "unsupported_media_type", "Send recovery action fields as application/json.");
-  }
-  let text: string;
-  try { text = await request.text(); }
-  catch { return apiFailure(400, "invalid_request", "The recovery action body could not be read."); }
-  if (Buffer.byteLength(text, "utf8") > MAX_BODY_BYTES) return apiFailure(413, "request_too_large", "The request body exceeds 64 KiB.");
-  let value: unknown;
-  try { value = JSON.parse(text); }
-  catch { return apiFailure(400, "invalid_request", "The recovery action body must contain readable JSON."); }
-  if (!object(value)) return apiFailure(400, "invalid_request", "The recovery action body must be a JSON object.");
-  return value;
 }
 
 export function eventNotificationDetails(event: Record<string, unknown>, eventId: string) {

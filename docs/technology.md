@@ -11,6 +11,10 @@ This document records the technology and implementation-order decisions agreed d
 
 These choices prioritize a manageable first release while preserving the user's intended path to self-hosting and Rust. They do not change the [API contract](api/api.md) or the [Site ownership and credential boundaries](ownership.md).
 
+## HTTP request mechanics
+
+`src/server/http-request.ts` owns the shared HTTP mechanics used by `/v1` handlers: content-type checks, streamed JSON-object reading with a 64 KiB limit, UUID recognition, allowed-key checks, and the common Site-local actor shape. The reader stops and cancels the request stream as soon as the limit is exceeded, instead of buffering an oversized body first. Event, checkout, payment, Admission, notification, recovery, and mapping handlers keep their operation-specific field and business validation in their own modules. Fee and Ticket-recovery actor rules remain local where their accepted reference semantics differ. This boundary reduces drift while preserving the documented response codes and operation ownership; it was settled during [issue #128](https://github.com/fvckzest/HP-OS/issues/128).
+
 ## Database access and changes
 
 - Execute SQL directly from the backend rather than adding an ORM, so database transactions and queries remain explicit.
@@ -50,6 +54,7 @@ Issue #23 implements the local foundation with Supabase CLI-managed PostgreSQL a
 - Run the database-dependent Next.js application and HP-OS and Site processing locally against test data. Exercise scheduled processing through a local scheduler or test runner using the same processing code; Vercel Cron is the hosted scheduling target, not evidence of local execution.
 - Run `pnpm worker:local` in another terminal to exercise the same HP-OS recovery route used by Vercel Cron. Set `HPOS_LOCAL_WORKER_ORIGIN` only to a loopback origin when using a nondefault development port.
 - Run `pnpm verify:notifications` after the local test database is ready. It creates synthetic Sites and notification jobs, exercises the Site-authenticated HTTP API and local scheduler with simulated Site reports, then removes its fixtures. It does not call a provider or verify an LMNL worker.
+- Run `pnpm verify:http-request` without a database to check the shared JSON reader's media-type, parsing, object-shape, exact-limit, oversized-stream, and chunked-body behavior.
 - Run `pnpm benchmark:events` after the local test database is ready to seed and remove a synthetic Event with 1,000 paid Orders and 8,000 issued Tickets. It measures Event arrival, cancellation, and archival mutation duration, an intentional harness-held Event lock interval, concurrent quote and notification claims, retries, rollback, job counts, and Site isolation. It checks the local 5-second mutation target against the observed 300-second Vercel production function timeout; the deployment configuration came from older code, so this is not hosted performance evidence. The lock interval is not a direct PostgreSQL lock-wait measurement. Results and environment details are in [Event fan-out sizing](features/events.md#event-fan-out-size-and-mutation-budget).
 - Keep local database services private. A Vercel Preview deployment does not automatically have access to the local Docker database. Do not expose that database publicly to enable Preview testing.
 - Apply the reviewed migrations to hosted Supabase when capacity is available for cutover preparation. Verify hosted database connectivity, scheduler behavior, provider callbacks, and the complete LMNL integration before switching production traffic. Local proof does not establish hosted readiness.

@@ -7,9 +7,8 @@ import { getBusinessPool } from "./database";
 import { salesStatus } from "./event-projection";
 import type { EventSalesState } from "./event-projection";
 import type { AuthenticatedSite } from "./site-auth";
+import { hasOnlyKeys, isObject as object, isUuid, readJsonObject } from "./http-request";
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const MAX_BODY_BYTES = 64 * 1024;
 const MAX_PUBLIC_QUANTITY = 8;
 const MAX_AMOUNT = BigInt(Number.MAX_SAFE_INTEGER);
 
@@ -76,31 +75,17 @@ interface PaymentConnectionRow extends QueryResultRow {
   provider_mapping: Record<string, unknown> | null;
 }
 
-function object(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function hasOnlyKeys(value: Record<string, unknown>, keys: string[]): boolean {
-  return Object.keys(value).every((key) => keys.includes(key));
-}
-
 function fieldError(field: string, code: string, message: string): Response {
   return apiFailure(422, "validation_failed", message, { details: [{ field, code, message }] });
 }
 
 async function readJsonBody(request: Request): Promise<Record<string, unknown> | Response> {
-  if (request.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "application/json") {
-    return apiFailure(415, "unsupported_media_type", "Send checkout fields as application/json.");
-  }
-  let text: string;
-  try { text = await request.text(); }
-  catch { return apiFailure(400, "invalid_request", "The request body could not be read as JSON."); }
-  if (Buffer.byteLength(text, "utf8") > MAX_BODY_BYTES) return apiFailure(413, "request_too_large", "The request body exceeds 64 KiB.");
-  let value: unknown;
-  try { value = JSON.parse(text); }
-  catch { return apiFailure(400, "invalid_request", "The request body must contain readable JSON."); }
-  if (!object(value)) return apiFailure(400, "invalid_request", "The request body must be a JSON object.");
-  return value;
+  return readJsonObject(request, {
+    unsupportedMediaType: "Send checkout fields as application/json.",
+    readError: "The request body could not be read as JSON.",
+    invalidJson: "The request body must contain readable JSON.",
+    nonObject: "The request body must be a JSON object.",
+  });
 }
 
 function operationError(status: number, code: string, message: string, details: Array<{ field: string; code: string; message: string }> = []): never {
@@ -350,7 +335,7 @@ function parseBuyer(value: unknown): { name: string; email: string; normalizedEm
 
 function parseOrderRequest(body: Record<string, unknown>): { quoteId: string; buyer: { name: string; email: string; normalizedEmail: string }; accessRequestToken: string | null } | Response {
   if (!hasOnlyKeys(body, ["quote_id", "buyer", "access_request_token"])) return fieldError("body", "unknown_field", "An Order accepts quote_id, buyer, and an optional approval token.");
-  if (typeof body.quote_id !== "string" || !UUID_PATTERN.test(body.quote_id)) return fieldError("quote_id", "invalid_uuid", "Provide the quote_id returned by the quote operation.");
+  if (!isUuid(body.quote_id)) return fieldError("quote_id", "invalid_uuid", "Provide the quote_id returned by the quote operation.");
   const buyer = parseBuyer(body.buyer);
   if (buyer instanceof Response) return buyer;
   const token = parseApprovalToken(body.access_request_token);
@@ -566,7 +551,7 @@ async function createOrder(
 export async function handleCheckoutPost(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
   if (path.length === 4 && path[0] === "public" && path[1] === "events" && path[3] === "quotes") {
     const eventId = path[2];
-    if (!UUID_PATTERN.test(eventId)) return apiFailure(404, "not_found", "The Event is not available for public checkout.");
+    if (!isUuid(eventId)) return apiFailure(404, "not_found", "The Event is not available for public checkout.");
     const body = await readJsonBody(request);
     if (body instanceof Response) return body;
     const input = parseQuoteRequest(body);

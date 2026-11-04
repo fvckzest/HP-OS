@@ -4,8 +4,8 @@ import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import { readAdminEvent } from "./events";
 import type { AuthenticatedSite } from "./site-auth";
+import { hasOnlyKeys, isObject as object, isUuid, parseSiteActor, readJsonObject } from "./http-request";
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RFC3339_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 const RESOURCE_TYPES = new Set(["square_item_variation", "stripe_price"]);
 
@@ -21,25 +21,12 @@ interface Actor {
   reference: string;
 }
 
-function object(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function hasOnlyKeys(value: Record<string, unknown>, allowed: string[]): boolean {
-  return Object.keys(value).every((key) => allowed.includes(key));
-}
-
 function operationError(status: number, code: string, message: string, details: Array<{ field: string; code: string; message: string }> = []): never {
   throw new ApiOperationError(status, code, message, details);
 }
 
 function actorFrom(value: unknown): Actor | null {
-  if (!object(value) || !hasOnlyKeys(value, ["type", "reference"])
-    || (value.type !== "user" && value.type !== "system")
-    || typeof value.reference !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(value.reference.trim())) {
-    return null;
-  }
-  return { type: value.type, reference: value.reference.trim() };
+  return parseSiteActor(value);
 }
 
 function numericVersion(value: unknown): number | null {
@@ -47,18 +34,12 @@ function numericVersion(value: unknown): number | null {
 }
 
 async function readJsonBody(request: Request): Promise<Record<string, unknown> | Response> {
-  if (request.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "application/json") {
-    return apiFailure(415, "unsupported_media_type", "Send provider-mapping fields as application/json.");
-  }
-  let text: string;
-  try { text = await request.text(); }
-  catch { return apiFailure(400, "invalid_request", "The provider-mapping body could not be read."); }
-  if (Buffer.byteLength(text, "utf8") > 64 * 1024) return apiFailure(413, "request_too_large", "The request body exceeds 64 KiB.");
-  let value: unknown;
-  try { value = JSON.parse(text); }
-  catch { return apiFailure(400, "invalid_request", "The provider-mapping body must contain readable JSON."); }
-  if (!object(value)) return apiFailure(400, "invalid_request", "The provider-mapping body must be a JSON object.");
-  return value;
+  return readJsonObject(request, {
+    unsupportedMediaType: "Send provider-mapping fields as application/json.",
+    readError: "The provider-mapping body could not be read.",
+    invalidJson: "The provider-mapping body must contain readable JSON.",
+    nonObject: "The provider-mapping body must be a JSON object.",
+  });
 }
 
 async function lockEvent(client: PoolClient, siteId: string, eventId: string) {
@@ -229,7 +210,7 @@ async function deleteMapping(
 }
 
 function validIds(eventId: string, connectionId: string): boolean {
-  return UUID_PATTERN.test(eventId) && UUID_PATTERN.test(connectionId);
+  return isUuid(eventId) && isUuid(connectionId);
 }
 
 function mapMappingDatabaseError(error: unknown): Response | null {

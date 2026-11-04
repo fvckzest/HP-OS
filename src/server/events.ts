@@ -16,14 +16,12 @@ import {
 } from "./event-projection";
 import type { PublicEventProjectionRow } from "./event-projection";
 import { enqueueWalletUpdateJobsForEvent } from "./wallet-data";
+import { hasOnlyKeys, isObject as object, isUuid, parseSiteActor, readJsonObject } from "./http-request";
 
 export { publicEventData, salesStatus } from "./event-projection";
 export type { EventSalesState, SalesStatus } from "./event-projection";
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RFC3339_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
-const MAX_BODY_BYTES = 64 * 1024;
-const ACTOR_REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 
 interface Actor {
   type: "user" | "system";
@@ -81,14 +79,6 @@ interface EventInput {
   };
 }
 
-function object(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function hasOnlyKeys(value: Record<string, unknown>, keys: string[]): boolean {
-  return Object.keys(value).every((key) => keys.includes(key));
-}
-
 function fieldError(field: string, code: string, message: string): Response {
   return apiFailure(422, "validation_failed", message, {
     details: [{ field, code, message }],
@@ -103,11 +93,7 @@ function validPlainText(value: unknown, maximum: number, allowEmpty = false): va
 }
 
 function actorFrom(value: unknown): Actor | null {
-  if (!object(value) || !hasOnlyKeys(value, ["type", "reference"])) return null;
-  if ((value.type !== "user" && value.type !== "system") || typeof value.reference !== "string") return null;
-  const reference = value.reference.trim();
-  if (!ACTOR_REFERENCE_PATTERN.test(reference)) return null;
-  return { type: value.type, reference };
+  return parseSiteActor(value);
 }
 
 function offsetMinutes(value: string): number {
@@ -344,18 +330,12 @@ function parseEventInput(value: Record<string, unknown>): EventInput | Response 
 }
 
 async function readJsonBody(request: Request): Promise<Record<string, unknown> | Response> {
-  if (request.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "application/json") {
-    return apiFailure(415, "unsupported_media_type", "Send Event fields as application/json.");
-  }
-  let text: string;
-  try { text = await request.text(); }
-  catch { return apiFailure(400, "invalid_request", "The request body could not be read as JSON."); }
-  if (Buffer.byteLength(text, "utf8") > MAX_BODY_BYTES) return apiFailure(413, "request_too_large", "The request body exceeds 64 KiB.");
-  let value: unknown;
-  try { value = JSON.parse(text); }
-  catch { return apiFailure(400, "invalid_request", "The request body must contain readable JSON."); }
-  if (!object(value)) return apiFailure(400, "invalid_request", "The request body must be a JSON object.");
-  return value;
+  return readJsonObject(request, {
+    unsupportedMediaType: "Send Event fields as application/json.",
+    readError: "The request body could not be read as JSON.",
+    invalidJson: "The request body must contain readable JSON.",
+    nonObject: "The request body must be a JSON object.",
+  });
 }
 
 function eventData(row: EventRow, admin: boolean): Record<string, unknown> {
@@ -656,7 +636,7 @@ function parseCursor(value: string | null, site: AuthenticatedSite, mode: string
     const suppliedSignature = Buffer.from(signature, "base64url");
     if (suppliedSignature.length !== expectedSignature.length || !timingSafeEqual(suppliedSignature, expectedSignature)) throw new Error();
     const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as unknown;
-    if (!object(decoded) || decoded.mode !== mode || decoded.siteId !== site.siteId || decoded.scope !== scope || typeof decoded.at !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(decoded.at) || !UUID_PATTERN.test(String(decoded.id ?? ""))) throw new Error();
+    if (!object(decoded) || decoded.mode !== mode || decoded.siteId !== site.siteId || decoded.scope !== scope || typeof decoded.at !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(decoded.at) || !isUuid(String(decoded.id ?? ""))) throw new Error();
     if (!Number.isFinite(Date.parse(decoded.at))) throw new Error();
     if (typeof decoded.issuedAt !== "string" || !RFC3339_PATTERN.test(decoded.issuedAt)) throw new Error();
     const issuedAt = Date.parse(decoded.issuedAt);
@@ -779,7 +759,7 @@ async function listEvents(request: Request, site: AuthenticatedSite, admin: bool
 }
 
 async function readEvent(site: AuthenticatedSite, eventId: string, admin: boolean): Promise<Response> {
-  if (!UUID_PATTERN.test(eventId)) return apiFailure(404, "not_found", "The Event is not available to this Site.");
+  if (!isUuid(eventId)) return apiFailure(404, "not_found", "The Event is not available to this Site.");
   if (admin) {
     const client = await getBusinessPool().connect();
     try {
@@ -1064,7 +1044,7 @@ export async function handleEventPost(request: Request, site: AuthenticatedSite,
 export async function handleEventPatch(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
   if (path.length !== 3 || path[0] !== "admin" || path[1] !== "events") return null;
   const eventId = path[2];
-  if (!UUID_PATTERN.test(eventId)) return apiFailure(404, "not_found", "The Event is not available to this Site.");
+  if (!isUuid(eventId)) return apiFailure(404, "not_found", "The Event is not available to this Site.");
   const body = await readJsonBody(request);
   if (body instanceof Response) return body;
   if (!hasOnlyKeys(body, ["actor", "expected_version", "title", "description", "event_type", "logo_path", "venue", "starts_at", "ends_at", "time_zone", "check_in_opens_at", "visibility", "ticket_offering"])) {
@@ -1082,7 +1062,7 @@ export async function handleEventPatch(request: Request, site: AuthenticatedSite
 
 export async function handleEventActionPost(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
   if (path.length !== 5 || path[0] !== "admin" || path[1] !== "events" || path[3] !== "actions") return null;
-  if (!UUID_PATTERN.test(path[2])) return apiFailure(404, "not_found", "The Event is not available to this Site.");
+  if (!isUuid(path[2])) return apiFailure(404, "not_found", "The Event is not available to this Site.");
   const body = await readJsonBody(request);
   if (body instanceof Response) return body;
   if (!hasOnlyKeys(body, ["actor", "expected_version"])) return fieldError("body", "unknown_field", "Only actor and expected_version are accepted for this action.");
