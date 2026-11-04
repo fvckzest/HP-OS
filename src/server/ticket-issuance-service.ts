@@ -2,7 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import { getBusinessPool } from "./database";
 import { publicEventData } from "./events";
-import { enqueueNotificationJob } from "./notifications";
+import { enqueueNotificationJob } from "./notification-queue";
 import {
   IssuanceRow, MAX_ISSUANCE_BATCH, eventNotificationDetails, hashToken, readIssuanceRow,
 } from "./ticketing-projections";

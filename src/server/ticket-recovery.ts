@@ -4,7 +4,7 @@ import { apiFailure } from "./api-response";
 import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import { publicEventData } from "./events";
-import { enqueueNotificationJob, supersedeUnsentNotificationJobs } from "./notifications";
+import { enqueueNotificationJob, supersedeUnsentNotificationJobs } from "./notification-queue";
 import type { AuthenticatedSite } from "./site-auth";
 import { readAdminOrder } from "./admin-order";
 import {

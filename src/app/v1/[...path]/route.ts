@@ -2,7 +2,7 @@ import { apiFailure, apiSuccess, withRequestCorrelation } from "@/server/api-res
 import { apiFailureContract, classifyApiFailure, emitServerDiagnostic, operationForV1, requestId } from "@/server/api-diagnostics";
 import { authenticateSiteRequest } from "@/server/site-auth";
 import { isPaymentConnectionId, readSitePaymentConfiguration, readSitePaymentConnection } from "@/server/site-payment-configuration";
-import { handleNotificationGet, handleNotificationPost } from "@/server/notifications";
+import { handleNotificationGet, handleNotificationPost } from "@/server/notification-worker";
 import { handleCheckoutPost } from "@/server/checkout";
 import { handlePaymentAttemptGet, handlePaymentAttemptPost } from "@/server/payment-attempts";
 import { handleAdminOrderGet, handleAdminOrderPaymentStatusGet } from "@/server/admin-order";
