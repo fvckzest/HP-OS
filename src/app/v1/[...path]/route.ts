@@ -5,7 +5,9 @@ import { isPaymentConnectionId, readSitePaymentConfiguration, readSitePaymentCon
 import { handleNotificationGet, handleNotificationPost } from "@/server/notifications";
 import { handleCheckoutPost } from "@/server/checkout";
 import { handlePaymentAttemptGet, handlePaymentAttemptPost } from "@/server/payment-attempts";
-import { handleAdminOrderActionPost, handleAdminOrderGet, handleAdminOrderPaymentStatusGet, handleBuyerOrderGet, handleBuyerTicketGet } from "@/server/ticket-issuance";
+import { handleAdminOrderGet, handleAdminOrderPaymentStatusGet } from "@/server/admin-order";
+import { handleAdminOrderActionPost } from "@/server/ticket-recovery";
+import { handleBuyerOrderGet, handleBuyerTicketGet } from "@/server/buyer-access";
 import { handlePaymentInvestigationGet, handlePaymentReportPost, handlePaymentResolutionPost } from "@/server/payment-reports";
 import { handleRefundReportPost } from "@/server/refunds";
 import { handleEventActionPost, handleEventGet, handleEventPatch, handleEventPost } from "@/server/events";

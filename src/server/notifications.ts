@@ -1073,7 +1073,7 @@ export async function handleScheduledProcessing(request: Request): Promise<Respo
   }
   try {
     const processing = await runBoundedProcessing(production ? "vercel_cron" : "local_scheduler", invocationId);
-    const issuance = await (await import("./ticket-issuance")).processPendingTicketIssuance();
+    const issuance = await (await import("./ticket-issuance-service")).processPendingTicketIssuance();
     return withRequestCorrelation(apiSuccess({
       ...processing,
       has_more: processing.has_more || issuance.has_more,

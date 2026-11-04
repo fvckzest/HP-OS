@@ -6,7 +6,7 @@ import { ApiOperationError } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
 import { enqueueNotificationJob } from "./notifications";
-import { issuePaidOrder } from "./ticket-issuance";
+import { issuePaidOrder } from "./ticket-issuance-service";
 import { paymentAttemptData } from "./payment-attempts";
 import type { AttemptRow } from "./payment-attempts";
 import type { AuthenticatedSite } from "./site-auth";
