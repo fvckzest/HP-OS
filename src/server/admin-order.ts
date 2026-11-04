@@ -3,13 +3,14 @@ import { apiFailure, apiSuccess } from "./api-response";
 import { getBusinessPool } from "./database";
 import { publicEventData } from "./event-projection";
 import { readFeeRecords } from "./fee-reports";
+import { isUuid } from "./http-request";
 import type { AuthenticatedSite } from "./site-auth";
 import {
-  AdminTicketRow, IssuanceRow, UUID_PATTERN, adminTicketData, noStore, readIssuanceRow, recoveryDeliveryState, safeNumber,
+  AdminTicketRow, IssuanceRow, adminTicketData, noStore, readIssuanceRow, recoveryDeliveryState, safeNumber,
 } from "./ticketing-projections";
 
 export async function readAdminOrder(site: AuthenticatedSite, orderId: string, existingClient?: PoolClient): Promise<Response> {
-  if (!UUID_PATTERN.test(orderId)) return apiFailure(404, "not_found", "The Order is not available to this Site.");
+  if (!isUuid(orderId)) return apiFailure(404, "not_found", "The Order is not available to this Site.");
   const pool = getBusinessPool();
   const client = existingClient ?? await pool.connect();
   try {
@@ -283,7 +284,7 @@ export async function handleAdminOrderGet(site: AuthenticatedSite, path: string[
 export async function handleAdminOrderPaymentStatusGet(site: AuthenticatedSite, path: string[]): Promise<Response | null> {
   if (path.length !== 4 || path[0] !== "admin" || path[1] !== "orders"
     || path[3] !== "payment-status") return null;
-  if (!UUID_PATTERN.test(path[2])) return apiFailure(404, "not_found", "The Order is not available to this Site.");
+  if (!isUuid(path[2])) return apiFailure(404, "not_found", "The Order is not available to this Site.");
   const result = await getBusinessPool().query<{
     id: string;
     order_reference: string;

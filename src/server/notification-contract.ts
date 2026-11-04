@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { QueryResultRow } from "pg";
+import { hasOnlyKeys, isObject as object, isUuid } from "./http-request";
 
 export const NOTIFICATION_KINDS = [
   "access_approved",
@@ -71,8 +72,6 @@ export type EventNotificationBatch =
     };
 
 export const MAX_CLAIM_SIZE = 100;
-export const MAX_BODY_BYTES = 64 * 1024;
-export const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 export const RFC3339_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 export interface NotificationJobRow extends QueryResultRow {
@@ -100,14 +99,6 @@ export interface NotificationJobRow extends QueryResultRow {
   lease_fence: number | string;
 }
 
-export function object(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-export function hasOnlyKeys(value: Record<string, unknown>, allowed: string[]): boolean {
-  return Object.keys(value).every((key) => allowed.includes(key));
-}
-
 export function validText(value: unknown, maximum = 500): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= maximum && !/[\u0000-\u001f\u007f]/.test(value);
 }
@@ -131,7 +122,7 @@ export function validTimestamp(value: unknown): value is string {
 export function validateEventDetails(value: unknown, includeChangedFields: boolean): value is EventNotificationDetails {
   if (!object(value)) return false;
   const allowed = ["event_id", "event_reference", "title", "starts_at", "ends_at", "time_zone", "venue", ...(includeChangedFields ? ["changed_fields"] : [])];
-  if (!hasOnlyKeys(value, allowed) || !UUID_PATTERN.test(String(value.event_id ?? "")) || !validText(value.event_reference) || !validText(value.title, 200)) return false;
+  if (!hasOnlyKeys(value, allowed) || !isUuid(String(value.event_id ?? "")) || !validText(value.event_reference) || !validText(value.title, 200)) return false;
   if (!validTimestamp(value.starts_at) || !validTimestamp(value.ends_at) || !validText(value.time_zone, 100)) return false;
   if (!object(value.venue) || !hasOnlyKeys(value.venue, ["name", "address"]) || !validText(value.venue.name, 200)) return false;
   if (value.venue.address !== null && !validText(value.venue.address, 1000)) return false;
@@ -151,33 +142,33 @@ export function validateNotificationPayload(kind: NotificationKind, value: unkno
   if (kind === "tickets_ready") {
     if (!hasOnlyKeys(value, ["recipient_email", "buyer_name", "event", "order"]) || !validEmail(value.recipient_email) || !validText(value.buyer_name, 200)) return false;
     if (!validateEventDetails(value.event, false) || !object(value.order) || !hasOnlyKeys(value.order, ["order_id", "order_reference", "order_token"])) return false;
-    return UUID_PATTERN.test(String(value.order.order_id ?? "")) && validText(value.order.order_reference) && validText(value.order.order_token, 2000);
+    return isUuid(String(value.order.order_id ?? "")) && validText(value.order.order_reference) && validText(value.order.order_token, 2000);
   }
   if (kind === "order_recovery") {
     if (!hasOnlyKeys(value, ["recipient_email", "orders"]) || !validEmail(value.recipient_email) || !Array.isArray(value.orders) || value.orders.length === 0) return false;
     return value.orders.every((order) => object(order) && hasOnlyKeys(order, ["order_id", "order_reference", "order_token", "expires_at"])
-      && UUID_PATTERN.test(String(order.order_id ?? "")) && validText(order.order_reference)
+      && isUuid(String(order.order_id ?? "")) && validText(order.order_reference)
       && validText(order.order_token, 2000) && validTimestamp(order.expires_at));
   }
   if (kind === "event_changed") {
     return hasOnlyKeys(value, ["recipient_email", "order", "event"]) && validEmail(value.recipient_email)
       && object(value.order) && hasOnlyKeys(value.order, ["order_id", "order_reference"])
-      && UUID_PATTERN.test(String(value.order.order_id ?? "")) && validText(value.order.order_reference)
+      && isUuid(String(value.order.order_id ?? "")) && validText(value.order.order_reference)
       && validateEventDetails(value.event, true);
   }
   if (kind === "event_canceled") {
     return hasOnlyKeys(value, ["recipient_email", "order", "event", "canceled_at"]) && validEmail(value.recipient_email)
       && object(value.order) && hasOnlyKeys(value.order, ["order_id", "order_reference"])
-      && UUID_PATTERN.test(String(value.order.order_id ?? "")) && validText(value.order.order_reference)
+      && isUuid(String(value.order.order_id ?? "")) && validText(value.order.order_reference)
       && validateEventDetails(value.event, false) && validTimestamp(value.canceled_at);
   }
   return hasOnlyKeys(value, ["ticket_id", "data_version"])
-    && UUID_PATTERN.test(String(value.ticket_id ?? "")) && validText(value.data_version, 200);
+    && isUuid(String(value.ticket_id ?? "")) && validText(value.data_version, 200);
 }
 
 export function expectedRecordIds(kind: NotificationKind, input: NewNotificationJob): boolean {
   const references = [input.eventId, input.orderId, input.accessRequestId, input.ticketId];
-  if (references.some((reference) => reference != null && !UUID_PATTERN.test(reference))) return false;
+  if (references.some((reference) => reference != null && !isUuid(reference))) return false;
   const required = {
     access_approved: Boolean(input.eventId && input.accessRequestId && !input.orderId && !input.ticketId),
     tickets_ready: Boolean(input.eventId && input.orderId && !input.accessRequestId && !input.ticketId),

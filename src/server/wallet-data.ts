@@ -5,8 +5,8 @@ import { getBusinessPool } from "./database";
 import { publicEventData } from "./event-projection";
 import { enqueueNotificationJob } from "./notification-queue";
 import type { AuthenticatedSite } from "./site-auth";
+import { isUuid } from "./http-request";
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,128}$/;
 
 function walletTimestampSql(value: string, offset: string): string {
@@ -302,7 +302,7 @@ export async function handleWalletDataGet(site: AuthenticatedSite, path: string[
   if (scope === "public" && !TOKEN_PATTERN.test(value)) {
     return apiFailure(404, "not_found", "The Ticket is not available to this Site.");
   }
-  if (scope === "admin" && !UUID_PATTERN.test(value)) {
+  if (scope === "admin" && !isUuid(value)) {
     return apiFailure(404, "not_found", "The Ticket is not available to this Site.");
   }
 

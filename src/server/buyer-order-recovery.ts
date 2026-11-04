@@ -5,8 +5,8 @@ import { withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import { enqueueNotificationJob } from "./notification-queue";
 import type { AuthenticatedSite } from "./site-auth";
+import { hasOnlyKeys, isObject as isObjectRecord, readJson } from "./http-request";
 
-const MAX_BODY_BYTES = 64 * 1024;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 function noStore(response: Response): Response {
@@ -14,33 +14,18 @@ function noStore(response: Response): Response {
   return response;
 }
 
-function isObjectRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function hasOnlyKeys(value: Record<string, unknown>, allowed: string[]): boolean {
-  return Object.keys(value).every((key) => allowed.includes(key));
-}
-
 function tokenHash(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 async function parseRecoveryBody(request: Request): Promise<{ email: string; normalizedEmail: string } | Response> {
-  if (request.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "application/json") {
-    return noStore(apiFailure(415, "unsupported_media_type", "Send the recovery email as application/json."));
-  }
-
-  let bodyText: string;
-  try { bodyText = await request.text(); }
-  catch { return noStore(apiFailure(400, "invalid_request", "The recovery request body could not be read.")); }
-  if (Buffer.byteLength(bodyText, "utf8") > MAX_BODY_BYTES) {
-    return noStore(apiFailure(413, "request_too_large", "The request body exceeds 64 KiB."));
-  }
-
-  let body: unknown;
-  try { body = JSON.parse(bodyText); }
-  catch { return noStore(apiFailure(400, "invalid_request", "The recovery request body must contain readable JSON.")); }
+  const body = await readJson(request, {
+    unsupportedMediaType: "Send the recovery email as application/json.",
+    readError: "The recovery request body could not be read.",
+    invalidJson: "The recovery request body must contain readable JSON.",
+    nonObject: "The recovery request body must be a JSON object.",
+  });
+  if (body instanceof Response) return noStore(body);
   if (!isObjectRecord(body) || !hasOnlyKeys(body, ["email"]) || typeof body.email !== "string") {
     return noStore(apiFailure(422, "validation_failed", "Provide only the buyer email address for Order recovery."));
   }

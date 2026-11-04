@@ -6,10 +6,9 @@ import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
 import type { AuthenticatedSite } from "./site-auth";
 import { enqueueWalletUpdateJobs } from "./wallet-data";
+import { hasOnlyKeys, isObject as object, isUuid, parseSiteActor, readJsonObject } from "./http-request";
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,128}$/;
-const ACTOR_REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 interface Actor {
@@ -70,10 +69,6 @@ interface LookupCursor {
   id: string;
 }
 
-function object(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
 function fieldError(field: string, code: string, message: string): Response {
   return apiFailure(422, "validation_failed", message, {
     details: [{ field, code, message }],
@@ -84,31 +79,17 @@ function operationError(status: number, code: string, message: string): never {
   throw new ApiOperationError(status, code, message);
 }
 
-function validKeys(value: Record<string, unknown>, keys: string[]): boolean {
-  return Object.keys(value).every((key) => keys.includes(key));
-}
-
 function actorFrom(value: unknown): Actor | null {
-  if (!object(value) || !validKeys(value, ["type", "reference"])) return null;
-  if ((value.type !== "user" && value.type !== "system") || typeof value.reference !== "string") return null;
-  const reference = value.reference.trim();
-  if (!ACTOR_REFERENCE_PATTERN.test(reference)) return null;
-  return { type: value.type, reference };
+  return parseSiteActor(value);
 }
 
 async function readJsonBody(request: Request): Promise<Record<string, unknown> | Response> {
-  if (request.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "application/json") {
-    return apiFailure(415, "unsupported_media_type", "Send the operation fields as application/json.");
-  }
-  let text: string;
-  try { text = await request.text(); }
-  catch { return apiFailure(400, "invalid_request", "The request body could not be read as JSON."); }
-  if (Buffer.byteLength(text, "utf8") > 64 * 1024) return apiFailure(413, "request_too_large", "The request body exceeds 64 KiB.");
-  let value: unknown;
-  try { value = JSON.parse(text); }
-  catch { return apiFailure(400, "invalid_request", "The request body must contain readable JSON."); }
-  if (!object(value)) return apiFailure(400, "invalid_request", "The request body must be a JSON object.");
-  return value;
+  return readJsonObject(request, {
+    unsupportedMediaType: "Send the operation fields as application/json.",
+    readError: "The request body could not be read as JSON.",
+    invalidJson: "The request body must contain readable JSON.",
+    nonObject: "The request body must be a JSON object.",
+  });
 }
 
 function mapAdmissionDatabaseError(error: unknown): Response | null {
@@ -154,7 +135,7 @@ function parseLookupCursor(
     const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as unknown;
     if (!object(decoded) || decoded.mode !== "ticket-lookup" || decoded.siteId !== site.siteId || decoded.scope !== scope
       || typeof decoded.at !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(decoded.at)
-      || !UUID_PATTERN.test(String(decoded.id ?? "")) || typeof decoded.issuedAt !== "string"
+      || !isUuid(String(decoded.id ?? "")) || typeof decoded.issuedAt !== "string"
       || !Number.isFinite(Date.parse(decoded.at)) || !Number.isFinite(Date.parse(decoded.issuedAt))) throw new Error();
     const issuedAt = Date.parse(decoded.issuedAt);
     if (issuedAt < Date.now() - 60 * 60 * 1000 || issuedAt > Date.now() + 60_000) throw new Error();
@@ -321,7 +302,7 @@ async function handleTicketLookup(
 ): Promise<Response> {
   const body = await readJsonBody(request);
   if (body instanceof Response) return body;
-  if (!validKeys(body, ["order_reference", "email", "limit", "cursor"])) {
+  if (!hasOnlyKeys(body, ["order_reference", "email", "limit", "cursor"])) {
     const unknown = Object.keys(body).find((key) => !["order_reference", "email", "limit", "cursor"].includes(key)) ?? "unknown";
     return fieldError(unknown, "unknown_field", "Remove the unsupported lookup field.");
   }
@@ -413,12 +394,12 @@ export async function handleAdmissionPost(
   if (path.length !== 4 || path[0] !== "admin" || path[1] !== "events"
     || (path[3] !== "admissions" && path[3] !== "ticket-lookup")) return null;
   const eventId = path[2];
-  if (!UUID_PATTERN.test(eventId)) return apiFailure(404, "not_found", "The Event is not available to this Site.");
+  if (!isUuid(eventId)) return apiFailure(404, "not_found", "The Event is not available to this Site.");
   if (path[3] === "ticket-lookup") return handleTicketLookup(request, site, eventId);
 
   const body = await readJsonBody(request);
   if (body instanceof Response) return body;
-  if (!validKeys(body, ["actor", "qr_token", "ticket_id"])) {
+  if (!hasOnlyKeys(body, ["actor", "qr_token", "ticket_id"])) {
     const unknown = Object.keys(body).find((key) => !["actor", "qr_token", "ticket_id"].includes(key)) ?? "unknown";
     return fieldError(unknown, "unknown_field", "Remove the unsupported Admission field.");
   }
@@ -430,7 +411,7 @@ export async function handleAdmissionPost(
   if (hasQrToken && (typeof body.qr_token !== "string" || !TOKEN_PATTERN.test(body.qr_token))) {
     return fieldError("qr_token", "invalid_token", "Provide the scanned admission QR token unchanged.");
   }
-  if (hasTicketId && (typeof body.ticket_id !== "string" || !UUID_PATTERN.test(body.ticket_id))) {
+  if (hasTicketId && !isUuid(body.ticket_id)) {
     return fieldError("ticket_id", "invalid_uuid", "Provide a Ticket ID selected from this Event's manual lookup results.");
   }
   const qrToken = hasQrToken ? body.qr_token as string : null;

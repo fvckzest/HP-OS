@@ -4,8 +4,8 @@ import { apiFailure, apiSuccess } from "./api-response";
 import { ApiOperationError } from "./api-idempotency";
 import { getBusinessPool } from "./database";
 import type { AuthenticatedSite } from "./site-auth";
+import { isUuid } from "./http-request";
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const STATUS_FILTERS = {
   payment_status: new Set(["unpaid", "processing", "paid", "failed", "unknown", "conflicted"]),
   issuance_status: new Set(["not_started", "pending", "issued", "failed", "blocked"]),
@@ -117,7 +117,7 @@ function parseCursor(value: string | null, site: AuthenticatedSite, mode: string
     const decoded = JSON.parse(Buffer.from(match[1], "base64url").toString("utf8")) as Record<string, unknown>;
     if (decoded.mode !== mode || decoded.siteId !== site.siteId || decoded.scope !== scope
       || typeof decoded.at !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(decoded.at)
-      || typeof decoded.id !== "string" || !UUID_PATTERN.test(decoded.id)
+      || !isUuid(decoded.id)
       || typeof decoded.issuedAt !== "string" || !Number.isFinite(Date.parse(decoded.issuedAt))) throw new Error();
     const issued = Date.parse(decoded.issuedAt);
     if (issued < Date.now() - 60 * 60 * 1000 || issued > Date.now() + 60_000) throw new Error();
@@ -524,7 +524,7 @@ async function readTotals(site: AuthenticatedSite, eventId: string): Promise<Res
 export async function handleAdminReportingGet(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
   if (path.length !== 4 || path[0] !== "admin" || path[1] !== "events" || !["orders", "tickets", "totals"].includes(path[3])) return null;
   const eventId = path[2];
-  if (!UUID_PATTERN.test(eventId)) return apiFailure(404, "not_found", "The Event is not available to this Site.");
+  if (!isUuid(eventId)) return apiFailure(404, "not_found", "The Event is not available to this Site.");
   if (path[3] === "totals") return readTotals(site, eventId);
   const exists = await eventExists(getBusinessPool(), site.siteId, eventId);
   if (!exists) return apiFailure(404, "not_found", "The Event is not available to this Site.");

@@ -8,12 +8,10 @@ import { publicEventData } from "./event-projection";
 import type { PublicEventProjectionRow } from "./event-projection";
 import { enqueueNotificationJob, supersedeUnsentNotificationJobs } from "./notification-queue";
 import type { AuthenticatedSite } from "./site-auth";
+import { hasOnlyKeys, isObject as object, isUuid, parseSiteActor, readJsonObject } from "./http-request";
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{32,200}$/;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const MAX_BODY_BYTES = 64 * 1024;
-const ACTOR_REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const RFC3339_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 type AccessStatus = "pending" | "approved" | "rejected";
@@ -52,14 +50,6 @@ function fail(status: number, code: string, message: string, details: Array<{ fi
   throw new AccessRequestError(status, code, message, details);
 }
 
-function object(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function hasOnlyKeys(value: Record<string, unknown>, keys: string[]): boolean {
-  return Object.keys(value).every((key) => keys.includes(key));
-}
-
 function validText(value: unknown, maximum: number): value is string {
   return typeof value === "string"
     && value.length <= maximum
@@ -80,10 +70,7 @@ function normalizedEmail(email: string): string {
 }
 
 function actorFrom(value: unknown): Actor | null {
-  if (!object(value) || !hasOnlyKeys(value, ["type", "reference"])) return null;
-  if ((value.type !== "user" && value.type !== "system") || typeof value.reference !== "string") return null;
-  const reference = value.reference.trim();
-  return ACTOR_REFERENCE_PATTERN.test(reference) ? { type: value.type, reference } : null;
+  return parseSiteActor(value);
 }
 
 function numericVersion(value: unknown): number | null {
@@ -95,18 +82,12 @@ function fieldError(field: string, code: string, message: string): Response {
 }
 
 async function readJsonBody(request: Request): Promise<Record<string, unknown> | Response> {
-  if (request.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "application/json") {
-    return apiFailure(415, "unsupported_media_type", "Send Access Request fields as application/json.");
-  }
-  let text: string;
-  try { text = await request.text(); }
-  catch { return apiFailure(400, "invalid_request", "The request body could not be read as JSON."); }
-  if (Buffer.byteLength(text, "utf8") > MAX_BODY_BYTES) return apiFailure(413, "request_too_large", "The request body exceeds 64 KiB.");
-  let value: unknown;
-  try { value = JSON.parse(text); }
-  catch { return apiFailure(400, "invalid_request", "The request body must contain readable JSON."); }
-  if (!object(value)) return apiFailure(400, "invalid_request", "The request body must be a JSON object.");
-  return value;
+  return readJsonObject(request, {
+    unsupportedMediaType: "Send Access Request fields as application/json.",
+    readError: "The request body could not be read as JSON.",
+    invalidJson: "The request body must contain readable JSON.",
+    nonObject: "The request body must be a JSON object.",
+  });
 }
 
 function parseSubmission(value: Record<string, unknown>): { name: string; email: string; normalizedEmail: string } | Response {
@@ -198,7 +179,7 @@ function decodeCursor(value: string | null, site: AuthenticatedSite, scope: stri
     const decoded = JSON.parse(Buffer.from(match[1], "base64url").toString("utf8")) as Record<string, unknown>;
     if (decoded.siteId !== site.siteId || decoded.route !== "admin-access-requests" || decoded.scope !== scope
       || typeof decoded.createdAt !== "string" || typeof decoded.issuedAt !== "string" || typeof decoded.id !== "string"
-      || !UUID_PATTERN.test(decoded.id) || !RFC3339_PATTERN.test(decoded.createdAt) || !RFC3339_PATTERN.test(decoded.issuedAt)) throw new Error();
+      || !isUuid(decoded.id) || !RFC3339_PATTERN.test(decoded.createdAt) || !RFC3339_PATTERN.test(decoded.issuedAt)) throw new Error();
     const issuedAt = Date.parse(decoded.issuedAt);
     if (!Number.isFinite(issuedAt) || issuedAt < Date.now() - 60 * 60 * 1000 || issuedAt > Date.now() + 60_000) throw new Error();
     return { createdAt: decoded.createdAt, id: decoded.id };
@@ -208,7 +189,7 @@ function decodeCursor(value: string | null, site: AuthenticatedSite, scope: stri
 }
 
 async function listAccessRequests(request: Request, site: AuthenticatedSite, eventId: string): Promise<Response> {
-  if (!UUID_PATTERN.test(eventId)) return apiFailure(404, "not_found", "The Event is not available to this Site.");
+  if (!isUuid(eventId)) return apiFailure(404, "not_found", "The Event is not available to this Site.");
   const eventResult = await getBusinessPool().query<{ id: string }>(
     `select id from hpos.events where site_id = $1 and id = $2`,
     [site.siteId, eventId],
@@ -249,7 +230,7 @@ async function listAccessRequests(request: Request, site: AuthenticatedSite, eve
 }
 
 async function readAdminAccessRequest(site: AuthenticatedSite, requestId: string): Promise<Response> {
-  if (!UUID_PATTERN.test(requestId)) return apiFailure(404, "not_found", "The Access Request is not available to this Site.");
+  if (!isUuid(requestId)) return apiFailure(404, "not_found", "The Access Request is not available to this Site.");
   const result = await getBusinessPool().query<AccessRequestRow>(
     `select id, site_id, event_id, name, email, normalized_email, status, version,
             decision_at, paid_order_id, created_at, updated_at
@@ -560,7 +541,7 @@ export async function handleAccessRequestGet(request: Request, site: Authenticat
 export async function handleAccessRequestPost(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
   if (path.length === 4 && path[0] === "public" && path[1] === "events" && path[3] === "access-requests") {
     const eventId = path[2];
-    if (!UUID_PATTERN.test(eventId)) return apiFailure(404, "not_found", "The Event is not available for Access Requests.");
+    if (!isUuid(eventId)) return apiFailure(404, "not_found", "The Event is not available for Access Requests.");
     const body = await readJsonBody(request);
     if (body instanceof Response) return body;
     const input = parseSubmission(body);
@@ -570,7 +551,7 @@ export async function handleAccessRequestPost(request: Request, site: Authentica
   if (path.length === 5 && path[0] === "admin" && path[1] === "access-requests" && path[3] === "actions") {
     const requestId = path[2];
     const action = path[4];
-    if (!UUID_PATTERN.test(requestId)) return apiFailure(404, "not_found", "The Access Request is not available to this Site.");
+    if (!isUuid(requestId)) return apiFailure(404, "not_found", "The Access Request is not available to this Site.");
     const body = await readJsonBody(request);
     if (body instanceof Response) return body;
     return withApiIdempotency(request, site, body, (client) => decideAccessRequest(client, site, requestId, action, body), mapDatabaseError);
@@ -581,7 +562,7 @@ export async function handleAccessRequestPost(request: Request, site: Authentica
 export async function handleAccessRequestPatch(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
   if (path.length !== 3 || path[0] !== "admin" || path[1] !== "access-requests") return null;
   const requestId = path[2];
-  if (!UUID_PATTERN.test(requestId)) return apiFailure(404, "not_found", "The Access Request is not available to this Site.");
+  if (!isUuid(requestId)) return apiFailure(404, "not_found", "The Access Request is not available to this Site.");
   const body = await readJsonBody(request);
   if (body instanceof Response) return body;
   return withApiIdempotency(request, site, body, (client) => editAccessRequest(client, site, requestId, body), mapDatabaseError);

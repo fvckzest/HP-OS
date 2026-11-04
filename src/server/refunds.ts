@@ -7,8 +7,8 @@ import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
 import type { AuthenticatedSite } from "./site-auth";
 import { enqueueWalletUpdateJobsForOrder } from "./wallet-data";
+import { isObject as object, isUuid, readJsonObject } from "./http-request";
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RFC3339_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 const OUTCOMES = new Set(["processing", "completed", "failed", "unknown"]);
 
@@ -83,10 +83,6 @@ interface RefundReportRow {
   created_at: Date;
 }
 
-function object(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
 function validReference(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.trim().length <= 500
     && !/[\u0000-\u001f\u007f]/.test(value);
@@ -105,8 +101,7 @@ function parseInput(value: Record<string, unknown>): RefundInput | Response {
   if (allowed.some((key) => !Object.hasOwn(value, key))) {
     return apiFailure(422, "validation_failed", "A refund report must include every required field.");
   }
-  if (typeof value.attempt_id !== "string" || !UUID_PATTERN.test(value.attempt_id)
-    || typeof value.connection_id !== "string" || !UUID_PATTERN.test(value.connection_id)) {
+  if (!isUuid(value.attempt_id) || !isUuid(value.connection_id)) {
     return apiFailure(422, "validation_failed", "attempt_id and connection_id must be UUIDs.");
   }
   const providerPaymentReference = value.provider_payment_reference;
@@ -141,18 +136,12 @@ function parseInput(value: Record<string, unknown>): RefundInput | Response {
 }
 
 async function readJsonBody(request: Request): Promise<Record<string, unknown> | Response> {
-  if (request.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "application/json") {
-    return apiFailure(415, "unsupported_media_type", "Send refund-report fields as application/json.");
-  }
-  let bodyText: string;
-  try { bodyText = await request.text(); }
-  catch { return apiFailure(400, "invalid_request", "The refund-report body could not be read."); }
-  if (Buffer.byteLength(bodyText, "utf8") > 64 * 1024) return apiFailure(413, "request_too_large", "The request body exceeds 64 KiB.");
-  let body: unknown;
-  try { body = JSON.parse(bodyText); }
-  catch { return apiFailure(400, "invalid_request", "The refund-report body must contain readable JSON."); }
-  if (!object(body)) return apiFailure(400, "invalid_request", "The refund-report body must be a JSON object.");
-  return body;
+  return readJsonObject(request, {
+    unsupportedMediaType: "Send refund-report fields as application/json.",
+    readError: "The refund-report body could not be read.",
+    invalidJson: "The refund-report body must contain readable JSON.",
+    nonObject: "The refund-report body must be a JSON object.",
+  });
 }
 
 function fingerprint(input: RefundInput): string {
@@ -680,7 +669,7 @@ export async function handleRefundReportPost(
 ): Promise<Response | null> {
   if (request.method !== "POST" || path.length !== 4 || path[0] !== "admin"
     || path[1] !== "orders" || path[3] !== "refund-reports") return null;
-  if (!UUID_PATTERN.test(path[2])) return apiFailure(404, "not_found", "The Order is not available to this Site.");
+  if (!isUuid(path[2])) return apiFailure(404, "not_found", "The Order is not available to this Site.");
   const body = await readJsonBody(request);
   if (body instanceof Response) return body;
   const input = parseInput(body);

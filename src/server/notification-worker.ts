@@ -5,18 +5,15 @@ import { apiFailure, apiSuccess } from "./api-response";
 import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import type { AuthenticatedSite } from "./site-auth";
+import { hasOnlyKeys, isObject as object, isUuid, parseSiteActor, readJsonObject } from "./http-request";
 import {
-  MAX_BODY_BYTES,
   MAX_CLAIM_SIZE,
   NOTIFICATION_KINDS,
-  UUID_PATTERN,
   type DeliveryOutcome,
   type DispatchOutcome,
   type FailureClass,
   type NotificationJobRow,
   type NotificationKind,
-  hasOnlyKeys,
-  object,
   validText,
   validTimestamp,
 } from "./notification-contract";
@@ -48,9 +45,7 @@ function mapUnexpectedNotificationError(error: unknown): Response | null {
 }
 
 function actorFrom(value: unknown): Actor | null {
-  if (!object(value) || !hasOnlyKeys(value, ["type", "reference"])) return null;
-  if ((value.type !== "user" && value.type !== "system") || typeof value.reference !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(value.reference)) return null;
-  return { type: value.type, reference: value.reference.trim() };
+  return parseSiteActor(value, { trimReference: false });
 }
 
 function hasActor(value: Record<string, unknown>, requiredType: Actor["type"] = "system"): Actor {
@@ -67,7 +62,7 @@ function validateFields(value: Record<string, unknown>, allowed: string[], requi
 }
 
 function requiredUuid(value: unknown, field: string): string {
-  if (typeof value !== "string" || !UUID_PATTERN.test(value)) reject(422, "validation_failed", `${field} must be a UUID.`, [{ field, code: "invalid_uuid", message: "Provide a UUID." }]);
+  if (!isUuid(value)) reject(422, "validation_failed", `${field} must be a UUID.`, [{ field, code: "invalid_uuid", message: "Provide a UUID." }]);
   return value;
 }
 
@@ -75,7 +70,7 @@ export async function handleNotificationGet(request: Request, site: Authenticate
   if (path.length === 2 && path[0] === "admin" && path[1] === "notification-jobs") return listJobs(request, site);
   if (path.length === 3 && path[0] === "admin" && path[1] === "notification-jobs") {
     const jobId = path[2];
-    if (!UUID_PATTERN.test(jobId)) return apiFailure(404, "not_found", "The notification job is not available to this Site.");
+    if (!isUuid(jobId)) return apiFailure(404, "not_found", "The notification job is not available to this Site.");
     const job = await readJob(getBusinessPool(), site.siteId, jobId);
     return job ? apiSuccess(job) : apiFailure(404, "not_found", "The notification job is not available to this Site.");
   }
@@ -106,7 +101,7 @@ export async function handleNotificationPost(request: Request, site: Authenticat
 
   if (path.length === 5 && path[0] === "admin" && path[1] === "notification-jobs" && path[2] === "claims" && path[4] === "renew") {
     const claimId = path[3];
-    if (!UUID_PATTERN.test(claimId)) return apiFailure(404, "not_found", "The notification claim is not active for this Site.");
+    if (!isUuid(claimId)) return apiFailure(404, "not_found", "The notification claim is not active for this Site.");
     const body = await readJsonBody(request);
     if (body instanceof Response) return body;
     if (!object(body)) return apiFailure(400, "invalid_request", "The request body must be a JSON object.");
@@ -120,7 +115,7 @@ export async function handleNotificationPost(request: Request, site: Authenticat
 
   if (path.length === 4 && path[0] === "admin" && path[1] === "notification-jobs" && path[3] === "outcome-reports") {
     const jobId = path[2];
-    if (!UUID_PATTERN.test(jobId)) return apiFailure(404, "not_found", "The notification job is not available to this Site.");
+    if (!isUuid(jobId)) return apiFailure(404, "not_found", "The notification job is not available to this Site.");
     const body = await readJsonBody(request);
     if (body instanceof Response) return body;
     if (!object(body)) return apiFailure(400, "invalid_request", "The request body must be a JSON object.");
@@ -142,7 +137,7 @@ export async function handleNotificationPost(request: Request, site: Authenticat
 
   if (path.length === 4 && path[0] === "admin" && path[1] === "notification-jobs" && path[3] === "delivery-reports") {
     const jobId = path[2];
-    if (!UUID_PATTERN.test(jobId)) return apiFailure(404, "not_found", "The notification job is not available to this Site.");
+    if (!isUuid(jobId)) return apiFailure(404, "not_found", "The notification job is not available to this Site.");
     const body = await readJsonBody(request);
     if (body instanceof Response) return body;
     if (!object(body)) return apiFailure(400, "invalid_request", "The request body must be a JSON object.");
@@ -159,29 +154,15 @@ export async function handleNotificationPost(request: Request, site: Authenticat
   return null;
 }
 
-async function readJsonBody(request: Request): Promise<unknown | Response> {
-  if (request.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "application/json") return apiFailure(415, "unsupported_media_type", "Send notification fields as application/json.");
-  const reader = request.body?.getReader();
-  if (!reader) return apiFailure(400, "invalid_request", "A JSON request body is required.");
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > MAX_BODY_BYTES) {
-        await reader.cancel().catch(() => undefined);
-        return apiFailure(413, "request_too_large", "The notification request exceeds the 64 KiB limit.");
-      }
-      chunks.push(value);
-    }
-    const bytes = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
-    try { return JSON.parse(bytes.toString("utf8")) as unknown; }
-    catch { return apiFailure(400, "invalid_request", "The request body is not valid JSON."); }
-  } catch {
-    return apiFailure(400, "invalid_request", "The request body could not be read.");
-  }
+async function readJsonBody(request: Request): Promise<Record<string, unknown> | Response> {
+  return readJsonObject(request, {
+    unsupportedMediaType: "Send notification fields as application/json.",
+    readError: "The request body could not be read.",
+    invalidJson: "The request body is not valid JSON.",
+    nonObject: "The request body must be a JSON object.",
+    tooLarge: "The notification request exceeds the 64 KiB limit.",
+    missingBody: "A JSON request body is required.",
+  });
 }
 
 function errorResponse(error: unknown): Response {
@@ -201,8 +182,8 @@ async function listJobs(request: Request, site: AuthenticatedSite): Promise<Resp
   if (!Number.isInteger(limit) || limit < 1 || limit > 100) return apiFailure(422, "validation_failed", "limit must be an integer from 1 to 100.", { details: [{ field: "limit", code: "out_of_range", message: "Choose from 1 to 100 jobs." }] });
   if (status !== null && !["pending", "failed", "completed"].includes(status)) return apiFailure(422, "validation_failed", "status is not a supported notification state.", { details: [{ field: "status", code: "invalid_enum", message: "Use pending, failed, or completed." }] });
   if (kind !== null && !NOTIFICATION_KINDS.includes(kind as NotificationKind)) return apiFailure(422, "validation_failed", "kind is not a supported notification kind.", { details: [{ field: "kind", code: "invalid_enum", message: "Use one documented notification kind." }] });
-  if (eventId !== null && !UUID_PATTERN.test(eventId)) return apiFailure(422, "validation_failed", "event_id must be a UUID.", { details: [{ field: "event_id", code: "invalid_uuid", message: "Provide a UUID." }] });
-  if (orderId !== null && !UUID_PATTERN.test(orderId)) return apiFailure(422, "validation_failed", "order_id must be a UUID.", { details: [{ field: "order_id", code: "invalid_uuid", message: "Provide a UUID." }] });
+  if (eventId !== null && !isUuid(eventId)) return apiFailure(422, "validation_failed", "event_id must be a UUID.", { details: [{ field: "event_id", code: "invalid_uuid", message: "Provide a UUID." }] });
+  if (orderId !== null && !isUuid(orderId)) return apiFailure(422, "validation_failed", "order_id must be a UUID.", { details: [{ field: "order_id", code: "invalid_uuid", message: "Provide a UUID." }] });
   if (requiresText !== null && requiresText !== "true" && requiresText !== "false") return apiFailure(422, "validation_failed", "requires_verification must be true or false.", { details: [{ field: "requires_verification", code: "invalid_boolean", message: "Use true or false." }] });
   const filters = { status, kind, eventId, orderId, requiresVerification: requiresText === null ? null : requiresText === "true" };
   let cursor: { createdAt: string; id: string } | null = null;
@@ -246,7 +227,7 @@ function decodeCursor(value: string, siteId: string, filters: object, limit: num
     const cursor = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as Record<string, unknown>;
     if (cursor.siteId !== siteId || cursor.route !== "admin-notification-jobs" || cursor.limit !== limit || canonicalJson(cursor.filters) !== canonicalJson(filters)) return null;
     if (!validTimestamp(cursor.issuedAt) || Date.parse(cursor.issuedAt) < Date.now() - 60 * 60 * 1000 || Date.parse(cursor.issuedAt) > Date.now() + 60_000) return null;
-    if (!validTimestamp(cursor.createdAt) || typeof cursor.id !== "string" || !UUID_PATTERN.test(cursor.id)) return null;
+    if (!validTimestamp(cursor.createdAt) || !isUuid(cursor.id)) return null;
     return { createdAt: cursor.createdAt, id: cursor.id };
   } catch { return null; }
 }

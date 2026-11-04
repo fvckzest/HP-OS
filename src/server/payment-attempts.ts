@@ -5,10 +5,9 @@ import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
 import type { AuthenticatedSite } from "./site-auth";
+import { hasOnlyKeys, isObject as object, isUuid, readJsonObject } from "./http-request";
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RFC3339_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
-const MAX_BODY_BYTES = 64 * 1024;
 
 type PaymentOutcome = "not_started" | "processing" | "paid" | "failed" | "canceled" | "unknown";
 type ClosureOutcome = "not_started" | "failed" | "canceled";
@@ -65,14 +64,6 @@ interface PaymentAttemptListRow extends AttemptRow {
   requires_report_work: boolean;
 }
 
-function object(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function hasOnlyKeys(value: Record<string, unknown>, allowed: string[]): boolean {
-  return Object.keys(value).every((key) => allowed.includes(key));
-}
-
 function reject(status: number, code: string, message: string, details: Array<{ field: string; code: string; message: string }> = []): never {
   throw new ApiOperationError(status, code, message, details);
 }
@@ -82,18 +73,12 @@ function fieldError(field: string, code: string, message: string): Response {
 }
 
 async function readJsonBody(request: Request): Promise<Record<string, unknown> | Response> {
-  if (request.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "application/json") {
-    return apiFailure(415, "unsupported_media_type", "Send payment-attempt fields as application/json.");
-  }
-  let text: string;
-  try { text = await request.text(); }
-  catch { return apiFailure(400, "invalid_request", "The request body could not be read as JSON."); }
-  if (Buffer.byteLength(text, "utf8") > MAX_BODY_BYTES) return apiFailure(413, "request_too_large", "The request body exceeds 64 KiB.");
-  let value: unknown;
-  try { value = JSON.parse(text); }
-  catch { return apiFailure(400, "invalid_request", "The request body must contain readable JSON."); }
-  if (!object(value)) return apiFailure(400, "invalid_request", "The request body must be a JSON object.");
-  return value;
+  return readJsonObject(request, {
+    unsupportedMediaType: "Send payment-attempt fields as application/json.",
+    readError: "The request body could not be read as JSON.",
+    invalidJson: "The request body must contain readable JSON.",
+    nonObject: "The request body must be a JSON object.",
+  });
 }
 
 function parseActor(value: unknown): Actor | Response {
@@ -183,7 +168,7 @@ function parseListCursor(value: string | null, site: AuthenticatedSite, filters:
     if (decoded.route !== "admin-payment-attempts" || decoded.siteId !== site.siteId
       || decoded.limit !== limit || JSON.stringify(decoded.filters) !== JSON.stringify(filters)
       || typeof decoded.issuedAt !== "string" || typeof decoded.createdAt !== "string"
-      || typeof decoded.id !== "string" || !UUID_PATTERN.test(decoded.id)
+      || !isUuid(decoded.id)
       || !Number.isFinite(Date.parse(decoded.issuedAt)) || !Number.isFinite(Date.parse(decoded.createdAt))) throw new Error();
     const issuedAt = Date.parse(decoded.issuedAt);
     if (issuedAt < Date.now() - 60 * 60 * 1000 || issuedAt > Date.now() + 60_000) throw new Error();
@@ -210,7 +195,7 @@ async function listPaymentAttempts(request: Request, site: AuthenticatedSite): P
     return fieldError("requires_report_work", "invalid_boolean", "requires_report_work must be true or false.");
   }
   const eventId = url.searchParams.get("event_id");
-  if (eventId !== null && !UUID_PATTERN.test(eventId)) return fieldError("event_id", "invalid_uuid", "event_id must be a UUID.");
+  if (eventId !== null && !isUuid(eventId)) return fieldError("event_id", "invalid_uuid", "event_id must be a UUID.");
   const filters = { requires_verification: requiresText, requires_report_work: reportWorkText, event_id: eventId };
   const cursor = parseListCursor(url.searchParams.get("cursor"), site, filters, limit);
   if (cursor instanceof Response) return cursor;
@@ -482,7 +467,7 @@ async function lockAttemptEvent(client: PoolClient, siteId: string, attemptId: s
 }
 
 function validateAttemptConnection(attempt: AttemptRow, connectionId: unknown): void {
-  if (typeof connectionId !== "string" || !UUID_PATTERN.test(connectionId)) {
+  if (!isUuid(connectionId)) {
     reject(422, "validation_failed", "connection_id must identify the connection frozen on this Order.", [
       { field: "connection_id", code: "invalid_uuid", message: "Provide the Order's recorded connection ID." },
     ]);
@@ -796,7 +781,7 @@ export async function handlePaymentAttemptPost(request: Request, site: Authentic
 
   if (path.length === 4 && path[0] === "admin" && path[1] === "orders" && path[3] === "payment-attempts") {
     const orderId = path[2];
-    if (!UUID_PATTERN.test(orderId)) return apiFailure(404, "not_found", "The Order is not available to this Site.");
+    if (!isUuid(orderId)) return apiFailure(404, "not_found", "The Order is not available to this Site.");
     const body = await readJsonBody(request);
     if (body instanceof Response) return body;
     if (!hasOnlyKeys(body, ["actor"])) return fieldError("body", "unknown_field", "Payment-attempt creation accepts only actor.");
@@ -806,7 +791,7 @@ export async function handlePaymentAttemptPost(request: Request, site: Authentic
       (client) => createAttempt(client, site, orderId), mapPaymentAttemptDatabaseError);
   }
 
-  if (path.length !== 4 || path[0] !== "admin" || path[1] !== "payment-attempts" || !UUID_PATTERN.test(path[2])) return null;
+  if (path.length !== 4 || path[0] !== "admin" || path[1] !== "payment-attempts" || !isUuid(path[2])) return null;
   const attemptId = path[2];
   const body = await readJsonBody(request);
   if (body instanceof Response) return body;
@@ -832,7 +817,7 @@ export async function handlePaymentAttemptGet(request: Request, site: Authentica
     return listPaymentAttempts(request, site);
   }
   if (path.length !== 3 || path[0] !== "admin" || path[1] !== "payment-attempts"
-    || !UUID_PATTERN.test(path[2])) return null;
+    || !isUuid(path[2])) return null;
   const result = await getBusinessPool().query<AttemptRow>(
     `select attempt.*, order_row.checkout_status, order_row.checkout_expires_at,
             order_row.payment_status, reservation.status as reservation_status

@@ -5,22 +5,23 @@ import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import { publicEventData } from "./event-projection";
 import { enqueueNotificationJob, supersedeUnsentNotificationJobs } from "./notification-queue";
+import { hasOnlyKeys, isUuid, parseSiteActor, readJsonObject } from "./http-request";
 import type { AuthenticatedSite } from "./site-auth";
 import { readAdminOrder } from "./admin-order";
 import {
-  IssuanceRow, RecoveryJobRow, UUID_PATTERN, actor, eventNotificationDetails, expectedVersion, hashToken, hasOnlyKeys,
-  readIssuanceRow, readJsonBody, recoveryDeliveryState, recoveryEmail, recoveryText,
+  IssuanceRow, RecoveryJobRow, eventNotificationDetails, expectedVersion, hashToken,
+  readIssuanceRow, recoveryDeliveryState, recoveryEmail, recoveryText,
 } from "./ticketing-projections";
 
 async function retryTicketIssuance(client: PoolClient, site: AuthenticatedSite, orderId: string, body: Record<string, unknown>): Promise<IdempotentResult> {
   if (!hasOnlyKeys(body, ["actor", "expected_version"])) {
     throw new ApiOperationError(422, "validation_failed", "Only actor and expected_version are accepted for this action.");
   }
-  const parsedActor = actor(body.actor);
+  const parsedActor = parseSiteActor(body.actor, { trimReference: false });
   if (!parsedActor) throw new ApiOperationError(422, "validation_failed", "Provide a valid Site-local actor reference.", [{ field: "actor", code: "invalid_actor", message: "Use {type, reference} with a non-secret reference." }]);
   const expected = expectedVersion(body.expected_version);
   if (!expected) throw new ApiOperationError(422, "validation_failed", "expected_version must be a positive integer.", [{ field: "expected_version", code: "required", message: "Use the current Order version." }]);
-  if (!UUID_PATTERN.test(orderId)) throw new ApiOperationError(404, "not_found", "The Order is not available to this Site.");
+  if (!isUuid(orderId)) throw new ApiOperationError(404, "not_found", "The Order is not available to this Site.");
   const row = await readIssuanceRow(client, site.siteId, orderId);
   if (!row) throw new ApiOperationError(404, "not_found", "The Order is not available to this Site.");
   if (row.order_version !== expected) throw new ApiOperationError(409, "version_conflict", "The Order changed after you loaded it. Reload it before retrying issuance.");
@@ -95,7 +96,7 @@ function ticketEmailPayload(row: IssuanceRow) {
 
 function assertRecoveryActorAndVersion(body: Record<string, unknown>, allowed: string[]): { actor: { type: "user" | "system"; reference: string }; version: number } {
   if (!hasOnlyKeys(body, allowed)) throw new ApiOperationError(422, "validation_failed", "The recovery action contains an unsupported field.");
-  const parsedActor = actor(body.actor);
+  const parsedActor = parseSiteActor(body.actor, { trimReference: false });
   if (!parsedActor) throw new ApiOperationError(422, "validation_failed", "Provide a valid Site-local actor reference.", [{ field: "actor", code: "invalid_actor", message: "Use {type, reference} with a non-secret reference." }]);
   const version = expectedVersion(body.expected_version);
   if (!version) throw new ApiOperationError(422, "validation_failed", "expected_version must be a positive integer.", [{ field: "expected_version", code: "required", message: "Use the current Order version." }]);
@@ -130,7 +131,7 @@ async function readRecoveryResponse(client: PoolClient, site: AuthenticatedSite,
 
 async function resendTicketEmail(client: PoolClient, site: AuthenticatedSite, orderId: string, body: Record<string, unknown>): Promise<IdempotentResult> {
   const parsed = assertRecoveryActorAndVersion(body, ["actor", "expected_version"]);
-  if (!UUID_PATTERN.test(orderId)) throw new ApiOperationError(404, "not_found", "The Order is not available to this Site.");
+  if (!isUuid(orderId)) throw new ApiOperationError(404, "not_found", "The Order is not available to this Site.");
   const row = await readIssuanceRow(client, site.siteId, orderId);
   if (!row) throw new ApiOperationError(404, "not_found", "The Order is not available to this Site.");
   if (row.order_version !== parsed.version) throw new ApiOperationError(409, "version_conflict", "The Order changed after you loaded it. Reload it before resending the Ticket email.");
@@ -169,7 +170,7 @@ async function correctDeliveryEmail(client: PoolClient, site: AuthenticatedSite,
   if (!corrected) throw new ApiOperationError(422, "validation_failed", "Provide a valid delivery email address.", [{ field: "email", code: "invalid_email", message: "Use a valid email address of at most 254 characters." }]);
   if (!recoveryText(body.reason, 500)) throw new ApiOperationError(422, "validation_failed", "reason is required for a verified delivery-email correction.", [{ field: "reason", code: "required", message: "Record why the address was corrected." }]);
   if (!recoveryText(body.verification_reference, 500)) throw new ApiOperationError(422, "validation_failed", "verification_reference is required for a verified delivery-email correction.", [{ field: "verification_reference", code: "required", message: "Record a non-secret verification reference." }]);
-  if (!UUID_PATTERN.test(orderId)) throw new ApiOperationError(404, "not_found", "The Order is not available to this Site.");
+  if (!isUuid(orderId)) throw new ApiOperationError(404, "not_found", "The Order is not available to this Site.");
   const row = await readIssuanceRow(client, site.siteId, orderId);
   if (!row) throw new ApiOperationError(404, "not_found", "The Order is not available to this Site.");
   if (row.order_version !== parsed.version) throw new ApiOperationError(409, "version_conflict", "The Order changed after you loaded it. Reload it before correcting the delivery email.");
@@ -261,7 +262,12 @@ async function correctDeliveryEmail(client: PoolClient, site: AuthenticatedSite,
 export async function handleAdminOrderActionPost(request: Request, site: AuthenticatedSite, path: string[]): Promise<Response | null> {
   if (path.length !== 5 || path[0] !== "admin" || path[1] !== "orders" || path[3] !== "actions") return null;
   if (!["retry_ticket_issuance", "resend_ticket_email", "correct_delivery_email"].includes(path[4])) return apiFailure(404, "not_found", "The requested Order action is unavailable.");
-  const body = await readJsonBody(request);
+  const body = await readJsonObject(request, {
+    unsupportedMediaType: "Send recovery action fields as application/json.",
+    readError: "The recovery action body could not be read.",
+    invalidJson: "The recovery action body must contain readable JSON.",
+    nonObject: "The recovery action body must be a JSON object.",
+  });
   if (body instanceof Response) return body;
   const action = path[4] === "retry_ticket_issuance" ? retryTicketIssuance
     : path[4] === "resend_ticket_email" ? resendTicketEmail : correctDeliveryEmail;

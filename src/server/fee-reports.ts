@@ -5,8 +5,8 @@ import { ApiOperationError, withApiIdempotency } from "./api-idempotency";
 import type { IdempotentResult } from "./api-idempotency";
 import { getBusinessPool } from "./database";
 import type { AuthenticatedSite } from "./site-auth";
+import { isObject as object, isUuid, readJsonObject } from "./http-request";
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const RFC3339_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 const CATEGORIES = new Set(["processing", "platform"]);
 const DIRECTIONS = new Set(["charge", "return"]);
@@ -82,10 +82,6 @@ interface ScopeRow extends QueryResultRow {
   refund_currency: string | null;
 }
 
-function object(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
 function validReference(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.trim().length <= 500
     && !/[\u0000-\u001f\u007f]/.test(value);
@@ -120,8 +116,8 @@ function parseFeeInput(body: Record<string, unknown>): FeeInput | Response {
   if (missing) return fieldError(missing, "required", "Include every required fee-report field.");
   const parsedActor = actor(body.actor);
   if (!parsedActor) return fieldError("actor", "invalid_actor", "Provide a user or system actor with a non-secret reference.");
-  if (typeof body.attempt_id !== "string" || !UUID_PATTERN.test(body.attempt_id)) return fieldError("attempt_id", "invalid_uuid", "attempt_id must be a UUID.");
-  if (typeof body.connection_id !== "string" || !UUID_PATTERN.test(body.connection_id)) return fieldError("connection_id", "invalid_uuid", "connection_id must be a UUID.");
+  if (!isUuid(body.attempt_id)) return fieldError("attempt_id", "invalid_uuid", "attempt_id must be a UUID.");
+  if (!isUuid(body.connection_id)) return fieldError("connection_id", "invalid_uuid", "connection_id must be a UUID.");
   if (typeof body.scope_type !== "string" || !SCOPES.has(body.scope_type)) return fieldError("scope_type", "unsupported_value", "scope_type must be payment or refund.");
   if (!validReference(body.scope_reference)) return fieldError("scope_reference", "invalid_reference", "scope_reference must be a provider reference.");
   if (!validReference(body.source_reference)) return fieldError("source_reference", "invalid_reference", "source_reference must be a provider fee-component reference.");
@@ -156,8 +152,8 @@ function parseConfirmationInput(body: Record<string, unknown>): ConfirmationInpu
   if (missing) return fieldError(missing, "required", "Include every required fee-confirmation field.");
   const parsedActor = actor(body.actor);
   if (!parsedActor) return fieldError("actor", "invalid_actor", "Provide a user or system actor with a non-secret reference.");
-  if (typeof body.attempt_id !== "string" || !UUID_PATTERN.test(body.attempt_id)) return fieldError("attempt_id", "invalid_uuid", "attempt_id must be a UUID.");
-  if (typeof body.connection_id !== "string" || !UUID_PATTERN.test(body.connection_id)) return fieldError("connection_id", "invalid_uuid", "connection_id must be a UUID.");
+  if (!isUuid(body.attempt_id)) return fieldError("attempt_id", "invalid_uuid", "attempt_id must be a UUID.");
+  if (!isUuid(body.connection_id)) return fieldError("connection_id", "invalid_uuid", "connection_id must be a UUID.");
   if (typeof body.scope_type !== "string" || !SCOPES.has(body.scope_type)) return fieldError("scope_type", "unsupported_value", "scope_type must be payment or refund.");
   if (!validReference(body.scope_reference)) return fieldError("scope_reference", "invalid_reference", "scope_reference must be a provider reference.");
   if (typeof body.category !== "string" || !CATEGORIES.has(body.category)) return fieldError("category", "unsupported_value", "category must be processing or platform.");
@@ -189,14 +185,12 @@ function parseConfirmationInput(body: Record<string, unknown>): ConfirmationInpu
 }
 
 async function readJsonBody(request: Request): Promise<Record<string, unknown> | Response> {
-  if (request.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !== "application/json") return apiFailure(415, "unsupported_media_type", "Send fee fields as application/json.");
-  let text: string;
-  try { text = await request.text(); } catch { return apiFailure(400, "invalid_request", "The fee request body could not be read."); }
-  if (Buffer.byteLength(text, "utf8") > 64 * 1024) return apiFailure(413, "request_too_large", "The request body exceeds 64 KiB.");
-  let value: unknown;
-  try { value = JSON.parse(text); } catch { return apiFailure(400, "invalid_request", "The fee request body must contain readable JSON."); }
-  if (!object(value)) return apiFailure(400, "invalid_request", "The fee request body must be a JSON object.");
-  return value;
+  return readJsonObject(request, {
+    unsupportedMediaType: "Send fee fields as application/json.",
+    readError: "The fee request body could not be read.",
+    invalidJson: "The fee request body must contain readable JSON.",
+    nonObject: "The fee request body must be a JSON object.",
+  });
 }
 
 function fingerprint(input: FeeInput): string {
@@ -286,7 +280,7 @@ async function issueForRecord(client: PoolClient, siteId: string, orderId: strin
 }
 
 async function feeReportAction(client: PoolClient, site: AuthenticatedSite, orderId: string, input: FeeInput): Promise<IdempotentResult> {
-  if (!UUID_PATTERN.test(orderId)) throw new ApiOperationError(404, "not_found", "The Order is not available to this Site.");
+  if (!isUuid(orderId)) throw new ApiOperationError(404, "not_found", "The Order is not available to this Site.");
   await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [
     `${site.siteId}|${input.connection_id}|${input.source_reference}|${input.category}|${input.direction}`,
   ]);
@@ -410,7 +404,7 @@ async function createPlannedFeeIssue(client: PoolClient, site: AuthenticatedSite
 }
 
 async function feeConfirmationAction(client: PoolClient, site: AuthenticatedSite, orderId: string, input: ConfirmationInput): Promise<IdempotentResult> {
-  if (!UUID_PATTERN.test(orderId)) throw new ApiOperationError(404, "not_found", "The Order is not available to this Site.");
+  if (!isUuid(orderId)) throw new ApiOperationError(404, "not_found", "The Order is not available to this Site.");
   await client.query("select pg_advisory_xact_lock(hashtextextended($1, 0))", [
     `${site.siteId}|${input.attempt_id}|${input.connection_id}|${input.scope_type}|${input.scope_reference}|${input.category}`,
   ]);
