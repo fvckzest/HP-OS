@@ -30,10 +30,10 @@ export function isUuid(value: unknown): value is string {
   return typeof value === "string" && UUID_PATTERN.test(value);
 }
 
-export function parseSiteActor(value: unknown): SiteActor | null {
+export function parseSiteActor(value: unknown, options: { trimReference?: boolean } = {}): SiteActor | null {
   if (!isObject(value) || !hasOnlyKeys(value, ["type", "reference"])) return null;
   if ((value.type !== "user" && value.type !== "system") || typeof value.reference !== "string") return null;
-  const reference = value.reference.trim();
+  const reference = options.trimReference === false ? value.reference : value.reference.trim();
   if (!ACTOR_REFERENCE_PATTERN.test(reference)) return null;
   return { type: value.type, reference };
 }

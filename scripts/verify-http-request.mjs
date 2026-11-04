@@ -73,6 +73,7 @@ assert.deepEqual(chunked, { chunked: true });
 
 const actor = parseSiteActor({ type: "system", reference: " worker:local " });
 assert.deepEqual(actor, { type: "system", reference: "worker:local" });
+assert.equal(parseSiteActor({ type: "system", reference: " worker:local " }, { trimReference: false }), null);
 assert.equal(parseSiteActor({ type: "system", reference: "not allowed" }), null);
 assert.equal(isUuid("1f8d1f5d-b7a4-4aa5-b0e3-8bb7a5e3d9e2"), true);
 assert.equal(isUuid("not-a-uuid"), false);

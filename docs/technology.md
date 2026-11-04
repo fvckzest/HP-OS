@@ -13,7 +13,7 @@ These choices prioritize a manageable first release while preserving the user's 
 
 ## HTTP request mechanics
 
-`src/server/http-request.ts` owns the shared HTTP mechanics used by `/v1` handlers: content-type checks, streamed JSON-object reading with a 64 KiB limit, UUID recognition, allowed-key checks, and the common Site-local actor shape. The reader stops and cancels the request stream as soon as the limit is exceeded, instead of buffering an oversized body first. Event, checkout, payment, Admission, notification, recovery, and mapping handlers keep their operation-specific field and business validation in their own modules. Fee and Ticket-recovery actor rules remain local where their accepted reference semantics differ. This boundary reduces drift while preserving the documented response codes and operation ownership; it was settled during [issue #128](https://github.com/fvckzest/HP-OS/issues/128).
+`src/server/http-request.ts` owns the shared HTTP mechanics used by `/v1` handlers: content-type checks, streamed JSON-object reading with a 64 KiB limit, UUID recognition, allowed-key checks, and the common Site-local actor shape. The reader stops and cancels the request stream as soon as the limit is exceeded, instead of buffering an oversized body first. Event, checkout, payment, Admission, notification, Ticket-recovery, and mapping handlers keep their operation-specific field and business validation in their own modules. Fee-report actor validation remains local because that operation accepts a different reference contract. This boundary reduces drift while preserving the documented response codes and operation ownership; it was settled during [issue #128](https://github.com/fvckzest/HP-OS/issues/128).
 
 ## Database access and changes
 

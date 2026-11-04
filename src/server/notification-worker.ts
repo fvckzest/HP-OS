@@ -45,7 +45,7 @@ function mapUnexpectedNotificationError(error: unknown): Response | null {
 }
 
 function actorFrom(value: unknown): Actor | null {
-  return parseSiteActor(value);
+  return parseSiteActor(value, { trimReference: false });
 }
 
 function hasActor(value: Record<string, unknown>, requiredType: Actor["type"] = "system"): Actor {
