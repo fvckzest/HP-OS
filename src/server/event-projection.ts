@@ -11,6 +11,9 @@ export interface PublicEventProjectionRow {
   description: string | null;
   event_type: string | null;
   logo_path: string | null;
+  performers: string[];
+  artists: string[];
+  vendors: string[];
   venue_name: string | null;
   venue_address: string | null;
   starts_at: Date | null;
@@ -86,6 +89,9 @@ export function publicEventData(row: PublicEventProjectionRow): Record<string, u
     description: row.description,
     event_type: row.event_type,
     logo_path: row.logo_path,
+    performers: row.performers,
+    artists: row.artists,
+    vendors: row.vendors,
     venue: { name: row.venue_name, address: row.venue_address },
     starts_at: eventTimestamp(row.starts_at, row.starts_at_offset_minutes),
     ends_at: eventTimestamp(row.ends_at, row.ends_at_offset_minutes),
@@ -111,5 +117,8 @@ export function walletEventProjection(row: PublicEventProjectionRow): Record<str
   const projection = publicEventData(row);
   delete projection.sales_status;
   delete projection.logo_path;
+  delete projection.performers;
+  delete projection.artists;
+  delete projection.vendors;
   return projection;
 }

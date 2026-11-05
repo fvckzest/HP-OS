@@ -77,6 +77,9 @@ interface WalletDataRow extends QueryResultRow {
   description: string | null;
   event_type: string | null;
   logo_path: string | null;
+  performers: string[];
+  artists: string[];
+  vendors: string[];
   venue_name: string | null;
   venue_address: string | null;
   starts_at: Date | null;
@@ -112,7 +115,7 @@ interface WalletDataRow extends QueryResultRow {
 
 const WALLET_SELECT = `select ticket.id as ticket_id, ticket.qr_payload, ticket.attendee_name,
                    admission.id as admission_id, order_row.refund_status,
-                   event_row.site_id, event_row.id as event_id, event_row.title, event_row.description, event_row.event_type, event_row.logo_path,
+                   event_row.site_id, event_row.id as event_id, event_row.title, event_row.description, event_row.event_type, event_row.logo_path, event_row.performers, event_row.artists, event_row.vendors,
                    event_row.venue_name, event_row.venue_address, event_row.starts_at,
                    event_row.starts_at_offset_minutes, event_row.ends_at,
                    event_row.ends_at_offset_minutes, event_row.time_zone,
@@ -165,6 +168,9 @@ function dataVersion(data: Omit<WalletData, "data_version">): string {
   const stable = { ...data, event: { ...data.event } };
   delete stable.event.sales_status;
   delete stable.event.logo_path;
+  delete stable.event.performers;
+  delete stable.event.artists;
+  delete stable.event.vendors;
   return createHash("sha256")
     .update(JSON.stringify(stable), "utf8")
     .digest("base64url");
@@ -187,6 +193,9 @@ function walletData(row: WalletDataRow): WalletData {
     description: row.description,
     event_type: row.event_type,
     logo_path: row.logo_path,
+    performers: row.performers,
+    artists: row.artists,
+    vendors: row.vendors,
     venue_name: row.venue_name,
     venue_address: row.venue_address,
     starts_at: row.starts_at,

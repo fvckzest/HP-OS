@@ -243,7 +243,7 @@ export async function readIssuanceRow(client: PoolClient, siteId: string, orderI
             order_row.version as order_version,
             reservation.id as reservation_id, reservation.status as reservation_status,
             reservation.expires_at as reservation_expires_at, reservation.awaiting_provider_verification,
-            event_row.title, event_row.description, event_row.event_type, event_row.logo_path, event_row.venue_name, event_row.venue_address,
+            event_row.title, event_row.description, event_row.event_type, event_row.logo_path, event_row.performers, event_row.artists, event_row.vendors, event_row.venue_name, event_row.venue_address,
             event_row.starts_at, event_row.starts_at_offset_minutes, event_row.ends_at,
             event_row.ends_at_offset_minutes, event_row.time_zone, event_row.check_in_opens_at,
             event_row.check_in_opens_offset_minutes, event_row.visibility,

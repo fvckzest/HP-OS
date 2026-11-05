@@ -409,6 +409,7 @@ Text limits: name/title 200 characters; description 20,000; venue address 1,000;
 | `description` | string? | Plain-text Event description. |
 | `event_type` | enum? | Optional concert, exhibition, festival, or club; editable after publication. |
 | `logo_path` | string? | Optional Site-root-relative logo path; the Site hosts the file. |
+| `performers`, `artists`, `vendors` | string[] | Ordered Event credit names, editable and clearable with `[]`. |
 | `venue` | Venue | Venue name/address. |
 | `starts_at` | timestamp? | Event start. |
 | `ends_at` | timestamp? | Event end; must follow start. |

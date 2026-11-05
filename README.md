@@ -1,6 +1,6 @@
 # HP-OS
 
-Events support an optional Site-owned logo path and an optional type: concert, exhibition, festival, or club. See the [Event rules](docs/features/events.md) and [API contract](docs/api/api.md#public-event-object).
+Events support ordered performer, artist, and vendor credits, an optional Site-owned logo path, and an optional type: concert, exhibition, festival, or club. See the [Event rules](docs/features/events.md) and [API contract](docs/api/api.md#public-event-object).
 
 Issue #42 refund reporting serializes provider source references within a Site, returns a retryable `503 payment_not_confirmed` while payment confirmation is unresolved, and releases a held Reservation when a full refund arrives before Ticket issuance. Issue #43 adds Site-scoped Order and Ticket lists, one-snapshot Event totals, attributable processing and platform fee reports, source revisions, explicit fee confirmations, and pending fee completeness. See the [ticketing feature notes](docs/features/ticketing.md#refunds-and-event-totals) and [API contract](docs/api/api.md#refund-reports). LMNL staff presentation and actual provider fee settlement are deferred repository-wide as later cutover proof; they do not block HP-OS issue closure.
 

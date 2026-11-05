@@ -102,7 +102,7 @@ function parseSubmission(value: Record<string, unknown>): { name: string; email:
 
 async function lockEvent(client: PoolClient, siteId: string, eventId: string): Promise<EventAccessRow> {
   const result = await client.query<EventAccessRow>(
-    `select e.id, e.site_id, e.title, e.description, e.event_type, e.logo_path, e.venue_name, e.venue_address,
+    `select e.id, e.site_id, e.title, e.description, e.event_type, e.logo_path, e.performers, e.artists, e.vendors, e.venue_name, e.venue_address,
             e.starts_at, e.starts_at_offset_minutes, e.ends_at, e.ends_at_offset_minutes,
             e.time_zone, e.check_in_opens_at, e.check_in_opens_offset_minutes,
             e.visibility, e.publication_status, e.is_canceled, e.is_archived, e.sales_paused,
@@ -480,7 +480,7 @@ async function lookupApproval(site: AuthenticatedSite, token: string): Promise<R
   const result = await getBusinessPool().query<AccessRequestRow & EventAccessRow & { token_id: string; checkout_in_progress: boolean }>(
     `select r.id, r.site_id, r.event_id, r.name, r.email, r.normalized_email, r.status,
             r.version, r.decision_at, r.paid_order_id, r.created_at, r.updated_at,
-            e.title, e.description, e.event_type, e.logo_path, e.venue_name, e.venue_address,
+            e.title, e.description, e.event_type, e.logo_path, e.performers, e.artists, e.vendors, e.venue_name, e.venue_address,
             e.starts_at, e.starts_at_offset_minutes, e.ends_at, e.ends_at_offset_minutes,
             e.time_zone, e.check_in_opens_at, e.check_in_opens_offset_minutes,
             e.visibility, e.publication_status, e.is_canceled, e.is_archived, e.sales_paused,

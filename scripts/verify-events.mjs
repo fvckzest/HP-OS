@@ -170,6 +170,25 @@ async function verifyEventType(site) {
   assert(cleared.status === 200 && cleared.data.data.event_type === null, "A published Event type could not be cleared.");
 }
 
+async function verifyEventCredits(site) {
+  const actor = { type: "user", reference: "test:event-credits" };
+  const create = await api(site, "/v1/admin/events", { method: "POST", idempotencyKey: randomUUID(), body: { actor, performers: ["  DJ One  ", "Band Two"], artists: ["Artist"], vendors: ["Vendor"] } });
+  assert(create.status === 201 && JSON.stringify(create.data.data.performers) === JSON.stringify(["DJ One", "Band Two"]) && create.data.data.artists[0] === "Artist" && create.data.data.vendors[0] === "Vendor", "Draft credits were not saved in order and trimmed.");
+  const id = create.data.data.event_id;
+  for (const invalid of [null, "DJ", [""], ["a\nb"], ["x".repeat(201)], Array(101).fill("x")]) {
+    const response = await api(site, `/v1/admin/events/${id}`, { method: "PATCH", idempotencyKey: randomUUID(), body: { actor, expected_version: create.data.data.version, performers: invalid } });
+    assert(response.status === 422, "Invalid credits were accepted.");
+  }
+  const event = await createPublishedEvent(site, { title: "Credit verification", startsAt: "2033-04-21T19:00:00-07:00", endsAt: "2033-04-21T22:00:00-07:00" });
+  assert(event.performers.length === 0 && event.artists.length === 0 && event.vendors.length === 0, "Omitted credits did not default to empty lists.");
+  const edit = await api(site, `/v1/admin/events/${event.event_id}`, { method: "PATCH", idempotencyKey: randomUUID(), body: { actor, expected_version: event.version, performers: ["First", "Second"], artists: ["Artist"], vendors: ["Vendor"] } });
+  const detail = await api(site, `/v1/public/events/${event.event_id}`);
+  const list = await api(site, "/v1/public/events?period=current");
+  assert(edit.status === 200 && JSON.stringify(detail.data.data.performers) === JSON.stringify(["First", "Second"]) && detail.data.data.artists[0] === "Artist" && list.data.data.some(item => item.event_id === event.event_id && item.vendors[0] === "Vendor"), "Published credits were not returned by public reads.");
+  const clear = await api(site, `/v1/admin/events/${event.event_id}`, { method: "PATCH", idempotencyKey: randomUUID(), body: { actor, expected_version: edit.data.data.version, performers: [] } });
+  assert(clear.status === 200 && clear.data.data.performers.length === 0 && clear.data.data.artists[0] === "Artist", "Clearing a credit list changed other lists.");
+}
+
 async function verifyEventLogoPath(site) {
   const actor = { type: "user", reference: "test:event-logo" };
   const create = await api(site, "/v1/admin/events", { method: "POST", idempotencyKey: randomUUID(), body: { actor, logo_path: "/media/events/space.png" } });
@@ -3707,6 +3726,7 @@ async function main() {
     await verifyPreconfiguredDraftCannotClearSales(site);
     await verifyEventLifecycleAndDiscovery(site);
     await verifyEventType(createSiteFixture());
+    await verifyEventCredits(createSiteFixture());
     await verifyEventLogoPath(createSiteFixture());
     await verifyEventChangeNotifications(site);
     await verifyEventCancellation(site);

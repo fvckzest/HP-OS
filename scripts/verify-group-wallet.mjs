@@ -564,6 +564,13 @@ async function verifyGroupOrder(site, otherSite) {
   assert(logoEdit.status === 200 && afterLogoWallet.data.data.event.logo_path === "/media/events/example.png" && afterLogoWallet.data.data.data_version === beforeLogoWallet.data.data.data_version && (await currentWalletJobs(site)).length === beforeLogoJobs, "A Site logo path changed Wallet version or queued work.");
   editedWalletEvent = logoEdit.data.data;
 
+  const creditJobs = (await currentWalletJobs(site)).length;
+  const beforeCreditWallet = await api(site, `/v1/admin/tickets/${tickets[0].ticket_id}/apple-wallet-data`);
+  const creditEdit = await api(site, `/v1/admin/events/${event.event_id}`, { method: "PATCH", idempotencyKey: randomUUID(), body: { actor: human, expected_version: editedWalletEvent.version, performers: ["DJ One"], artists: ["Artist"], vendors: ["Vendor"] } });
+  const afterCreditWallet = await api(site, `/v1/admin/tickets/${tickets[0].ticket_id}/apple-wallet-data`);
+  assert(creditEdit.status === 200 && afterCreditWallet.data.data.event.performers[0] === "DJ One" && afterCreditWallet.data.data.data_version === beforeCreditWallet.data.data.data_version && (await currentWalletJobs(site)).length === creditJobs, "Event credits changed Wallet version or queued work.");
+  editedWalletEvent = creditEdit.data.data;
+
   const walletCountBeforePartial = (await currentWalletJobs(site)).length;
   const partialAmount = 1000;
   const partial = await api(site, `/v1/admin/orders/${group.order.order_id}/refund-reports`, {

@@ -63,6 +63,9 @@ interface EventInput {
   description?: string | null;
   event_type?: string | null;
   logo_path?: string | null;
+  performers?: string[];
+  artists?: string[];
+  vendors?: string[];
   venue?: { name?: string | null; address?: string | null };
   starts_at?: ParsedTimestamp | null;
   ends_at?: ParsedTimestamp | null;
@@ -184,7 +187,7 @@ function parseOptionalString(
 }
 
 function parseEventInput(value: Record<string, unknown>): EventInput | Response {
-  const allowed = ["actor", "title", "description", "event_type", "logo_path", "venue", "starts_at", "ends_at", "time_zone", "check_in_opens_at", "visibility", "ticket_offering"];
+  const allowed = ["actor", "title", "description", "event_type", "logo_path", "performers", "artists", "vendors", "venue", "starts_at", "ends_at", "time_zone", "check_in_opens_at", "visibility", "ticket_offering"];
   if (!hasOnlyKeys(value, allowed)) {
     const unknown = Object.keys(value).find((key) => !allowed.includes(key)) ?? "unknown";
     return fieldError(unknown, "unknown_field", "Remove the unsupported field.");
@@ -211,6 +214,14 @@ function parseEventInput(value: Record<string, unknown>): EventInput | Response 
     const logo = value.logo_path;
     if (logo !== null && (typeof logo !== "string" || logo.length > 500 || !/^(?:\/[A-Za-z0-9_][A-Za-z0-9_.-]*)+$/.test(logo))) return fieldError("logo_path", "invalid_path", "Provide a Site-root-relative asset path or null.");
     input.logo_path = logo as string | null;
+  }
+  for (const role of ["performers", "artists", "vendors"] as const) {
+    if (!Object.hasOwn(value, role)) continue;
+    const names = value[role];
+    if (!Array.isArray(names) || names.length > 100 || names.some((name) => typeof name !== "string" || name.trim().length === 0 || name.length > 200 || /[\u0000-\u001f\u007f]/.test(name))) {
+      return fieldError(role, "invalid_list", "Provide up to 100 non-empty names of at most 200 characters each.");
+    }
+    input[role] = names.map((name: string) => name.trim());
   }
   if (Object.hasOwn(value, "venue")) {
     if (!object(value.venue) || !hasOnlyKeys(value.venue, ["name", "address"])) return fieldError("venue", "invalid_object", "Provide venue.name and optional venue.address.");
@@ -392,7 +403,7 @@ async function readProviderMappings(client: PoolClient, siteId: string, eventId:
 
 export async function readAdminEvent(client: PoolClient, siteId: string, eventId: string): Promise<Record<string, unknown> | null> {
   const result = await client.query<EventRow>(
-    `select e.id, e.site_id, e.ticket_offering_id, e.title, e.description, e.event_type, e.logo_path,
+    `select e.id, e.site_id, e.ticket_offering_id, e.title, e.description, e.event_type, e.logo_path, e.performers, e.artists, e.vendors,
        e.venue_name, e.venue_address, e.starts_at, e.starts_at_offset_minutes,
        e.ends_at, e.ends_at_offset_minutes, e.time_zone, e.check_in_opens_at,
        e.check_in_opens_offset_minutes, e.visibility, e.publication_status, e.is_canceled,
@@ -581,10 +592,10 @@ async function createDraft(client: PoolClient, site: AuthenticatedSite, input: E
        venue_address, starts_at, starts_at_offset_minutes, ends_at,
        ends_at_offset_minutes, time_zone, check_in_opens_at,
        check_in_opens_offset_minutes, visibility, created_actor_type,
-       created_actor_reference, updated_actor_type, updated_actor_reference, event_type, logo_path
+       created_actor_reference, updated_actor_type, updated_actor_reference, event_type, logo_path, performers, artists, vendors
      ) values (
        $1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9, $10::timestamptz,
-       $11, $12, $13::timestamptz, $14, $15, $16, $17, $16, $17, $18, $19
+       $11, $12, $13::timestamptz, $14, $15, $16, $17, $16, $17, $18, $19, $20, $21, $22
      )`,
     [
       eventId, site.siteId, offeringId, input.title ?? null, input.description ?? null,
@@ -594,6 +605,7 @@ async function createDraft(client: PoolClient, site: AuthenticatedSite, input: E
       input.time_zone ?? null, input.check_in_opens_at?.iso ?? null,
       input.check_in_opens_at?.offsetMinutes ?? null, input.visibility ?? null,
       input.actor.type, input.actor.reference, input.event_type ?? null, input.logo_path ?? null,
+      input.performers ?? [], input.artists ?? [], input.vendors ?? [],
     ],
   );
   await client.query(
@@ -713,7 +725,7 @@ async function listEvents(request: Request, site: AuthenticatedSite, admin: bool
   }
   values.push(limit + 1);
   const orderBy = admin ? "e.created_at desc, e.id asc" : period === "past" ? "e.starts_at desc, e.id asc" : "e.starts_at asc, e.id asc";
-  const query = `select e.id, e.site_id, e.ticket_offering_id, e.title, e.description, e.event_type, e.logo_path,
+  const query = `select e.id, e.site_id, e.ticket_offering_id, e.title, e.description, e.event_type, e.logo_path, e.performers, e.artists, e.vendors,
     e.venue_name, e.venue_address, e.starts_at, e.starts_at_offset_minutes,
     e.ends_at, e.ends_at_offset_minutes, e.time_zone, e.check_in_opens_at,
     e.check_in_opens_offset_minutes, e.visibility, e.publication_status,
@@ -769,7 +781,7 @@ async function readEvent(site: AuthenticatedSite, eventId: string, admin: boolea
       client.release();
     }
   }
-  const query = `select e.id, e.site_id, e.ticket_offering_id, e.title, e.description, e.event_type, e.logo_path,
+  const query = `select e.id, e.site_id, e.ticket_offering_id, e.title, e.description, e.event_type, e.logo_path, e.performers, e.artists, e.vendors,
     e.venue_name, e.venue_address, e.starts_at, e.starts_at_offset_minutes,
     e.ends_at, e.ends_at_offset_minutes, e.time_zone, e.check_in_opens_at,
     e.check_in_opens_offset_minutes, e.visibility, e.publication_status,
@@ -828,7 +840,7 @@ function numericVersion(value: unknown): number | null {
 async function writeEventPatch(client: PoolClient, site: AuthenticatedSite, eventId: string, body: Record<string, unknown>, input: EventInput): Promise<IdempotentResult> {
   const expected = numericVersion(body.expected_version);
   if (!expected) operationError(422, "validation_failed", "Provide expected_version.", [{ field: "expected_version", code: "required", message: "Use the Event version you loaded." }]);
-  const selected = await client.query<EventRow>(`select e.id, e.site_id, e.ticket_offering_id, e.title, e.description, e.event_type, e.logo_path,
+  const selected = await client.query<EventRow>(`select e.id, e.site_id, e.ticket_offering_id, e.title, e.description, e.event_type, e.logo_path, e.performers, e.artists, e.vendors,
     e.venue_name, e.venue_address, e.starts_at, e.starts_at_offset_minutes,
     e.ends_at, e.ends_at_offset_minutes, e.time_zone, e.check_in_opens_at,
     e.check_in_opens_offset_minutes, e.visibility, e.publication_status,
@@ -880,6 +892,9 @@ async function writeEventPatch(client: PoolClient, site: AuthenticatedSite, even
   if (Object.hasOwn(input, "description")) addEvent("description", input.description);
   if (Object.hasOwn(input, "event_type")) addEvent("event_type", input.event_type);
   if (Object.hasOwn(input, "logo_path")) addEvent("logo_path", input.logo_path);
+  for (const role of ["performers", "artists", "vendors"] as const) {
+    if (Object.hasOwn(input, role)) addEvent(role, input[role]);
+  }
   if (input.venue && Object.hasOwn(input.venue, "name")) addEvent("venue_name", input.venue.name);
   if (input.venue && Object.hasOwn(input.venue, "address")) addEvent("venue_address", input.venue.address);
   if (Object.hasOwn(input, "starts_at")) addTime("starts_at", "starts_at_offset_minutes", input.starts_at ?? null);
@@ -900,7 +915,7 @@ async function writeEventPatch(client: PoolClient, site: AuthenticatedSite, even
     if (Object.hasOwn(offer, "buyer_fees")) add("buyer_fees", offer.buyer_fees === null ? null : JSON.stringify(offer.buyer_fees));
     if (sets.length) await client.query(`update hpos.ticket_offerings set ${sets.join(", ")} where id=$1 and site_id=$2`, args);
   }
-  const mergedResult = await client.query<EventRow>(`select e.id, e.site_id, e.ticket_offering_id, e.title, e.description, e.event_type, e.logo_path,
+  const mergedResult = await client.query<EventRow>(`select e.id, e.site_id, e.ticket_offering_id, e.title, e.description, e.event_type, e.logo_path, e.performers, e.artists, e.vendors,
     e.venue_name, e.venue_address, e.starts_at, e.starts_at_offset_minutes,
     e.ends_at, e.ends_at_offset_minutes, e.time_zone, e.check_in_opens_at,
     e.check_in_opens_offset_minutes, e.visibility, e.publication_status,
@@ -935,7 +950,7 @@ async function writeEventAction(client: PoolClient, site: AuthenticatedSite, eve
   if (!actor) operationError(422, "validation_failed", "Include a user or system actor for audit attribution.", [{ field: "actor", code: "invalid_actor", message: "Use a non-secret Site-local reference." }]);
   const expected = numericVersion(body.expected_version);
   if (!expected) operationError(422, "validation_failed", "Provide expected_version.", [{ field: "expected_version", code: "required", message: "Use the Event version you loaded." }]);
-  const selected = await client.query<EventRow>(`select e.id, e.site_id, e.ticket_offering_id, e.title, e.description, e.event_type, e.logo_path,
+  const selected = await client.query<EventRow>(`select e.id, e.site_id, e.ticket_offering_id, e.title, e.description, e.event_type, e.logo_path, e.performers, e.artists, e.vendors,
     e.venue_name, e.venue_address, e.starts_at, e.starts_at_offset_minutes,
     e.ends_at, e.ends_at_offset_minutes, e.time_zone, e.check_in_opens_at,
     e.check_in_opens_offset_minutes, e.visibility, e.publication_status,
@@ -1047,8 +1062,8 @@ export async function handleEventPatch(request: Request, site: AuthenticatedSite
   if (!isUuid(eventId)) return apiFailure(404, "not_found", "The Event is not available to this Site.");
   const body = await readJsonBody(request);
   if (body instanceof Response) return body;
-  if (!hasOnlyKeys(body, ["actor", "expected_version", "title", "description", "event_type", "logo_path", "venue", "starts_at", "ends_at", "time_zone", "check_in_opens_at", "visibility", "ticket_offering"])) {
-    const unknown = Object.keys(body).find((key) => !["actor", "expected_version", "title", "description", "event_type", "logo_path", "venue", "starts_at", "ends_at", "time_zone", "check_in_opens_at", "visibility", "ticket_offering"].includes(key)) ?? "unknown";
+  if (!hasOnlyKeys(body, ["actor", "expected_version", "title", "description", "event_type", "logo_path", "performers", "artists", "vendors", "venue", "starts_at", "ends_at", "time_zone", "check_in_opens_at", "visibility", "ticket_offering"])) {
+    const unknown = Object.keys(body).find((key) => !["actor", "expected_version", "title", "description", "event_type", "logo_path", "performers", "artists", "vendors", "venue", "starts_at", "ends_at", "time_zone", "check_in_opens_at", "visibility", "ticket_offering"].includes(key)) ?? "unknown";
     return fieldError(unknown, "unknown_field", "Remove the unsupported field.");
   }
   const expectedVersion = numericVersion(body.expected_version);

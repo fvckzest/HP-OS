@@ -92,7 +92,7 @@ An edit that reduces capacity below the offering's committed `reserved_quantity`
 
 An Event's `visibility` can change freely while it is a draft but becomes fixed once published. A published Event cannot switch between public checkout and Access Request mode. This prevents changing access rules after visitors have seen the Event or begun checkout, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
 
-The Site may create an empty draft by sending `{}`. Missing configurable fields return as `null`, and draft fields may be cleared back to `null`. Supplied values must still be valid; for example, invalid timestamps and negative capacity are rejected. Publication separately checks the required Event details. This supports gradual draft completion without accepting malformed data, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
+The Site may create an empty draft by sending `{}`. Missing configurable fields return as `null`, except Event credit lists which default to `[]`; nullable draft fields may be cleared back to `null`. Supplied values must still be valid; for example, invalid timestamps and negative capacity are rejected. Publication separately checks the required Event details. This supports gradual draft completion without accepting malformed data, as decided in [ticket #10](https://github.com/fvckzest/HP-OS/issues/10).
 
 ### Offering provider mapping
 
@@ -152,12 +152,14 @@ Public Event lists and detail lookup use the same Event object:
 
 | Group | Fields |
 | --- | --- |
-| Identity and content | `event_id`, `title`, `description`, `event_type`, `logo_path`, `venue` |
+| Identity and content | `event_id`, `title`, `description`, `event_type`, `logo_path`, `performers`, `artists`, `vendors`, `venue` |
 | Timing | `starts_at`, `ends_at`, `time_zone`, `check_in_opens_at` |
 | State | `visibility`, `purchase_mode`, `sales_status`, `is_canceled`, `is_archived` |
 | `ticket_offering` | `price`, `max_quantity_per_order` |
 
 `logo_path` is an optional Site-root-relative path of at most 500 characters, with slash-separated segments beginning with a letter, digit, or underscore and containing only letters, digits, underscores, hyphens, and periods. It may be set or cleared before or after publication. The Site hosts the asset and decides which paths to render; HP-OS does not fetch or validate the file. Logo path changes do not change Wallet data versions or queue Wallet updates, because Site artwork is managed separately.
+
+`performers`, `artists`, and `vendors` are ordered arrays of names, each defaulting to `[]`. Each list accepts at most 100 nonempty plain-text names, each at most 200 characters; surrounding whitespace is trimmed and control characters are rejected. Set a list to `[]` to clear it. Draft and published Event edits replace each supplied list in full; omitted lists stay unchanged. These are Event-specific display credits, not linked person profiles or attendance records. Credit edits do not change Wallet data versions or queue Wallet updates.
 
 `event_type` is optional and is `concert`, `exhibition`, `festival`, `club`, or `null`. It can be set or cleared on draft or published Events without changing sales behavior. A change to this public Event field also changes Wallet data and queues Wallet updates for eligible Tickets.
 
@@ -603,7 +605,7 @@ HP-OS checks replay history before applying a fresh version check, so a committe
 
 ### Event field and action rules
 
-Draft fields may be omitted or `null`, including venue and offering configuration. Supplied nested objects merge by field. Publication requires nonempty title, description, venue name, visibility, valid start/end timestamps, and time zone; end must follow start. Required publication fields cannot be cleared afterward. Price, capacity, both sales timestamps, an explicit per-Ticket tax amount, and an explicit buyer-fee list must be present before sales can open. Use tax amount `0` and buyer fees `[]` only after confirming those charges do not apply; `null` means unknown and keeps sales unconfigured. Sales closing must follow opening and be no later than Event end. Published sales configuration cannot be cleared once configured; price and capacity edits affect new Orders only and retain the established capacity floor.
+Draft fields may be omitted or `null`, including venue and offering configuration; credit lists use `[]` instead of `null`. Supplied nested objects merge by field. Publication requires nonempty title, description, venue name, visibility, valid start/end timestamps, and time zone; end must follow start. Required publication fields cannot be cleared afterward. Price, capacity, both sales timestamps, an explicit per-Ticket tax amount, and an explicit buyer-fee list must be present before sales can open. Use tax amount `0` and buyer fees `[]` only after confirming those charges do not apply; `null` means unknown and keeps sales unconfigured. Sales closing must follow opening and be no later than Event end. Published sales configuration cannot be cleared once configured; price and capacity edits affect new Orders only and retain the established capacity floor.
 
 `check_in_opens_at: null` means use the current Event start, including after a start-time edit. An explicit check-in opening remains at its saved time when Event start changes and cannot be later than Event end. Public and admin responses return the effective opening time; admin responses also include `check_in_uses_event_start` so the Site can distinguish the default from an explicit value. Strings are plain text; public responses never include draft records.
 
